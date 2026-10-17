@@ -1427,7 +1427,6 @@ async_postgres/pg_types.nim	export encoding.encodeBinaryArray
 async_postgres/pg_types.nim	export encoding.encodeHstoreText
 async_postgres/pg_types.nim	export encoding.foldBindParam
 async_postgres/pg_types.nim	export encoding.paramOidOf
-async_postgres/pg_types.nim	export encoding.pgParams
 async_postgres/pg_types.nim	export encoding.toPgBinaryDateParam
 async_postgres/pg_types.nim	export encoding.toPgBinaryParam
 async_postgres/pg_types.nim	export encoding.toPgBinaryTimestampTzParam
@@ -1448,6 +1447,7 @@ async_postgres/pg_types.nim	export encoding.writeParamValue
 async_postgres/pg_types.nim	export ranges
 async_postgres/pg_types.nim	export user_types
 async_postgres/pg_types.nim	get
+async_postgres/pg_types.nim	pgParams
 async_postgres/pg_types/accessors.nim	`$`
 async_postgres/pg_types/accessors.nim	`==`
 async_postgres/pg_types/accessors.nim	`[]`
@@ -1608,9 +1608,11 @@ async_postgres/pg_types/core.nim	OidBoolArray
 async_postgres/pg_types/core.nim	OidBox
 async_postgres/pg_types/core.nim	OidBoxArray
 async_postgres/pg_types/core.nim	OidBpchar
+async_postgres/pg_types/core.nim	OidBpcharArray
 async_postgres/pg_types/core.nim	OidBytea
 async_postgres/pg_types/core.nim	OidByteaArray
 async_postgres/pg_types/core.nim	OidChar
+async_postgres/pg_types/core.nim	OidCharArray
 async_postgres/pg_types/core.nim	OidCidr
 async_postgres/pg_types/core.nim	OidCidrArray
 async_postgres/pg_types/core.nim	OidCircle
@@ -1644,6 +1646,7 @@ async_postgres/pg_types/core.nim	OidInt8RangeArray
 async_postgres/pg_types/core.nim	OidInterval
 async_postgres/pg_types/core.nim	OidIntervalArray
 async_postgres/pg_types/core.nim	OidJson
+async_postgres/pg_types/core.nim	OidJsonArray
 async_postgres/pg_types/core.nim	OidJsonb
 async_postgres/pg_types/core.nim	OidJsonbArray
 async_postgres/pg_types/core.nim	OidLine
@@ -1657,6 +1660,7 @@ async_postgres/pg_types/core.nim	OidMacAddrArray
 async_postgres/pg_types/core.nim	OidMoney
 async_postgres/pg_types/core.nim	OidMoneyArray
 async_postgres/pg_types/core.nim	OidName
+async_postgres/pg_types/core.nim	OidNameArray
 async_postgres/pg_types/core.nim	OidNumMultirange
 async_postgres/pg_types/core.nim	OidNumMultirangeArray
 async_postgres/pg_types/core.nim	OidNumRange
@@ -1906,7 +1910,6 @@ async_postgres/pg_types/encoding.nim	paramOidOf#6
 async_postgres/pg_types/encoding.nim	paramOidOf#7
 async_postgres/pg_types/encoding.nim	paramOidOf#8
 async_postgres/pg_types/encoding.nim	paramOidOf#9
-async_postgres/pg_types/encoding.nim	pgParams
 async_postgres/pg_types/encoding.nim	toPgBinaryDateParam
 async_postgres/pg_types/encoding.nim	toPgBinaryParam
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#10
@@ -1945,7 +1948,6 @@ async_postgres/pg_types/encoding.nim	toPgBinaryParam#4
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#40
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#41
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#42
-async_postgres/pg_types/encoding.nim	toPgBinaryParam#43
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#5
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#6
 async_postgres/pg_types/encoding.nim	toPgBinaryParam#7
@@ -1997,8 +1999,6 @@ async_postgres/pg_types/encoding.nim	toPgParam#42
 async_postgres/pg_types/encoding.nim	toPgParam#43
 async_postgres/pg_types/encoding.nim	toPgParam#44
 async_postgres/pg_types/encoding.nim	toPgParam#45
-async_postgres/pg_types/encoding.nim	toPgParam#46
-async_postgres/pg_types/encoding.nim	toPgParam#47
 async_postgres/pg_types/encoding.nim	toPgParam#5
 async_postgres/pg_types/encoding.nim	toPgParam#6
 async_postgres/pg_types/encoding.nim	toPgParam#7
@@ -2111,6 +2111,7 @@ async_postgres/pg_types/ranges.nim	toPgParam
 async_postgres/pg_types/ranges.nim	toPgParam#10
 async_postgres/pg_types/ranges.nim	toPgParam#11
 async_postgres/pg_types/ranges.nim	toPgParam#12
+async_postgres/pg_types/ranges.nim	toPgParam#13
 async_postgres/pg_types/ranges.nim	toPgParam#2
 async_postgres/pg_types/ranges.nim	toPgParam#3
 async_postgres/pg_types/ranges.nim	toPgParam#4

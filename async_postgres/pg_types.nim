@@ -26,7 +26,6 @@ export encoding.toPgDateParam
 export encoding.toPgTimestampTzParam
 export encoding.encodeHstoreText
 export encoding.encodeBinaryArray
-export encoding.pgParams
 export encoding.toPgBinaryParam
 export encoding.toPgBinaryDateParam
 export encoding.toPgBinaryTimestampTzParam
@@ -45,6 +44,23 @@ export encoding.writeParamValue
 export encoding.writeParamOid
 export encoding.foldBindParam
 export encoding.writeBindParam
+
+# Here rather than in `encoding`: `bindSym` binds the `toPgParam` overloads
+# in scope where the macro is declared, which includes `ranges`.
+macro pgParams*(args: varargs[typed]): untyped =
+  ## Convert multiple values to a ``seq[PgParam]`` in one call.
+  ## At least one argument is required; for parameterless queries omit the
+  ## parameter argument entirely instead of calling ``pgParams()``.
+  ##
+  ## .. code-block:: nim
+  ##   await conn.query("SELECT * FROM users WHERE age > $1 AND name = $2",
+  ##     pgParams(25'i32, "Alice"))
+  result = newNimNode(nnkPrefix)
+  result.add(ident"@")
+  let bracket = newNimNode(nnkBracket)
+  for arg in args:
+    bracket.add(newCall(bindSym"toPgParam", arg))
+  result.add(bracket)
 
 # `decoding` — public text parsers; the raw binary decoders stay internal.
 export decoding.fromPgText

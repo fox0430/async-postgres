@@ -1,7 +1,7 @@
 ## Nim → PostgreSQL parameter encoders. Caller-sized payloads raise
 ## ``PgTypeError`` (not ``ValueError``) via ``checkPgBinLen``/``textParam``.
 
-import std/[options, json, macros, strutils, tables, times, net, math]
+import std/[options, json, macrocache, macros, strutils, tables, times, net, math]
 
 import ../[pg_bytes, pg_gensym, pg_protocol]
 import core, array
@@ -415,14 +415,14 @@ proc checkPgBinPayload*(size: int64, what: string) {.inline.} =
       PgTypeError, what & " payload too large for PostgreSQL binary format"
     )
 
-proc encodeBinaryArray*(
+proc encodeValidatedBinaryArray(
     elemOid: int32,
     dims: openArray[int32],
     lowerBounds: openArray[int32],
     elements: openArray[Option[seq[byte]]],
 ): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
-  ## Encode N-dim binary array. ``dims.len==0`` means empty array.
-  validatePgArrayShape(dims, lowerBounds, elements.len)
+  ## ``encodeBinaryArray`` for a shape that already passed
+  ## ``validatePgArrayShape``.
   let headerSize = 12 + 8 * dims.len
   var dataSize: int64 = 0
   var anyNull = false
@@ -455,6 +455,16 @@ proc encodeBinaryArray*(
       pos += 4
       result.writeBytesAt(pos, ev)
       pos += ev.len
+
+proc encodeBinaryArray*(
+    elemOid: int32,
+    dims: openArray[int32],
+    lowerBounds: openArray[int32],
+    elements: openArray[Option[seq[byte]]],
+): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
+  ## Encode N-dim binary array. ``dims.len==0`` means empty array.
+  validatePgArrayShape(dims, lowerBounds, elements.len)
+  encodeValidatedBinaryArray(elemOid, dims, lowerBounds, elements)
 
 proc encodeBinaryArray*(
     elemOid: int32, dims: openArray[int32], elements: openArray[Option[seq[byte]]]
@@ -571,32 +581,34 @@ template buildFixedArrayOpt(
       pos += esz
     inc i
 
-template genFixedArrayEncoder(
-    T: typedesc, arrayOid, elemOid: int32, elemSize: int, writeElem: untyped
+template buildVarArray(
+    elemOid: int32,
+    dims, lowerBounds: seq[int32],
+    count: int,
+    checkFirst: static bool,
+    isNullExpr, checkElem, encodeElem: untyped,
 ) =
-  ## Define ``toPgParam(seq[T])`` for fixed-width type.
-  proc toPgParam*(v {.inject.}: seq[T]): PgParam {.raises: [PgTypeError].} =
-    buildFixedArray(elemOid, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, elemSize):
-      writeElem
-    PgParam(oid: arrayOid, format: 1, value: some(buf))
-
-template genFixedArray1D(
-    T: typedesc, arrayOid, elemOid: int32, elemSize: int, writeVal: untyped
-) =
-  ## Define ``toPgParam(seq[T])`` and ``toPgParam(seq[Option[T]])`` for fixed-width.
-  proc toPgParam*(v {.inject.}: seq[T]): PgParam {.raises: [PgTypeError].} =
-    buildFixedArray(elemOid, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, elemSize):
-      let val {.inject.} = v[i]
-      writeVal
-    PgParam(oid: arrayOid, format: 1, value: some(buf))
-
-  proc toPgParam*(v {.inject.}: seq[Option[T]]): PgParam {.raises: [PgTypeError].} =
-    buildFixedArrayOpt(
-      elemOid, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, elemSize, v[i].isNone
-    ):
-      let val {.inject.} = v[i].get
-      writeVal
-    PgParam(oid: arrayOid, format: 1, value: some(buf))
+  ## Variable-width counterpart of ``buildFixedArrayOpt``: one ``seq[byte]``
+  ## per element. With ``checkFirst``, ``checkElem`` runs on every element
+  ## before any is encoded.
+  let dms = dims
+  let lbs = lowerBounds
+  let cnt = count
+  # Before any element is encoded, as in ``buildFixedArrayOpt``.
+  validatePgArrayShape(dms, lbs, cnt)
+  var i {.inject.} = 0
+  when checkFirst:
+    while i < cnt:
+      if not (isNullExpr):
+        checkElem
+      inc i
+    i = 0
+  var elements = newSeq[Option[seq[byte]]](cnt)
+  while i < cnt:
+    if not (isNullExpr):
+      elements[i] = some(encodeElem)
+    inc i
+  let buf {.inject.} = encodeValidatedBinaryArray(elemOid, dms, lbs, elements)
 
 proc pgTimeFieldsMicros(
     hour, minute, second, microsecond: int32
@@ -629,66 +641,15 @@ template writeIntervalAt(buf: var openArray[byte], pos: int, val: PgInterval) =
     buf.writeBE32(pos + 8, iv.days)
     buf.writeBE32(pos + 12, iv.months)
 
-genFixedArray1D(int16, OidInt2Array, OidInt2, 2):
-  buf.writeBE16(pos, val)
-
-genFixedArray1D(int32, OidInt4Array, OidInt4, 4):
-  buf.writeBE32(pos, val)
-
-genFixedArray1D(int64, OidInt8Array, OidInt8, 8):
-  buf.writeBE64(pos, val)
-
-genFixedArray1D(float32, OidFloat4Array, OidFloat4, 4):
-  buf.writeBE32(pos, cast[int32](val))
-
-genFixedArray1D(float64, OidFloat8Array, OidFloat8, 8):
-  buf.writeBE64(pos, cast[int64](val))
-
-genFixedArray1D(bool, OidBoolArray, OidBool, 1):
-  buf[pos] = (if val: 1'u8 else: 0'u8)
-
-proc toPgParam*(v: seq[string]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
-  checkArrayLen(v.len)
-  for x in v:
-    checkPgBinLen(x.len, "string")
-  var elements = newSeq[Option[seq[byte]]](v.len)
-  for i, x in v:
-    elements[i] = some(toBytes(x))
-  PgParam(
-    oid: OidTextArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidText, dimsFor1D(v.len), elements)),
-  )
-
 proc toPgParam*(v: seq[Option[int]]): PgParam {.raises: [PgTypeError].} =
-  ## ``int`` has no plain ``seq[int]`` encoder (callers use ``seq[int64]``), so
-  ## it is the one Option numeric not generated by ``genFixedArray1D``. Encoded
-  ## as 8-byte ``int8`` (OID 20), matching ``seq[int64]``.
+  ## ``int`` has no plain ``seq[int]`` encoder (callers use ``seq[int64]``) and
+  ## no array registration. Encoded as 8-byte ``int8`` (OID 20), matching
+  ## ``seq[int64]``.
   buildFixedArrayOpt(
     OidInt8, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, 8, v[i].isNone
   ):
     buf.writeBE64(pos, int64(v[i].get))
   PgParam(oid: OidInt8Array, format: 1, value: some(buf))
-
-proc toPgParam*(
-    v: seq[Option[string]]
-): PgParam {.raises: [PgTypeError, PgProtocolError].} =
-  checkArrayLen(v.len)
-  for x in v:
-    if x.isSome:
-      checkPgBinLen(x.get.len, "string")
-  var elements = newSeq[Option[seq[byte]]](v.len)
-  for i, x in v:
-    elements[i] =
-      if x.isSome:
-        some(toBytes(x.get))
-      else:
-        none(seq[byte])
-  PgParam(
-    oid: OidTextArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidText, dimsFor1D(v.len), elements)),
-  )
 
 proc toPgParam*(v: Option[JsonNode]): PgParam {.raises: [PgTypeError].} =
   if v.isSome:
@@ -720,31 +681,6 @@ proc toPgParam*(v: Option[DateTime]): PgParam {.raises: [PgTypeError].} =
     toPgParam(v.get)
   else:
     PgParam(oid: OidTimestamp, format: 0, value: none(seq[byte]))
-
-# No raises pragma: the effect is T's encoder effects, inferred per
-# instantiation. A union annotation would over-declare for T whose encoder
-# raises less (e.g. Option[int32] raises neither, Option[string] only PgTypeError).
-proc toPgParam*[T](v: Option[T]): PgParam =
-  if v.isSome:
-    result = toPgParam(v.get)
-  else:
-    let proto = toPgParam(default(T))
-    result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
-
-macro pgParams*(args: varargs[typed]): untyped =
-  ## Convert multiple values to a ``seq[PgParam]`` in one call.
-  ## At least one argument is required; for parameterless queries omit the
-  ## parameter argument entirely instead of calling ``pgParams()``.
-  ##
-  ## .. code-block:: nim
-  ##   await conn.query("SELECT * FROM users WHERE age > $1 AND name = $2",
-  ##     pgParams(25'i32, "Alice"))
-  result = newNimNode(nnkPrefix)
-  result.add(ident"@")
-  let bracket = newNimNode(nnkBracket)
-  for arg in args:
-    bracket.add(newCall(bindSym"toPgParam", arg))
-  result.add(bracket)
 
 proc toPgBinaryParam*(v: string): PgParam {.raises: [PgTypeError].} =
   ## String → binary PgParam. Raises ``PgTypeError`` if oversized.
@@ -1050,22 +986,6 @@ proc toPgBinaryParam*(v: PgBit): PgParam {.raises: [].} =
     data[4 + i] = v.data[i]
   PgParam(oid: OidVarbit, format: 1, value: some(data))
 
-proc toPgBinaryParam*(
-    v: seq[PgBit]
-): PgParam {.raises: [PgTypeError, PgProtocolError].} =
-  checkArrayLen(v.len)
-  var elements = newSeq[Option[seq[byte]]](v.len)
-  for i, x in v:
-    elements[i] = some(toPgBinaryParam(x).value.get)
-  PgParam(
-    oid: OidVarbitArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidVarbit, dimsFor1D(v.len), elements)),
-  )
-
-proc toPgParam*(v: seq[PgBit]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
-  toPgBinaryParam(v)
-
 # Temporal array encoders
 
 proc toPgTimestampArrayParam*(v: seq[DateTime]): PgParam {.raises: [PgTypeError].} =
@@ -1084,43 +1004,6 @@ proc toPgDateArrayParam*(v: seq[DateTime]): PgParam {.raises: [PgTypeError].} =
   buildFixedArray(OidDate, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, 4):
     buf.writeBE32(pos, pgDateDays(v[i]))
   PgParam(oid: OidDateArray, format: 1, value: some(buf))
-
-template genArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
-  proc toPgParam*(v: seq[T]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
-    checkArrayLen(v.len)
-    var elements = newSeq[Option[seq[byte]]](v.len)
-    for i, x in v:
-      elements[i] = some(toPgBinaryParam(x).value.get)
-    PgParam(
-      oid: arrayOid,
-      format: 1,
-      value: some(encodeBinaryArray(elemOid, dimsFor1D(v.len), elements)),
-    )
-
-genFixedArrayEncoder(PgTime, OidTimeArray, OidTime, 8):
-  buf.writeTimeAt(pos, v[i])
-
-genFixedArrayEncoder(PgTimeTz, OidTimeTzArray, OidTimeTz, 12):
-  buf.writeTimeTzAt(pos, v[i])
-
-genFixedArrayEncoder(PgInterval, OidIntervalArray, OidInterval, 16):
-  buf.writeIntervalAt(pos, v[i])
-
-# Identifier / network array encoders
-
-genFixedArrayEncoder(PgUuid, OidUuidArray, OidUuid, 16):
-  buf.writeUuidAt(pos, v[i])
-
-# ``inet`` / ``cidr`` carry a variable-width address (IPv4 vs IPv6), so they
-# stay on the generic per-element path.
-genArrayEncoder(PgInet, OidInetArray, OidInet)
-genArrayEncoder(PgCidr, OidCidrArray, OidCidr)
-
-genFixedArrayEncoder(PgMacAddr, OidMacAddrArray, OidMacAddr, 6):
-  buf.writeMacAt(pos, string(v[i]), 6, "PgMacAddr")
-
-genFixedArrayEncoder(PgMacAddr8, OidMacAddr8Array, OidMacAddr8, 8):
-  buf.writeMacAt(pos, string(v[i]), 8, "PgMacAddr8")
 
 # ``PgMoney`` needs manual scale validation (binary format lacks scale).
 proc toPgMoneyArrayParam*(
@@ -1145,10 +1028,6 @@ proc toPgParam*(v: seq[PgMoney]): PgParam {.raises: [PgTypeError].} =
   ## ``seq[PgMoney]`` → ``money[]`` with ``scale=2``. Use ``toPgMoneyArrayParam``
   ## for other scales.
   toPgMoneyArrayParam(v, scale = 2)
-
-# Numeric / binary / JSON array encoders
-
-genArrayEncoder(PgNumeric, OidNumericArray, OidNumeric)
 
 proc toPgByteaArrayParam*(
     v: seq[seq[byte]]
@@ -1177,17 +1056,6 @@ proc encodeJsonbBinary*(
   result[0] = 1 # jsonb version byte
   if s.len > 0:
     result.writeBytesAt(1, s.toOpenArrayByte(0, s.high))
-
-proc toPgParam*(v: seq[JsonNode]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
-  checkArrayLen(v.len)
-  var elements = newSeq[Option[seq[byte]]](v.len)
-  for i, x in v:
-    elements[i] = some(encodeJsonbBinary(x))
-  PgParam(
-    oid: OidJsonbArray,
-    format: 1,
-    value: some(encodeBinaryArray(OidJsonb, dimsFor1D(v.len), elements)),
-  )
 
 template writePointAt*(dst: var openArray[byte], pos: int, p: PgPoint) =
   ## Write a point as 16 bytes (two float64 big-endian) into dst at pos.
@@ -1276,45 +1144,7 @@ proc toPgBinaryParam*(v: PgCircle): PgParam =
 proc toPgBinaryParam*(v: JsonNode): PgParam {.raises: [PgTypeError, PgProtocolError].} =
   PgParam(oid: OidJsonb, format: 1, value: some(encodeJsonbBinary(v)))
 
-# Geometric array encoders
-
-genFixedArrayEncoder(PgPoint, OidPointArray, OidPoint, 16):
-  buf.writePointAt(pos, v[i])
-
-genFixedArrayEncoder(PgLine, OidLineArray, OidLine, 24):
-  buf.writeLineAt(pos, v[i])
-
-genFixedArrayEncoder(PgLseg, OidLsegArray, OidLseg, 32):
-  buf.writeLsegAt(pos, v[i])
-
-genFixedArrayEncoder(PgBox, OidBoxArray, OidBox, 32):
-  buf.writeBoxAt(pos, v[i])
-
-# ``path`` / ``polygon`` carry a variable number of points, so they stay on the
-# generic per-element path.
-genArrayEncoder(PgPath, OidPathArray, OidPath)
-genArrayEncoder(PgPolygon, OidPolygonArray, OidPolygon)
-
-genFixedArrayEncoder(PgCircle, OidCircleArray, OidCircle, 24):
-  buf.writeCircleAt(pos, v[i])
-
 # Other array encoders
-
-template genStringArrayEncoder(T: typedesc, arrayOid, elemOid: int32) =
-  proc toPgParam*(v: seq[T]): PgParam {.raises: [PgTypeError, PgProtocolError].} =
-    checkArrayLen(v.len)
-    for x in v:
-      checkPgBinLen(string(x).len, "string")
-    var elements = newSeq[Option[seq[byte]]](v.len)
-    for i, x in v:
-      elements[i] = some(toBytes(string(x)))
-    PgParam(
-      oid: arrayOid,
-      format: 1,
-      value: some(encodeBinaryArray(elemOid, dimsFor1D(v.len), elements)),
-    )
-
-genStringArrayEncoder(PgXml, OidXmlArray, OidXml)
 
 proc encodeTsArrayText(elems: openArray[string], what: string): string =
   ## Build a text-format array literal from tsvector/tsquery text elements.
@@ -1357,13 +1187,6 @@ proc toPgParam*(v: seq[PgTsQuery]): PgParam {.raises: [PgTypeError].} =
   for i, x in v:
     elems[i] = string(x)
   textParam(OidTsQueryArray, encodeTsArrayText(elems, "tsquery array"), "tsquery array")
-
-proc toPgBinaryParam*[T](v: seq[T]): PgParam =
-  ## Same as ``toPgParam(v)``. Most arrays go in binary there, but range and
-  ## multirange arrays and ``seq[PgTsVector]`` / ``seq[PgTsQuery]`` go as text,
-  ## and ``seq[PgHstore]`` and ``pgEnum`` arrays as text with OID 0 (pass the
-  ## hstore OIDs for binary; the 3-argument ``pgEnum`` sets the array OID).
-  toPgParam(v)
 
 proc toPgBinaryParam*(
     v: Option[JsonNode]
@@ -1483,15 +1306,6 @@ proc toPgBinaryParam*(
     value: some(encodeBinaryArray(elemOid, dimsFor1D(v.len), elements)),
   )
 
-# No raises pragma: the effect is T's encoder effects, inferred per
-# instantiation (same reason as the toPgParam Option[T] dispatcher above).
-proc toPgBinaryParam*[T](v: Option[T]): PgParam =
-  if v.isSome:
-    result = toPgBinaryParam(v.get)
-  else:
-    let proto = toPgBinaryParam(default(T))
-    result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
-
 proc toPgBinaryParam*(
     v: Option[PgMoney], scale: int = 2
 ): PgParam {.raises: [PgTypeError].} =
@@ -1511,320 +1325,332 @@ proc toPgBinaryParam*(
   else:
     PgParam(oid: OidMoney, format: 1, value: none(seq[byte]))
 
-# PgArray[T] element registry: per-type element and array OIDs plus
-# element-to-bytes encoders, consumed by the generic ``toPgParam(PgArray[T])``.
-# Decoders live in ``accessors.nim`` alongside ``getArrayND[T]``.
-
-proc pgArrayElemOid*(_: typedesc[int16]): int32 =
-  OidInt2
-
-proc pgArrayArrayOid*(_: typedesc[int16]): int32 =
-  OidInt2Array
-
-proc encodePgArrayElement*(v: int16): seq[byte] {.raises: [].} =
-  @(toBE16(v))
-
-proc pgArrayElemOid*(_: typedesc[int32]): int32 =
-  OidInt4
-
-proc pgArrayArrayOid*(_: typedesc[int32]): int32 =
-  OidInt4Array
-
-proc encodePgArrayElement*(v: int32): seq[byte] {.raises: [].} =
-  @(toBE32(v))
-
-proc pgArrayElemOid*(_: typedesc[int64]): int32 =
-  OidInt8
-
-proc pgArrayArrayOid*(_: typedesc[int64]): int32 =
-  OidInt8Array
-
-proc encodePgArrayElement*(v: int64): seq[byte] {.raises: [].} =
-  @(toBE64(v))
-
-proc pgArrayElemOid*(_: typedesc[float32]): int32 =
-  OidFloat4
-
-proc pgArrayArrayOid*(_: typedesc[float32]): int32 =
-  OidFloat4Array
-
-proc encodePgArrayElement*(v: float32): seq[byte] {.raises: [].} =
-  @(toBE32(cast[int32](v)))
-
-proc pgArrayElemOid*(_: typedesc[float64]): int32 =
-  OidFloat8
-
-proc pgArrayArrayOid*(_: typedesc[float64]): int32 =
-  OidFloat8Array
-
-proc encodePgArrayElement*(v: float64): seq[byte] {.raises: [].} =
-  @(toBE64(cast[int64](v)))
-
-proc pgArrayElemOid*(_: typedesc[bool]): int32 =
-  OidBool
-
-proc pgArrayArrayOid*(_: typedesc[bool]): int32 =
-  OidBoolArray
-
-proc encodePgArrayElement*(v: bool): seq[byte] {.raises: [].} =
-  @[if v: 1'u8 else: 0'u8]
-
-proc pgArrayElemOid*(_: typedesc[string]): int32 =
-  OidText
-
-proc pgArrayArrayOid*(_: typedesc[string]): int32 =
-  OidTextArray
-
-proc encodePgArrayElement*(v: string): seq[byte] {.raises: [].} =
-  toBytes(v)
-
-proc pgArrayElemOid*(_: typedesc[PgUuid]): int32 =
-  OidUuid
-
-proc pgArrayArrayOid*(_: typedesc[PgUuid]): int32 =
-  OidUuidArray
-
-proc encodePgArrayElement*(v: PgUuid): seq[byte] {.raises: [PgTypeError].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgNumeric]): int32 =
-  OidNumeric
-
-proc pgArrayArrayOid*(_: typedesc[PgNumeric]): int32 =
-  OidNumericArray
-
-proc encodePgArrayElement*(v: PgNumeric): seq[byte] {.raises: [PgTypeError].} =
-  encodeNumericBinary(v)
-
-proc pgArrayElemOid*(_: typedesc[PgMoney]): int32 =
-  ## Used by ``getMoneyArrayND`` to verify the wire ``elemOid``.
-  ## ``pgArrayArrayOid(PgMoney)`` and ``encodePgArrayElement(PgMoney)`` are
-  ## intentionally not provided: ``money``'s binary wire format does not
-  ## carry the scale, so callers must go through
-  ## ``toPgMoneyArrayNDParam(v, scale = ...)`` (which validates every
-  ## element's ``scale`` against the server's ``frac_digits``), and the
-  ## generic ``toPgParam(PgArray[PgMoney])`` is ``{.error.}``-gated.
-  OidMoney
-
-proc pgArrayElemOid*(_: typedesc[PgBit]): int32 =
-  OidVarbit
-
-proc pgArrayArrayOid*(_: typedesc[PgBit]): int32 =
-  OidVarbitArray
-
-proc encodePgArrayElement*(v: PgBit): seq[byte] {.raises: [].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgInterval]): int32 =
-  OidInterval
-
-proc pgArrayArrayOid*(_: typedesc[PgInterval]): int32 =
-  OidIntervalArray
-
-proc encodePgArrayElement*(v: PgInterval): seq[byte] {.raises: [].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgTime]): int32 =
-  OidTime
-
-proc pgArrayArrayOid*(_: typedesc[PgTime]): int32 =
-  OidTimeArray
-
-proc encodePgArrayElement*(v: PgTime): seq[byte] {.raises: [PgTypeError].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgTimeTz]): int32 =
-  OidTimeTz
-
-proc pgArrayArrayOid*(_: typedesc[PgTimeTz]): int32 =
-  OidTimeTzArray
-
-proc encodePgArrayElement*(v: PgTimeTz): seq[byte] {.raises: [PgTypeError].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgInet]): int32 =
-  OidInet
-
-proc pgArrayArrayOid*(_: typedesc[PgInet]): int32 =
-  OidInetArray
-
-proc encodePgArrayElement*(v: PgInet): seq[byte] {.raises: [].} =
-  encodeInetBinary(v.address, v.mask, false)
-
-proc pgArrayElemOid*(_: typedesc[PgCidr]): int32 =
-  OidCidr
-
-proc pgArrayArrayOid*(_: typedesc[PgCidr]): int32 =
-  OidCidrArray
-
-proc encodePgArrayElement*(v: PgCidr): seq[byte] {.raises: [].} =
-  encodeInetBinary(v.address, v.mask, true)
-
-proc pgArrayElemOid*(_: typedesc[PgMacAddr]): int32 =
-  OidMacAddr
-
-proc pgArrayArrayOid*(_: typedesc[PgMacAddr]): int32 =
-  OidMacAddrArray
-
-proc encodePgArrayElement*(v: PgMacAddr): seq[byte] {.raises: [PgTypeError].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgMacAddr8]): int32 =
-  OidMacAddr8
-
-proc pgArrayArrayOid*(_: typedesc[PgMacAddr8]): int32 =
-  OidMacAddr8Array
-
-proc encodePgArrayElement*(v: PgMacAddr8): seq[byte] {.raises: [PgTypeError].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgXml]): int32 =
-  OidXml
-
-proc pgArrayArrayOid*(_: typedesc[PgXml]): int32 =
-  OidXmlArray
-
-proc encodePgArrayElement*(v: PgXml): seq[byte] {.raises: [].} =
-  toBytes(string(v))
-
-proc pgArrayElemOid*(_: typedesc[PgPoint]): int32 =
-  OidPoint
-
-proc pgArrayArrayOid*(_: typedesc[PgPoint]): int32 =
-  OidPointArray
-
-proc encodePgArrayElement*(v: PgPoint): seq[byte] {.raises: [].} =
-  encodePointBinary(v)
-
-proc pgArrayElemOid*(_: typedesc[PgLine]): int32 =
-  OidLine
-
-proc pgArrayArrayOid*(_: typedesc[PgLine]): int32 =
-  OidLineArray
-
-proc encodePgArrayElement*(v: PgLine): seq[byte] {.raises: [].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgLseg]): int32 =
-  OidLseg
-
-proc pgArrayArrayOid*(_: typedesc[PgLseg]): int32 =
-  OidLsegArray
-
-proc encodePgArrayElement*(v: PgLseg): seq[byte] {.raises: [].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgBox]): int32 =
-  OidBox
-
-proc pgArrayArrayOid*(_: typedesc[PgBox]): int32 =
-  OidBoxArray
-
-proc encodePgArrayElement*(v: PgBox): seq[byte] {.raises: [].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgPath]): int32 =
-  OidPath
-
-proc pgArrayArrayOid*(_: typedesc[PgPath]): int32 =
-  OidPathArray
-
-proc encodePgArrayElement*(v: PgPath): seq[byte] {.raises: [PgTypeError].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgPolygon]): int32 =
-  OidPolygon
-
-proc pgArrayArrayOid*(_: typedesc[PgPolygon]): int32 =
-  OidPolygonArray
-
-proc encodePgArrayElement*(v: PgPolygon): seq[byte] {.raises: [PgTypeError].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[PgCircle]): int32 =
-  OidCircle
-
-proc pgArrayArrayOid*(_: typedesc[PgCircle]): int32 =
-  OidCircleArray
-
-proc encodePgArrayElement*(v: PgCircle): seq[byte] {.raises: [].} =
-  toPgBinaryParam(v).value.get
-
-proc pgArrayElemOid*(_: typedesc[JsonNode]): int32 =
-  OidJsonb
-
-proc pgArrayArrayOid*(_: typedesc[JsonNode]): int32 =
-  OidJsonbArray
-
-proc encodePgArrayElement*(
-    v: JsonNode
-): seq[byte] {.raises: [PgTypeError, PgProtocolError].} =
-  encodeJsonbBinary(v)
-
-# Fixed-width registry: element byte width plus a write-in-place primitive for
-# the types whose binary form is a compile-time constant size. The generic
-# ``toPgParam(PgArray[T])`` uses these to fill one buffer directly (via
-# ``buildFixedArrayOpt``) instead of allocating a ``seq[byte]`` per element.
-# Variable-width element types (numeric, bit, inet, cidr, xml, json, string)
-# are intentionally absent and keep the generic per-element path.
-
-template fixedArrayElem(T: typedesc, width: int, writeExpr: untyped) =
-  proc pgArrayElemFixedWidth(_: typedesc[T]): int {.inline.} =
-    width
-
-  proc writePgArrayElementAt(
-      buf {.inject.}: var openArray[byte], pos {.inject.}: int, v {.inject.}: T
-  ) =
-    writeExpr
+# PgArray[T] element registry. One registration per element type yields its
+# element and array OIDs, the element OIDs its decoders accept and the element
+# encoder, and ``seqPgArrayParams`` gives it the 1-D ``toPgParam(seq[T])`` (and
+# ``toPgParam(seq[Option[T]])`` with ``optSeq``), so they cannot drift apart.
+# The decoders live in ``accessors.nim`` next to ``getArrayND[T]``.
+
+const pgArrayElemTypes = CacheSeq"async_postgres.pgArrayElemTypes"
+  ## Every registered element type. Tests read it through ``{.all.}``.
+
+const pgArrayOptSeqElemTypes = CacheSeq"async_postgres.pgArrayOptSeqElemTypes"
+  ## The registered types with ``optSeq``.
+
+macro recordPgArrayElemType(T: typed, optSeq: static bool): untyped =
+  pgArrayElemTypes.add(T)
+  if optSeq:
+    pgArrayOptSeqElemTypes.add(T)
+  result = newStmtList()
 
 proc pgArrayElemFixedWidth[T](_: typedesc[T]): int {.inline.} =
   ## Default: ``0`` means "variable width, use the generic per-element path".
   0
 
-fixedArrayElem(int16, 2):
+proc pgArrayElemCheckFirst[T](_: typedesc[T]): bool {.inline.} =
+  ## Default: an element is checked only as it is encoded.
+  false
+
+template pgTextBytes[T](v: T): string =
+  ## Element bytes of a text-backed type, as ``string``. Branches so that
+  ## ``string`` does not convert to itself (a compiler hint).
+  when T is string:
+    v
+  else:
+    string(v)
+
+template registerPgArrayElem(
+    T: typedesc,
+    elemOid, arrayOid: int32,
+    acceptOids, acceptArrayOids: untyped,
+    optSeq: static bool,
+) =
+  proc pgArrayElemOid*(_: typedesc[T]): int32 =
+    elemOid
+
+  proc pgArrayArrayOid*(_: typedesc[T]): int32 =
+    arrayOid
+
+  # Templates, so each decoder gets the literals rather than calls. The two
+  # lists run in parallel: element OID i is the element type of array OID i.
+  template pgArrayAcceptOids*(_: typedesc[T]): untyped =
+    acceptOids
+
+  template pgArrayAcceptArrayOids*(_: typedesc[T]): untyped =
+    acceptArrayOids
+
+  recordPgArrayElemType(T, optSeq)
+
+template fixedPgArrayElem(
+    T: typedesc,
+    elemOid, arrayOid: int32,
+    width: int,
+    optSeq: static bool,
+    writeExpr: untyped,
+) =
+  ## ``writeExpr`` writes ``v`` into ``buf[pos ..< pos + width]``. The array
+  ## encoders fill one buffer with it instead of a ``seq[byte]`` per element,
+  ## so no per-element encoder is generated for a fixed-width type.
+  ## ``optSeq`` adds ``toPgParam(seq[Option[T]])``; it has no default because
+  ## the trailing block would bind to it.
+  registerPgArrayElem(T, elemOid, arrayOid, [elemOid], [arrayOid], optSeq)
+
+  proc pgArrayElemFixedWidth(_: typedesc[T]): int {.inline.} =
+    width
+
+  proc writePgArrayElementAt(
+      buf {.inject.}: var openArray[byte], pos {.inject.}: int, v {.inject.}: T
+  ) {.inline.} =
+    writeExpr
+
+template varPgArrayElem(
+    T: typedesc,
+    elemOid, arrayOid: int32,
+    acceptOids, acceptArrayOids: untyped,
+    optSeq: static bool,
+    encodeExpr: untyped,
+) =
+  ## ``encodeExpr`` returns the element bytes of ``v``.
+  registerPgArrayElem(T, elemOid, arrayOid, acceptOids, acceptArrayOids, optSeq)
+
+  proc encodePgArrayElement*(v {.inject.}: T): seq[byte] =
+    encodeExpr
+
+template varPgArrayElem(
+    T: typedesc, elemOid, arrayOid: int32, optSeq: static bool, encodeExpr: untyped
+) =
+  varPgArrayElem(T, elemOid, arrayOid, [elemOid], [arrayOid], optSeq, encodeExpr)
+
+template textPgArrayElem(
+    T: typedesc,
+    elemOid, arrayOid: int32,
+    acceptOids, acceptArrayOids: untyped,
+    what: string,
+    optSeq: static bool,
+) =
+  ## The element bytes are the type's ``string`` form. Their length is known
+  ## without copying, so the array encoders check every element before copying
+  ## any.
+  proc checkPgArrayElement(v: T) {.inline.} =
+    checkPgBinLen(pgTextBytes(v).len, what)
+
+  proc pgArrayElemCheckFirst(_: typedesc[T]): bool {.inline.} =
+    true
+
+  varPgArrayElem(T, elemOid, arrayOid, acceptOids, acceptArrayOids, optSeq):
+    checkPgArrayElement(v)
+    toBytes(pgTextBytes(v))
+
+template textPgArrayElem(
+    T: typedesc,
+    elemOid, arrayOid: int32,
+    acceptOids: untyped,
+    what: string,
+    optSeq: static bool,
+) =
+  textPgArrayElem(T, elemOid, arrayOid, acceptOids, [arrayOid], what, optSeq)
+
+fixedPgArrayElem(int16, OidInt2, OidInt2Array, 2, optSeq = true):
   buf.writeBE16(pos, v)
-fixedArrayElem(int32, 4):
+fixedPgArrayElem(int32, OidInt4, OidInt4Array, 4, optSeq = true):
   buf.writeBE32(pos, v)
-fixedArrayElem(int64, 8):
+fixedPgArrayElem(int64, OidInt8, OidInt8Array, 8, optSeq = true):
   buf.writeBE64(pos, v)
-fixedArrayElem(float32, 4):
+fixedPgArrayElem(float32, OidFloat4, OidFloat4Array, 4, optSeq = true):
   buf.writeBE32(pos, cast[int32](v))
-fixedArrayElem(float64, 8):
+fixedPgArrayElem(float64, OidFloat8, OidFloat8Array, 8, optSeq = true):
   buf.writeBE64(pos, cast[int64](v))
-fixedArrayElem(bool, 1):
+fixedPgArrayElem(bool, OidBool, OidBoolArray, 1, optSeq = true):
   buf[pos] = (if v: 1'u8 else: 0'u8)
-fixedArrayElem(PgUuid, 16):
+fixedPgArrayElem(PgUuid, OidUuid, OidUuidArray, 16, optSeq = false):
   buf.writeUuidAt(pos, v)
-fixedArrayElem(PgInterval, 16):
+fixedPgArrayElem(PgInterval, OidInterval, OidIntervalArray, 16, optSeq = false):
   buf.writeIntervalAt(pos, v)
-fixedArrayElem(PgTime, 8):
+fixedPgArrayElem(PgTime, OidTime, OidTimeArray, 8, optSeq = false):
   buf.writeTimeAt(pos, v)
-fixedArrayElem(PgTimeTz, 12):
+fixedPgArrayElem(PgTimeTz, OidTimeTz, OidTimeTzArray, 12, optSeq = false):
   buf.writeTimeTzAt(pos, v)
-fixedArrayElem(PgMacAddr, 6):
+fixedPgArrayElem(PgMacAddr, OidMacAddr, OidMacAddrArray, 6, optSeq = false):
   buf.writeMacAt(pos, string(v), 6, "PgMacAddr")
-fixedArrayElem(PgMacAddr8, 8):
+fixedPgArrayElem(PgMacAddr8, OidMacAddr8, OidMacAddr8Array, 8, optSeq = false):
   buf.writeMacAt(pos, string(v), 8, "PgMacAddr8")
-fixedArrayElem(PgPoint, 16):
+fixedPgArrayElem(PgPoint, OidPoint, OidPointArray, 16, optSeq = false):
   buf.writePointAt(pos, v)
-fixedArrayElem(PgLine, 24):
+fixedPgArrayElem(PgLine, OidLine, OidLineArray, 24, optSeq = false):
   buf.writeLineAt(pos, v)
-fixedArrayElem(PgLseg, 32):
+fixedPgArrayElem(PgLseg, OidLseg, OidLsegArray, 32, optSeq = false):
   buf.writeLsegAt(pos, v)
-fixedArrayElem(PgBox, 32):
+fixedPgArrayElem(PgBox, OidBox, OidBoxArray, 32, optSeq = false):
   buf.writeBoxAt(pos, v)
-fixedArrayElem(PgCircle, 24):
+fixedPgArrayElem(PgCircle, OidCircle, OidCircleArray, 24, optSeq = false):
   buf.writeCircleAt(pos, v)
+
+# A text-typed array of any character type decodes as ``string``.
+textPgArrayElem(
+  string,
+  OidText,
+  OidTextArray,
+  [OidText, OidVarchar, OidBpchar, OidName, OidChar],
+  [OidTextArray, OidVarcharArray, OidBpcharArray, OidNameArray, OidCharArray],
+  "string",
+  optSeq = true,
+)
+textPgArrayElem(PgXml, OidXml, OidXmlArray, [OidXml], "xml", optSeq = false)
+# ``bit`` and ``bit varying`` share the wire format; arrays are sent as varbit.
+varPgArrayElem(
+  PgBit,
+  OidVarbit,
+  OidVarbitArray,
+  [OidBit, OidVarbit],
+  [OidBitArray, OidVarbitArray],
+  optSeq = false,
+):
+  toPgBinaryParam(v).value.get
+# Always sent as jsonb; ``json[]`` is read too (no version byte on the wire).
+varPgArrayElem(
+  JsonNode,
+  OidJsonb,
+  OidJsonbArray,
+  [OidJson, OidJsonb],
+  [OidJsonArray, OidJsonbArray],
+  optSeq = false,
+):
+  encodeJsonbBinary(v)
+varPgArrayElem(PgNumeric, OidNumeric, OidNumericArray, optSeq = false):
+  encodeNumericBinary(v)
+# ``inet`` / ``cidr`` carry an IPv4 or IPv6 address, so their width varies.
+varPgArrayElem(PgInet, OidInet, OidInetArray, optSeq = false):
+  encodeInetBinary(v.address, v.mask, false)
+varPgArrayElem(PgCidr, OidCidr, OidCidrArray, optSeq = false):
+  encodeInetBinary(v.address, v.mask, true)
+varPgArrayElem(PgPath, OidPath, OidPathArray, optSeq = false):
+  toPgBinaryParam(v).value.get
+varPgArrayElem(PgPolygon, OidPolygon, OidPolygonArray, optSeq = false):
+  toPgBinaryParam(v).value.get
+
+# Below the registrations on purpose: a template declared where only the
+# default ``pgArrayElemFixedWidth`` / ``pgArrayElemCheckFirst`` is in scope binds
+# to it, so every ``T`` reads the default.
+
+template buildPgArrayParam(
+    T: typedesc,
+    dims, lowerBounds: seq[int32],
+    count: int,
+    isNullExpr, elemExpr: untyped,
+): PgParam =
+  ## Picks the fixed- or variable-width path for every registry encoder.
+  ## ``elemExpr`` is element ``i``, read only where ``isNullExpr`` is false.
+  block:
+    when pgArrayElemFixedWidth(T) > 0:
+      buildFixedArrayOpt(
+        pgArrayElemOid(T),
+        dims,
+        lowerBounds,
+        count,
+        pgArrayElemFixedWidth(T),
+        isNullExpr,
+      ):
+        writePgArrayElementAt(buf, pos, elemExpr)
+    else:
+      buildVarArray(
+        pgArrayElemOid(T),
+        dims,
+        lowerBounds,
+        count,
+        pgArrayElemCheckFirst(T),
+        isNullExpr,
+        checkPgArrayElement(elemExpr),
+        encodePgArrayElement(elemExpr),
+      )
+    PgParam(oid: pgArrayArrayOid(T), format: 1, value: some(buf))
+
+template buildPgArrayParam(
+    T: typedesc, dims, lowerBounds: seq[int32], count: int, elemExpr: untyped
+): PgParam =
+  ## No NULL elements: the fixed-width path skips counting them.
+  block:
+    when pgArrayElemFixedWidth(T) > 0:
+      buildFixedArray(
+        pgArrayElemOid(T), dims, lowerBounds, count, pgArrayElemFixedWidth(T)
+      ):
+        writePgArrayElementAt(buf, pos, elemExpr)
+      PgParam(oid: pgArrayArrayOid(T), format: 1, value: some(buf))
+    else:
+      buildPgArrayParam(T, dims, lowerBounds, count, false, elemExpr)
+
+template pgArrayParamProc(T, V: typedesc, body: untyped) =
+  ## ``toPgParam*(v: V)``. Only the variable-width path reaches
+  ## ``encodeValidatedBinaryArray`` (``PgProtocolError``).
+  when pgArrayElemFixedWidth(T) > 0:
+    proc toPgParam*(v {.inject.}: V): PgParam {.raises: [PgTypeError].} =
+      body
+
+  else:
+    proc toPgParam*(
+        v {.inject.}: V
+    ): PgParam {.raises: [PgTypeError, PgProtocolError].} =
+      body
+
+template seqPgArrayParam(T: untyped) =
+  pgArrayParamProc(T, seq[T]):
+    buildPgArrayParam(T, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, v[i])
+
+template optSeqPgArrayParam(T: untyped) =
+  ## ``none`` is a NULL element.
+  pgArrayParamProc(T, seq[Option[T]]):
+    buildPgArrayParam(
+      T, dimsFor1D(v.len), lowerBoundsFor1D(v.len), v.len, v[i].isNone, v[i].get
+    )
+
+macro seqPgArrayParams(): untyped =
+  ## ``toPgParam(seq[T])`` for every registered ``T``, and
+  ## ``toPgParam(seq[Option[T]])`` for those registered with ``optSeq``.
+  result = newStmtList()
+  for T in pgArrayElemTypes:
+    result.add getAst(seqPgArrayParam(T))
+  for T in pgArrayOptSeqElemTypes:
+    result.add getAst(optSeqPgArrayParam(T))
+
+seqPgArrayParams()
+
+# Below seqPgArrayParams: a generic sees only the overloads declared before it
+# plus the caller's, and a caller may import toPgBinaryParam or pgParams alone.
+
+# No raises pragma: the effect is T's encoder effects, inferred per
+# instantiation. A union annotation would over-declare for T whose encoder
+# raises less (e.g. Option[int32] raises neither, Option[string] only PgTypeError).
+proc toPgParam*[T](v: Option[T]): PgParam =
+  if v.isSome:
+    result = toPgParam(v.get)
+  else:
+    let proto = toPgParam(default(T))
+    result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
+
+proc toPgBinaryParam*[T](v: seq[T]): PgParam =
+  ## Same as ``toPgParam(v)``. Most arrays go in binary there, but range and
+  ## multirange arrays and ``seq[PgTsVector]`` / ``seq[PgTsQuery]`` go as text,
+  ## and ``seq[PgHstore]`` and ``pgEnum`` arrays as text with OID 0 (pass the
+  ## hstore OIDs for binary; the 3-argument ``pgEnum`` sets the array OID).
+  toPgParam(v)
+
+# No raises pragma: the effect is T's encoder effects, inferred per
+# instantiation (same reason as the toPgParam Option[T] dispatcher above).
+proc toPgBinaryParam*[T](v: Option[T]): PgParam =
+  if v.isSome:
+    result = toPgBinaryParam(v.get)
+  else:
+    let proto = toPgBinaryParam(default(T))
+    result = PgParam(oid: proto.oid, format: proto.format, value: none(seq[byte]))
 
 # No raises pragma on this dispatcher: fixed-width element types only take
 # the buildFixedArrayOpt path (PgTypeError at most), while variable-width
-# types also reach encodeBinaryArray (PgProtocolError). The effect is
+# types also reach encodeValidatedBinaryArray (PgProtocolError). The effect is
 # inferred per instantiation; a union annotation would over-declare for
 # fixed-width T. Callers needing the worst case must handle both.
 proc toPgParam*[T](v: PgArray[T]): PgParam =
   ## Encode an N-dimensional ``PgArray[T]`` as a PostgreSQL binary array
-  ## parameter. ``T`` must be a registered scalar type — see the
-  ## ``pgArrayElemOid`` / ``encodePgArrayElement`` overloads above.
+  ## parameter. ``T`` must be a registered element type — see the
+  ## ``fixedPgArrayElem`` / ``varPgArrayElem`` registrations above.
   ##
   ## For ``T == JsonNode`` the parameter is always tagged as ``jsonb[]`` (with
   ## the leading ``0x01`` version byte on every element). Binding such a value
@@ -1874,40 +1700,10 @@ proc toPgParam*[T](v: PgArray[T]): PgParam =
         "values on servers whose lc_monetary frac_digits differ from 2. " &
         "Use toPgMoneyArrayNDParam(v, scale = ...) instead."
     .}
-  # Shape validation is delegated to encodeBinaryArray / buildFixedArrayOpt
-  # below; no need to validate here as well — both call paths check the same
-  # invariants.
-  let elemOid = pgArrayElemOid(T)
-  let arrayOid = pgArrayArrayOid(T)
-  when pgArrayElemFixedWidth(T) > 0:
-    # Fixed-width element: write straight into one buffer, no per-element seq.
-    buildFixedArrayOpt(
-      elemOid,
-      v.dims,
-      v.lowerBounds,
-      v.elements.len,
-      pgArrayElemFixedWidth(T),
-      v.elements[i].isNone,
-    ):
-      writePgArrayElementAt(buf, pos, v.elements[i].get)
-    PgParam(oid: arrayOid, format: 1, value: some(buf))
-  else:
-    if v.elements.len > int32.high.int:
-      raise newException(
-        PgTypeError,
-        "Array has too many elements for PostgreSQL binary format: " & $v.elements.len,
-      )
-    var elements = newSeq[Option[seq[byte]]](v.elements.len)
-    for i, oe in v.elements:
-      if oe.isSome:
-        elements[i] = some(encodePgArrayElement(oe.get))
-      else:
-        elements[i] = none(seq[byte])
-    PgParam(
-      oid: arrayOid,
-      format: 1,
-      value: some(encodeBinaryArray(elemOid, v.dims, v.lowerBounds, elements)),
-    )
+  # Both paths validate the shape before encoding any element.
+  buildPgArrayParam(
+    T, v.dims, v.lowerBounds, v.elements.len, v.elements[i].isNone, v.elements[i].get
+  )
 
 proc toPgMoneyArrayNDParam*(
     v: PgArray[PgMoney], scale: int = 2

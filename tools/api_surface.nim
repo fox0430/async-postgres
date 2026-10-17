@@ -17,15 +17,16 @@
 ## the values). Object fields are `Type.field` so a named hub export of the
 ## type carries `*` fields into the promised surface.
 ##
-## Blind spot: this reads source lines, not the compiler table, so
-## template/macro expansions are invisible. Live public cases in neither
-## golden: name-based row accessors (`row.getInt("col")`) and index-based
-## array accessors (`row.getIntArray(0)`). `tests/test_aggregate.nim` probes
-## both.
+## Blind spot: this reads source lines, not the compiler table, so a template
+## or macro body counts once, not per expansion, and a `*` name it takes from
+## a parameter is invisible. Live public cases in neither golden: name-based
+## row accessors (`row.getInt("col")`) and index-based array accessors
+## (`row.getIntArray(0)`). `tests/test_aggregate.nim` probes both.
 ##
-## `template` / `macro` bodies are skipped: a `proc X*` there is codegen in
-## the caller, not this module's export. Wrapped signatures keep the skip
-## until the depth-0 `=`.
+## Exported `template` / `macro` bodies are skipped: a `proc X*` there is
+## codegen in the caller, not this module's export. Wrapped signatures keep
+## the skip until the depth-0 `=`. Only this module can call a private one,
+## so its body is read as this module's declarations.
 ##
 ## `Type.field` is promised only when `Type` is: a hub export of a proc that
 ## shares the field's name does not reach the field. `Enum.value` is promised
@@ -343,8 +344,48 @@ proc headerHasBodyEquals(text: string): bool =
     inc i
   false
 
+proc templateHeader(all: seq[string], start: int): (HashSet[string], int) =
+  ## Parameter names of the template / macro declared at `all[start]`, and the
+  ## index of its header's last line.
+  var header = ""
+  var last = start
+  for j in start ..< all.len:
+    header.add ' ' & stripLineComment(all[j]).strip()
+    if headerHasBodyEquals(header):
+      last = j
+      break
+  var params: HashSet[string]
+  proc addParam(piece: string) =
+    var name = piece
+    for i, c in piece:
+      if c in {':', '=', '{'}:
+        name = piece[0 ..< i]
+        break
+    name = name.strip().strip(chars = {'`'})
+    if name.len > 0:
+      params.incl name
+
+  let open = header.find('(')
+  if open >= 0:
+    var depth = 0
+    var piece = ""
+    for c in header[open + 1 ..^ 1]:
+      if c in {'(', '[', '{'}:
+        inc depth
+      elif c in {')', ']', '}'}:
+        if depth == 0:
+          addParam piece
+          break
+        dec depth
+      elif c in {',', ';'} and depth == 0:
+        addParam piece
+        piece = ""
+        continue
+      piece.add c
+  (params, last)
+
 proc collectStarNames(path: string): seq[StarName] =
-  ## Exported `*` names in `path`. Skips `template` / `macro` bodies.
+  ## Exported `*` names in `path`. Skips exported `template` / `macro` bodies.
   var occurrences: CountTable[string]
   let all = toSeq(lines(path))
   template emit(name: string, fieldOfType = false) =
@@ -364,9 +405,16 @@ proc collectStarNames(path: string): seq[StarName] =
   var objectIndent = -1
   var codegenIndent = -1
   var codegenAwaitEquals = false
+  var privateBodies: seq[(int, HashSet[string])]
+    ## Enclosing private template / macro indents and parameter names.
+  var headerEnd = -1
+  proc fromParam(name: string): bool =
+    let bare = name.strip(chars = {'`'})
+    privateBodies.anyIt(bare in it[1])
+
   for i, line in all:
     let body = stripLineComment(line)
-    if body.strip().len == 0:
+    if body.strip().len == 0 or i <= headerEnd:
       continue
     if codegenIndent >= 0:
       if line.indentation > codegenIndent:
@@ -381,6 +429,8 @@ proc collectStarNames(path: string): seq[StarName] =
           continue
       else:
         codegenIndent = -1
+    while privateBodies.len > 0 and line.indentation <= privateBodies[^1][0]:
+      discard privateBodies.pop()
     if objectType.len > 0 and line.indentation <= objectIndent:
       objectType = ""
       objectIndent = -1
@@ -392,13 +442,18 @@ proc collectStarNames(path: string): seq[StarName] =
     let stripped = body.strip()
     if stripped.startsWith("template ") or stripped.startsWith("macro "):
       let name = exportedName(line)
-      if name.len > 0:
+      if name.len == 0:
+        let (params, last) = templateHeader(all, i)
+        privateBodies.add (line.indentation, params)
+        headerEnd = last
+        continue
+      if not fromParam(name):
         emit name
       codegenIndent = line.indentation
       codegenAwaitEquals = not headerHasBodyEquals(body)
       continue
     let name = exportedName(line)
-    if name.len == 0:
+    if name.len == 0 or fromParam(name):
       continue
     emit name
     let enumAt = stripped.find("= enum")

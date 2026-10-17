@@ -168,6 +168,7 @@ const
     114, # json
     142, # xml
     143, # xml[]
+    199, # json[]
     600, # point
     601, # lseg
     602, # path
@@ -189,9 +190,13 @@ const
     869, # inet
     1000, # bool[]
     1001, # bytea[]
+    # "char"[] (1002) stays text: charout escapes high-bit bytes and NUL,
+    # which charsend sends raw, so the value would depend on the cache.
+    1003, # name[]
     1005, # int2[]
     1007, # int4[]
     1009, # text[]
+    1014, # bpchar[]
     1015, # varchar[]
     1016, # int8[]
     1017, # point[]
