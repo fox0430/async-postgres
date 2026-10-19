@@ -656,7 +656,8 @@ proc grantSlots(pool: PgPool, dial = true) =
   while pool.waiters.len > 0 and (
     pool.idle.len > 0 or
     (dial and pool.configFault == nil and pool.active < pool.config.maxSize)
-  ):
+  )
+  :
     let waiter = pool.waiters.popFirst()
     if waiter.isAbandoned:
       continue
