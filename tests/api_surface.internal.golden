@@ -523,6 +523,7 @@ async_postgres/pg_types/encoding.nim	pgArrayAcceptArrayOids
 async_postgres/pg_types/encoding.nim	pgArrayAcceptOids
 async_postgres/pg_types/encoding.nim	pgArrayArrayOid
 async_postgres/pg_types/encoding.nim	pgArrayElemOid
+async_postgres/pg_types/encoding.nim	pgArrayElemTypes
 async_postgres/pg_types/encoding.nim	pgDateDays
 async_postgres/pg_types/encoding.nim	pgDateText
 async_postgres/pg_types/encoding.nim	pgTimestampMicros

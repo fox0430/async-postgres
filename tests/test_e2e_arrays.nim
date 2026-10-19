@@ -1608,6 +1608,18 @@ suite "E2E: Multirange array types":
 
     waitFor t()
 
+template elemOptRoundtrip(pgType: string, v: untyped) =
+  test "get(seq[Option[T]]) reads " & pgType & "[] with a NULL element":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let arr = @[some(v), none(typeof(v))]
+      for fmt in [rfText, rfBinary]:
+        let res = await conn.query("SELECT $1::" & pgType & "[]", pgParams(arr), fmt)
+        doAssert res.rows[0].get(0, seq[Option[typeof(v)]]) == arr, $fmt
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Option/NULL array input and element-level output":
   test "seq[Option[int32]] roundtrip with NULL element":
     proc t() {.async.} =
@@ -1699,6 +1711,34 @@ suite "E2E: Option/NULL array input and element-level output":
       await conn.close()
 
     waitFor t()
+
+  # Every registered type has the codec pair; these had neither before 0.5.
+  elemOptRoundtrip("uuid", PgUuid("550e8400-e29b-41d4-a716-446655440000"))
+  elemOptRoundtrip("inet", PgInet(address: parseIpAddress("10.0.0.1"), mask: 24))
+  elemOptRoundtrip("cidr", PgCidr(address: parseIpAddress("10.0.0.0"), mask: 8))
+  elemOptRoundtrip("macaddr", PgMacAddr("08:00:2b:01:02:03"))
+  elemOptRoundtrip("macaddr8", PgMacAddr8("08:00:2b:01:02:03:04:05"))
+  elemOptRoundtrip("numeric", parsePgNumeric("1.5"))
+  elemOptRoundtrip("json", %*{"a": 1})
+  elemOptRoundtrip("jsonb", %*{"a": 1})
+  elemOptRoundtrip("varbit", parseBitString("101"))
+  elemOptRoundtrip("xml", PgXml("<a/>"))
+  elemOptRoundtrip("time", PgTime(hour: 1, minute: 2, second: 3, microsecond: 4))
+  elemOptRoundtrip(
+    "timetz", PgTimeTz(hour: 1, minute: 2, second: 3, microsecond: 4, utcOffset: 3600)
+  )
+  elemOptRoundtrip("interval", PgInterval(months: 1, days: 2, microseconds: 3))
+  elemOptRoundtrip("point", PgPoint(x: 1, y: 2))
+  elemOptRoundtrip("line", PgLine(a: 1, b: 2, c: 3))
+  elemOptRoundtrip("lseg", PgLseg(p1: PgPoint(x: 1, y: 2), p2: PgPoint(x: 3, y: 4)))
+  elemOptRoundtrip("box", PgBox(high: PgPoint(x: 3, y: 4), low: PgPoint(x: 1, y: 2)))
+  elemOptRoundtrip(
+    "path", PgPath(closed: true, points: @[PgPoint(x: 1, y: 2), PgPoint(x: 3, y: 4)])
+  )
+  elemOptRoundtrip(
+    "polygon", PgPolygon(points: @[PgPoint(x: 1, y: 2), PgPoint(x: 3, y: 4)])
+  )
+  elemOptRoundtrip("circle", PgCircle(center: PgPoint(x: 1, y: 2), radius: 1.5))
 
 type PgE2eMood = enum
   happy2 = "happy2"

@@ -785,14 +785,11 @@ apiExists(getXmlArray)
 apiExists(getXmlArrayOpt)
 apiExists(getXmlOpt)
 
-# -- array parameter probes
-# Pins the encoders the PgArray registry generates per type
+# -- array codec probes
+# Pins the codecs the PgArray registry generates per type
 # (`tools/api_surface.nim` lists each template declaration once): `seq[T]`,
-# `PgArray[T]` and `pgParams` for every registered type, and `seq[Option[T]]`
-# for exactly the types listed.
-const optSeqArrayTypes =
-  ["int16", "int32", "int64", "float32", "float64", "bool", "string"]
-
+# `seq[Option[T]]`, `PgArray[T]` and `pgParams` for every registered type, and
+# the `seq[Option[T]]` decoders behind `get`.
 macro apiArrayParams(): untyped =
   result = newStmtList()
   for registered in pgArrayElemTypes:
@@ -800,12 +797,19 @@ macro apiArrayParams(): untyped =
     # stopped exporting the type.
     let T = ident(registered.repr)
     let name = newLit(registered.repr)
-    let hasOptSeq = newLit(registered.repr in optSeqArrayTypes)
     result.add quote do:
-      when not compiles(pgParams(default(seq[`T`]), default(PgArray[`T`]))):
+      when not compiles(
+        pgParams(default(seq[`T`]), default(seq[Option[`T`]]), default(PgArray[`T`]))
+      ):
         {.error: "aggregate import does not encode `" & `name` & "` arrays".}
-      when compiles(toPgParam(default(seq[Option[`T`]]))) != `hasOptSeq`:
-        {.error: "seq[Option[" & `name` & "]] encoding differs from optSeqArrayTypes".}
+      when not compiles(
+        (
+          discard default(Row).get(0, seq[Option[`T`]])
+          discard default(Row).get(0, Option[seq[Option[`T`]]])
+          discard default(Row).get("c", seq[Option[`T`]])
+        )
+      ):
+        {.error: "aggregate import does not decode `seq[Option[" & `name` & "]]`".}
 
 apiArrayParams()
 

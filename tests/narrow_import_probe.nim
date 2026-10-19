@@ -9,8 +9,7 @@ import std/[macrocache, macros]
 from std/options import Option
 
 from ../async_postgres/pg_types import pgParams, toPgBinaryParam
-from ../async_postgres/pg_types/encoding {.all.} import
-  pgArrayElemTypes, pgArrayOptSeqElemTypes
+from ../async_postgres/pg_types/encoding import pgArrayElemTypes
 
 macro probeArrayParams(): untyped =
   result = newStmtList()
@@ -22,9 +21,6 @@ macro probeArrayParams(): untyped =
         {.error: "toPgBinaryParam alone does not encode `" & `name` & "` arrays".}
       when not compiles(pgParams(default(Option[seq[`T`]]))):
         {.error: "pgParams alone does not encode `Option[seq[" & `name` & "]]`".}
-  for T in pgArrayOptSeqElemTypes:
-    let name = newLit(T.repr)
-    result.add quote do:
       when not compiles(toPgBinaryParam(default(seq[Option[`T`]]))):
         {.
           error: "toPgBinaryParam alone does not encode `seq[Option[" & `name` & "]]`"

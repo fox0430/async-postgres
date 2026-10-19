@@ -1524,12 +1524,6 @@ async_postgres/pg_types/accessors.nim	get#68
 async_postgres/pg_types/accessors.nim	get#69
 async_postgres/pg_types/accessors.nim	get#7
 async_postgres/pg_types/accessors.nim	get#70
-async_postgres/pg_types/accessors.nim	get#71
-async_postgres/pg_types/accessors.nim	get#72
-async_postgres/pg_types/accessors.nim	get#73
-async_postgres/pg_types/accessors.nim	get#74
-async_postgres/pg_types/accessors.nim	get#75
-async_postgres/pg_types/accessors.nim	get#76
 async_postgres/pg_types/accessors.nim	get#8
 async_postgres/pg_types/accessors.nim	get#9
 async_postgres/pg_types/accessors.nim	getArrayND
