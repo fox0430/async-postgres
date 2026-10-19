@@ -94,7 +94,12 @@ type
 
   Waiter = ref object
     fut: Future[PgConnection]
+      ## Completed with a conn ready to use, or with nil for a slot granted by
+      ## `grantSlots`: the waiter then checks `grant` or dials into it itself.
     cancelled: bool
+    grant: PooledConn
+      ## An idle conn granted with the slot, not yet checked; nil `conn` for
+      ## an empty slot.
 
   PoolMetrics* = object ## Cumulative pool statistics.
     acquireCount*: int64 ## Total successful acquires
@@ -167,7 +172,7 @@ type
     pendingBackgroundTasks: seq[Future[void]]
       ## Fire-and-forget tasks tracked so `pool.close()` can drain them
       ## before returning. Populated by `closeNoWait` (connection closes)
-      ## and `spawnConnectForWaiter` (FIFO-driven background connects).
+      ## and the close of a connect an acquire's deadline orphaned.
     consecutiveConnectFailures: int
       ## Counter for exponential backoff in the maintenance loop. Reset to 0
       ## whenever a connect succeeds (in maintenance or acquire).
@@ -177,16 +182,17 @@ type
     configFault: ref PgConfigError
       ## The `PgConfigError` the first failing connect raised, if any. The
       ## config never changes for the life of the pool, so no later connect can
-      ## succeed: replenish and out-of-band spawns stop, stranded waiters are
-      ## failed, and an acquire that needs a new connection fails fast.
+      ## succeed: replenish stops, waiters get no empty slot, stranded waiters
+      ## are failed, and an acquire that needs a new connection fails fast.
     lastRefusal: ref CatchableError
       ## The latest refusal since a connect last succeeded. Another kind of
       ## failure leaves it: dials come from uncoordinated places, so only a
       ## success says the refusal cleared. It paces the replenish; no waiter is
       ## failed with it (see `failStrandedWaiters`).
-    spawnsInFlight: int
-      ## Unsettled `spawnConnectForWaiter` dials, so the per-tick respawn does
-      ## not stack a second one on a waiter.
+    dialsInFlight: int
+      ## An acquire's dials under way, counting the empty slots granted to
+      ## waiters not yet resumed: a refused pool's maintenance round makes no
+      ## dial of its own beside them.
 
 const bgTaskPruneThreshold = 16
   ## Sweep `pool.pendingBackgroundTasks` for finished futures only once its
@@ -520,22 +526,6 @@ proc tryHandoffToWaiter(pool: PgPool, conn: PgConnection): bool =
     return true
   return false
 
-proc failLastWaiter(pool: PgPool, err: ref CatchableError): bool =
-  ## Fail the most-recently-queued live (non-abandoned) waiter with `err`,
-  ## scanning from the back. Returns true if a waiter was failed.
-  ##
-  ## FIFO fairness: charge failures to the tail, never the head. A spawn failure
-  ## isn't bound to any waiter, so failing the head would hand its turn to a
-  ## younger waiter once a sibling spawn or release delivers from the front.
-  while pool.waiters.len > 0:
-    let waiter = pool.waiters.popLast()
-    if waiter.isAbandoned:
-      continue
-    pool.waiterCount.dec
-    waiter.fut.fail(err)
-    return true
-  return false
-
 proc scheduleConnectRetry(pool: PgPool, delay: Duration) =
   ## Set the earliest moment a connect may be attempted again. A zero delay
   ## clears the deadline, so a pool with backoff disabled falls back to the
@@ -609,9 +599,10 @@ proc connectRefusal*(pool: PgPool): ref CatchableError =
   ## `minSize` by a refusal surfaces. A failure of another kind, a config fault
   ## and a close leave it; the next successful connect clears it: an
   ## `acquire`'s, or the maintenance loop's every `connectBackoffMax` while the
-  ## pool is below `minSize`. The loop dials only while below `minSize` (or for
-  ## a stranded waiter), so a pool already at `minSize` keeps it longer. A
-  ## config fault itself is not recorded here; it surfaces as `pekConfigFault`.
+  ## pool is below `minSize`. The loop dials only while below `minSize` (a
+  ## waiter dials into its slot as an `acquire`), so a pool already at
+  ## `minSize` keeps it longer. A config fault itself is not recorded here; it
+  ## surfaces as `pekConfigFault`.
   pool.lastRefusal
 
 proc failStrandedWaiters(pool: PgPool, refusal: ref CatchableError = nil) =
@@ -645,117 +636,49 @@ proc canAttemptConnect(pool: PgPool): bool =
     return false
   pool.consecutiveConnectFailures == 0 or Moment.now() >= pool.nextConnectRetryAt
 
-proc canDialForWaiter(pool: PgPool): bool =
-  ## Whether a queued waiter may get a dial now. A refusal paces the replenish
-  ## only: like an `acquire`, a waiter hears from the server itself.
-  pool.configFault == nil and (pool.lastRefusal != nil or pool.canAttemptConnect())
-
 proc boundedConnConfig(pool: PgPool): ConnConfig =
   ## `connConfig` for a dial no acquire budget bounds: an unset
   ## `connectTimeout` falls back to `maintenanceInterval`, so a stalled dial or
-  ## handshake cannot hold the spawning task, or `close()`'s drain of it, open
+  ## handshake cannot hold the maintenance loop, or `close()`'s wait for it, open
   ## indefinitely. A zero `maintenanceInterval` would leave the fallback zero,
   ## which would read as no timeout: floor it so the bound holds.
   result = pool.config.connConfig
   if result.connectTimeout == ZeroDuration:
     result.connectTimeout = max(milliseconds(1), pool.config.maintenanceInterval)
 
-proc spawnConnectForWaiter(pool: PgPool) =
-  ## Open a connection asynchronously and hand it to the next queued waiter
-  ## (FIFO). The caller MUST have already incremented `pool.active` as a
-  ## capacity reservation before invoking this proc; the spawn rebalances
-  ## that reservation based on the outcome:
-  ## - delivered to a waiter: reservation stays consumed (the conn is the
-  ##   waiter's active connection)
-  ## - connect failed / no waiter remained / pool closed: reservation is
-  ##   released via `active.dec`
-  ##
-  ## On connect failure the most-recently-queued (tail) waiter is failed with a
-  ## `PgPoolError` wrapping the underlying error (available via `parent`) so the
-  ## caller's `acquire` returns promptly rather than waiting for `acquireTimeout`.
-  ## Failing the tail rather than the head preserves FIFO fairness (see
-  ## `failLastWaiter`).
-  ## The spawned future is tracked in
-  ## `pendingBackgroundTasks` so `pool.close()` drains it before returning.
-  let connCfg = pool.boundedConnConfig()
-
-  proc run() {.async.} =
-    var consumed = false
-    var refusal: ref CatchableError
-    try:
-      let conn = await connect(connCfg)
-      conn.ownerPool = pool
-      pool.metrics.createCount.inc
-      pool.noteConnected()
-      if pool.closed:
-        pool.metrics.closeCount.inc
-        await pool.tracedClose(conn)
-        return
-      if pool.tryHandoffToWaiter(conn):
-        consumed = true
-        return
-      # No waiter remained (all cancelled); park the conn in idle so it
-      # is not lost.
-      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
-    except CancelledError:
-      # Task cancellation is not a connect failure: don't bump the backoff
-      # counter or fail the waiter with a pool error. Nothing cancels these
-      # spawns today (close() awaits them via `pendingBackgroundTasks`), so
-      # this is defensive. Swallowed rather than re-raised: this future is
-      # `asyncSpawn`ed, and chronos treats a spawned task that finishes
-      # cancelled as a FutureDefect. The reservation is released by
-      # `finally`; the waiter stays queued, bounded by its own wait budget
-      # or failed by close().
-      discard
-    except CatchableError as e:
-      # Fail only the tail waiter, keeping the head's FIFO claim: the rest may
-      # still be served by a release, or by a spawn once the backoff window
-      # expires. After a config fault or a refusal, `finally` sweeps them.
-      #
-      # Wrap in PgPoolError before failing the waiter: acquire() documents
-      # PgPoolError for every failure mode, and a raw AsyncTimeoutError from
-      # `connConfig.connectTimeout` would otherwise be indistinguishable from
-      # the waiter's own wait-budget timeout in acquireImpl — whose handler
-      # decrements `waiterCount` a second time (failLastWaiter below already
-      # did) and permanently corrupts the FIFO fast-path guard.
-      let err =
-        case pool.noteConnectFailure(e)
-        of cfConfigFault:
-          pool.configFaultError()
-        of cfRefused:
-          refusal = e
-          refusedError(e)
-        of cfFailed:
-          newPoolError(pekConnectFailed, "Pool connect for waiter failed", e)
-      discard pool.failLastWaiter(err)
-    finally:
-      pool.spawnsInFlight.dec
-      if not consumed and pool.active > 0:
-        pool.active.dec
-      pool.failStrandedWaiters(refusal)
-
-  pool.pruneBackgroundTasks()
-  pool.spawnsInFlight.inc
-  let fut = run()
-  pool.pendingBackgroundTasks.add(fut)
-  asyncSpawn fut
-
-proc respawnForStrandedWaiter(pool: PgPool, refusal: ref CatchableError = nil) =
-  ## Kick a background connect for the head waiter after a caller-driven
-  ## acquire failure released its reserved `active` slot. Without this, a
-  ## waiter that queued while the failed caller held the slot has no spawn
-  ## attached (queue-time spawn was skipped because `active == maxSize`) and
-  ## no borrower to release, so it would sit until its own wait budget elapses.
-  ## The maintenance loop also calls it each tick, for waiters a failed
-  ## background spawn left behind. `refusal`: the failed dial was refused,
-  ## which answers the waiters too.
-  if pool.closed or pool.waiterCount <= pool.spawnsInFlight:
+proc grantSlots(pool: PgPool, dial = true) =
+  ## Hand free capacity to queued waiters, head first. A waiter gets an idle
+  ## conn with its slot, or, when `dial` and no config fault forbid it, an
+  ## empty slot under `maxSize`. Either way it checks the conn or dials itself,
+  ## within its own budget, like an `acquire` on the fast path.
+  if pool.closed:
     return
-  if refusal == nil and pool.active < pool.config.maxSize and pool.canDialForWaiter():
+  while pool.waiters.len > 0 and (
+    pool.idle.len > 0 or
+    (dial and pool.configFault == nil and pool.active < pool.config.maxSize)
+  )
+  :
+    let waiter = pool.waiters.popFirst()
+    if waiter.isAbandoned:
+      continue
+    if pool.idle.len > 0:
+      waiter.grant = pool.idle.popFirst()
+    else:
+      pool.dialsInFlight.inc
+    pool.waiterCount.dec
     pool.active.inc
-    pool.spawnConnectForWaiter()
-  else:
-    pool.failStrandedWaiters(refusal)
+    waiter.fut.complete(nil)
+
+proc releaseSlot(pool: PgPool, refusal: ref CatchableError = nil) =
+  ## Give up a slot that got its holder no conn, and pass the freed capacity
+  ## on to queued waiters head-first: parked idle conns drain first, then one
+  ## empty slot. `refusal`:
+  ## the holder's dial was just refused, so no waiter gets an empty slot to
+  ## repeat it; with nothing else to serve them, they fail with it.
+  if pool.active > 0:
+    pool.active.dec
+  pool.grantSlots(dial = refusal == nil)
+  pool.failStrandedWaiters(refusal)
 
 proc settleReplenishConnect(pool: PgPool, conn: PgConnection, now: Moment) =
   ## Settle a fresh replenishment connection: the pre-reserved `pool.active`
@@ -817,10 +740,11 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
 
     pool.idle = remaining
 
-    # Ahead of the gate below: it is `canDialForWaiter` that decides, not the
-    # backoff (a refusal does not hold back a stranded waiter's dial), and a
-    # config fault fails the waiters instead.
-    pool.respawnForStrandedWaiter()
+    # Ahead of the backoff gate below: the backoff paces the replenish only, so
+    # a waiter still gets an empty slot to dial into, and a config fault fails
+    # the waiters instead.
+    pool.grantSlots()
+    pool.failStrandedWaiters()
 
     # Skip the replenish phase for good after a config fault (see
     # `configFault`), and while we are inside a backoff window from a recent
@@ -837,10 +761,10 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     let currentTotal = pool.idle.len + pool.active
     var needed = max(0, pool.config.minSize - currentTotal)
     if pool.lastRefusal != nil:
-      # One dial to see whether the server still refuses, not one per slot; a
-      # waiter's dial in flight is that one.
+      # One dial to see whether the server still refuses, not one per slot; an
+      # acquire's dial under way is that one.
       needed = min(needed, 1)
-      if pool.spawnsInFlight > 0:
+      if pool.dialsInFlight > 0:
         needed = 0
     if needed > 0:
       if pool.closed:
@@ -962,25 +886,20 @@ proc releaseCore(
   # the head waiter and never reaches `idle`, so under a queue that never
   # drains an expired conn would stay in use indefinitely.
   if pool.closed or discarded or pool.isExpired(conn, now):
-    if pool.active > 0:
-      pool.active.dec
+    # The freed slot goes to the head waiter, which dials into it.
+    pool.releaseSlot()
     pool.closeNoWait(
       conn, byUser = conn.borrowedByUser and pool.closed and not discarded
     )
-    # A discarded or expired conn frees an `active` slot without serving a
-    # waiter; spawn a replacement so the head waiter is not stranded.
-    pool.respawnForStrandedWaiter()
     return (true, false)
   # FIFO handoff: serve the head waiter directly with the released conn.
   # `active` is intentionally not decremented — the conn is still in use, just
-  # by a different borrower. Waiters behind the head are covered by the spawns
-  # emitted at queue-time (acquireImpl), by broken-release replacements, or by
-  # `respawnForStrandedWaiter` on caller-driven connect failures.
+  # by a different borrower.
   if pool.tryHandoffToWaiter(conn):
     return (false, true)
   if pool.active > 0:
     pool.active.dec
-  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
+  pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
   return (false, false)
 
 proc releaseImpl(pool: PgPool, conn: PgConnection) =
@@ -1155,9 +1074,10 @@ proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
   ## cancellation.
   ##
   ## Skip the decrement when the pool already settled this waiter — a handoff
-  ## (`completed()`) or a `failLastWaiter`/`close` (`failed()`) already
-  ## decremented `waiterCount`, and a second decrement would drive it negative,
-  ## permanently disabling the FIFO fast-path guard and the `maxWaiters` bound.
+  ## or a slot grant (`completed()`), or a `failStrandedWaiters`/`close`
+  ## (`failed()`) already decremented `waiterCount`, and a second decrement
+  ## would drive it negative, permanently disabling the FIFO fast-path guard
+  ## and the `maxWaiters` bound.
   ## Such a settle can still race with this cleanup: under asyncdispatch `wait()`
   ## can't cancel its inner future, so `withTimeout` may surface AsyncTimeoutError
   ## on the same tick the future already completed *or* failed.
@@ -1174,11 +1094,24 @@ proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
   ## 0 after failing waiters, and a chronos waiter whose inner future was already
   ## cancelled before close() ran may still reach this cleanup afterwards.
   if waiter.fut.completed():
-    # Not `release()`: the pool is returning its own handoff, not the
-    # application giving the connection back.
-    waiter.fut.read().releaseReclaimed()
+    let conn = waiter.fut.read()
+    if conn != nil:
+      # Not `release()`: the pool is returning its own handoff, not the
+      # application giving the connection back.
+      conn.releaseReclaimed()
+    else:
+      # A granted slot: put its unchecked conn back where it came from, and
+      # pass the slot on.
+      if waiter.grant.conn == nil:
+        pool.dialsInFlight.dec
+      elif pool.closed:
+        pool.closeNoWait(waiter.grant.conn)
+      else:
+        # Taken from the front, so returned to the front to keep FIFO order.
+        pool.idle.addFirst(waiter.grant)
+      pool.releaseSlot()
   elif waiter.fut.failed():
-    discard # failLastWaiter/close already decremented; no conn was delivered
+    discard # failStrandedWaiters/close already decremented; no conn was delivered
   else:
     waiter.cancelled = true
     if pool.waiterCount > 0:
@@ -1215,250 +1148,262 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
     pool.metrics.acquireDuration =
       pool.metrics.acquireDuration + (Moment.now() - acquireStart)
 
-  # FIFO fairness: skip the idle / new-conn fast paths when waiters are
-  # already queued, otherwise a fresh caller would jump the queue. Cancelled
-  # waiters don't count (they're swept lazily by release/handoff), so the
-  # `waiterCount` field — which tracks only live waiters — is the guard. It is
-  # checked once: a waiter that queues during a ping below arrived after this
-  # caller, which reuses the slot of a conn it discards unless it gives up.
-  if pool.waiterCount == 0:
-    # Try to get an idle connection
-    while pool.idle.len > 0:
-      # Re-taken per iteration: the health-check ping below awaits.
-      let now = Moment.now()
-      let pc = pool.idle.popFirst()
-      if pc.conn.state != csReady or pc.conn.socketHasFin():
-        # closeNoWait: avoid an await point where a cancellation could be
-        # swallowed by tracedClose and leak the next acquired conn (see ping guard).
-        pool.closeNoWait(pc.conn)
-        continue
-      if pool.isExpired(pc.conn, now):
-        pool.closeNoWait(pc.conn)
-        continue
-      # Health check: ping connections that have been idle too long.
-      # TLS connections use the tighter `tlsHealthCheckTimeout` window because
-      # the MSG_PEEK probe above cannot see TLS alerts or any ErrorResponse
-      # already encrypted into the TCP buffer — only a real round-trip can.
-      let idleThreshold =
-        if pc.conn.sslEnabled:
-          pool.config.tlsHealthCheckTimeout
-        else:
-          pool.config.healthCheckTimeout
-      if idleThreshold > ZeroDuration and now - pc.lastUsedAt > idleThreshold:
-        var pingBudget = pool.config.pingTimeout
-        if hasDeadline:
-          let rem = remainingBudget()
-          # Don't start a ping unless a realistic round trip's worth of
-          # budget remains (`pingBudgetFloor`, or the user's own tighter
-          # `pingTimeout`): a ping doomed to time out would discard a
-          # connection that may well be healthy. Put it back for the next
-          # acquirer instead and report the timeout.
-          let pingFloor =
-            if pingBudget > ZeroDuration:
-              min(pingBudget, pingBudgetFloor)
-            else:
-              pingBudgetFloor
-          if rem < pingFloor:
-            pool.idle.addFirst(pc)
-            raiseAcquireTimeout()
-          pingBudget =
-            if pingBudget == ZeroDuration:
-              rem
-            else:
-              min(pingBudget, rem)
-        # Count the conn as active across the ping so a concurrent acquire
-        # can't overshoot maxSize while it is off `idle`.
-        pool.active.inc
-        var alive = true
+  # FIFO fairness: skip the fast path when waiters are already queued,
+  # otherwise a fresh caller would jump the queue. Cancelled waiters don't
+  # count (they're swept lazily by release/handoff), so the `waiterCount`
+  # field — which tracks only live waiters — is the guard. It is checked once:
+  # a waiter that queues during a ping below arrived after this caller, which
+  # keeps its slot across the conns it discards.
+  #
+  # The caller takes a slot first, from free capacity or as a waiter's grant,
+  # and holds it across every ping and dial below; an idle conn always leaves
+  # room for it under `maxSize`. An exit that gets it no conn passes the slot
+  # on to the next waiter (`releaseSlot`).
+  var queued = pool.waiterCount > 0
+  while true:
+    var candidate: PooledConn
+    if not queued and (
+      pool.idle.len > 0 or
+      (pool.configFault == nil and pool.active < pool.config.maxSize)
+    ):
+      pool.active.inc
+    else:
+      # Either max connections are reached or waiters are queued ahead of us;
+      # queue up for a released conn or a slot.
+      if pool.configFault != nil and pool.active == 0 and pool.idle.len == 0:
+        # No borrower will release and no connect can succeed (see
+        # `configFault`): fail now instead of waiting out the acquire budget.
+        raise pool.configFaultError()
+      if pool.config.maxWaiters >= 0 and pool.waiterCount >= pool.config.maxWaiters:
+        raise newPoolError(
+          pekQueueFull,
+          "Pool acquire queue full (maxWaiters=" & $pool.config.maxWaiters & ")",
+        )
+      # Compute the remaining budget before queueing; whatever the idle
+      # health-check pings consumed comes out of the waiter wait below.
+      var waitBudget = ZeroDuration
+      if hasDeadline:
+        waitBudget = remainingBudget()
+        if waitBudget <= ZeroDuration:
+          raiseAcquireTimeout()
+      # If `close()` finished during any await above, its waiter sweep is done
+      # and nothing will fail a waiter enqueued after it — `await fut` would hang.
+      if pool.closed:
+        raisePoolClosed()
+      let fut = newFuture[PgConnection]("PgPool.acquire")
+      let waiter = Waiter(fut: fut, cancelled: false)
+      pool.waiters.addLast(waiter)
+      pool.waiterCount.inc
+      # Queued behind others while `active < maxSize`: the head gets the slot.
+      pool.grantSlots()
+
+      var conn: PgConnection
+      if hasDeadline:
         try:
-          await pc.conn.ping(pingBudget)
+          # `settleAbandonedWaiter` reads the outcome after a timeout.
+          conn = await fut.waitKeepingOutcome(waitBudget)
+        except AsyncTimeoutError:
+          pool.metrics.timeoutCount.inc
+          pool.settleAbandonedWaiter(waiter)
+          raise newPoolError(pekAcquireTimeout, "Pool acquire timeout")
         except CancelledError as e:
-          # CancelledError is a CatchableError; the generic handler below would
-          # swallow it, letting acquire run on and return a connection the
-          # departed canceller leaks. The interrupted ping leaves the protocol
-          # out of sync, so close the popped conn (closeNoWait, since the pending
-          # cancellation would interrupt a fresh await) and re-raise.
-          pool.active.dec
-          pool.closeNoWait(pc.conn)
-          pool.respawnForStrandedWaiter()
+          # External cancellation (e.g. a caller's `wait()`-style deadline such
+          # as pool.withTransactionDeadline or a cluster fallback timeout) can
+          # land here too: `fut.wait()` propagates cancellation into `fut`.
+          # Same cleanup as the no-deadline branch below.
+          pool.settleAbandonedWaiter(waiter)
           raise e
-        except CatchableError:
-          alive = false
-        # Discard it if the ping failed, a close() during the ping didn't drain
-        # it, or it expired meanwhile (the lifetime check above is stale).
-        if not alive or pool.closed or pool.isExpired(pc.conn, Moment.now()):
-          pool.active.dec
+      else:
+        try:
+          conn = await fut
+        except CancelledError as e:
+          # The caller's `wait()`-style timeout (e.g. pool.withTransactionDeadline)
+          # cancelled this acquire. Mirrors the AsyncTimeoutError path above.
+          pool.settleAbandonedWaiter(waiter)
+          raise e
+      if conn != nil:
+        recordAcquire()
+        return (conn, false)
+      # A granted slot, maybe with an idle conn still to check.
+      candidate = waiter.grant
+      if candidate.conn == nil:
+        pool.dialsInFlight.dec
+    queued = true
+
+    var served = false
+    var refusal: ref CatchableError
+    try:
+      while true:
+        var pc: PooledConn
+        if candidate.conn != nil:
+          pc = candidate
+          candidate = PooledConn()
+        elif pool.idle.len > 0:
+          pc = pool.idle.popFirst()
+        else:
+          break
+        # Re-taken per conn: the health-check ping below awaits.
+        let now = Moment.now()
+        if pc.conn.state != csReady or pc.conn.socketHasFin():
+          # closeNoWait: avoid an await point where a cancellation could be
+          # swallowed by tracedClose and leak the next acquired conn (see ping guard).
           pool.closeNoWait(pc.conn)
-          if pool.closed:
-            raisePoolClosed()
           continue
+        if pool.isExpired(pc.conn, now):
+          pool.closeNoWait(pc.conn)
+          continue
+        # Health check: ping connections that have been idle too long.
+        # TLS connections use the tighter `tlsHealthCheckTimeout` window because
+        # the MSG_PEEK probe above cannot see TLS alerts or any ErrorResponse
+        # already encrypted into the TCP buffer — only a real round-trip can.
+        let idleThreshold =
+          if pc.conn.sslEnabled:
+            pool.config.tlsHealthCheckTimeout
+          else:
+            pool.config.healthCheckTimeout
+        if idleThreshold > ZeroDuration and now - pc.lastUsedAt > idleThreshold:
+          var pingBudget = pool.config.pingTimeout
+          if hasDeadline:
+            let rem = remainingBudget()
+            # Don't start a ping unless a realistic round trip's worth of
+            # budget remains (`pingBudgetFloor`, or the user's own tighter
+            # `pingTimeout`): a ping doomed to time out would discard a
+            # connection that may well be healthy. Put it back for the next
+            # acquirer instead and report the timeout.
+            let pingFloor =
+              if pingBudget > ZeroDuration:
+                min(pingBudget, pingBudgetFloor)
+              else:
+                pingBudgetFloor
+            if rem < pingFloor:
+              pool.idle.addFirst(pc)
+              raiseAcquireTimeout()
+            pingBudget =
+              if pingBudget == ZeroDuration:
+                rem
+              else:
+                min(pingBudget, rem)
+          var alive = true
+          try:
+            await pc.conn.ping(pingBudget)
+          except CancelledError as e:
+            # CancelledError is a CatchableError; the generic handler below would
+            # swallow it, letting acquire run on and return a connection the
+            # departed canceller leaks. The interrupted ping leaves the protocol
+            # out of sync, so close the popped conn (closeNoWait, since the pending
+            # cancellation would interrupt a fresh await) and re-raise.
+            pool.closeNoWait(pc.conn)
+            raise e
+          except CatchableError:
+            alive = false
+          # Discard it if the ping failed, a close() during the ping didn't drain
+          # it, or it expired meanwhile (the lifetime check above is stale).
+          if not alive or pool.closed or pool.isExpired(pc.conn, Moment.now()):
+            pool.closeNoWait(pc.conn)
+            if pool.closed:
+              raisePoolClosed()
+            continue
+        elif pool.closed:
+          pool.closeNoWait(pc.conn)
+          raisePoolClosed()
         pc.conn.borrowed = true
         recordAcquire()
+        served = true
         return (pc.conn, false)
-      if pool.closed:
-        pool.closeNoWait(pc.conn)
-        raisePoolClosed()
-      pool.active.inc
-      pc.conn.borrowed = true
-      recordAcquire()
-      return (pc.conn, false)
 
-    # No idle connections; create new if under limit. A recorded config fault
-    # skips the doomed dial: only a borrower's release could serve us now.
-    if pool.configFault == nil and pool.active < pool.config.maxSize:
-      let connCfg = pool.config.connConfig
-      var rem = ZeroDuration
-      if hasDeadline:
-        rem = remainingBudget()
-        if rem <= ZeroDuration:
-          # A waiter that queued during a ping above got no dial (the ping held
-          # the slot): hand it the slot this caller gives up.
-          pool.respawnForStrandedWaiter()
-          raiseAcquireTimeout()
-      pool.active.inc
-      var newConn: PgConnection
-      try:
+      # No idle connection left: dial into the slot. A granted waiter can get
+      # here after `close()`, whose idle sweep it missed.
+      if pool.closed:
+        raisePoolClosed()
+      # A recorded config fault skips the doomed dial: only a borrower's release
+      # could serve us now, so queue up for one instead.
+      if pool.configFault == nil:
+        let connCfg = pool.config.connConfig
+        var rem = ZeroDuration
         if hasDeadline:
-          # Bound the whole connect (across multi-host failover) by the acquire
-          # budget: per-address `connectTimeout` alone lets total wait reach
-          # `connectTimeout * addresses`. Under asyncdispatch the orphan close
-          # mirrors `attemptHostTimed`'s handling.
-          let attempt = connect(connCfg)
-          when hasAsyncDispatch:
-            newConn = await attempt.wait(
-              rem,
-              onOrphan = proc(fut: Future[PgConnection]) =
-                if fut.completed():
-                  # Track the orphan close so pool.close()'s drain awaits it.
-                  pool.pruneBackgroundTasks()
-                  let closeFut = (
-                    proc() {.async.} =
-                      try:
-                        let orphan = fut.read()
-                        if orphan != nil:
-                          await orphan.closeImpl(byUser = false)
-                      except CatchableError:
-                        discard
-                  )()
-                  pool.pendingBackgroundTasks.add(closeFut)
-                  asyncSpawn closeFut
-              ,
-            )
+          rem = remainingBudget()
+          if rem <= ZeroDuration:
+            raiseAcquireTimeout()
+        var newConn: PgConnection
+        pool.dialsInFlight.inc
+        try:
+          if hasDeadline:
+            # Bound the whole connect (across multi-host failover) by the acquire
+            # budget: per-address `connectTimeout` alone lets total wait reach
+            # `connectTimeout * addresses`. Under asyncdispatch the orphan close
+            # mirrors `attemptHostTimed`'s handling.
+            let attempt = connect(connCfg)
+            when hasAsyncDispatch:
+              newConn = await attempt.wait(
+                rem,
+                onOrphan = proc(fut: Future[PgConnection]) =
+                  if fut.completed():
+                    # Track the orphan close so pool.close()'s drain awaits it.
+                    pool.pruneBackgroundTasks()
+                    let closeFut = (
+                      proc() {.async.} =
+                        try:
+                          let orphan = fut.read()
+                          if orphan != nil:
+                            await orphan.closeImpl(byUser = false)
+                        except CatchableError:
+                          discard
+                    )()
+                    pool.pendingBackgroundTasks.add(closeFut)
+                    asyncSpawn closeFut
+                ,
+              )
+            else:
+              newConn = await attempt.wait(rem)
           else:
-            newConn = await attempt.wait(rem)
-        else:
-          newConn = await connect(connCfg)
-      except CancelledError as e:
-        # Cancellation (e.g. a caller's wait()-style deadline) must propagate
-        # unwrapped so the canceller's machinery sees it.
-        pool.active.dec
-        pool.respawnForStrandedWaiter()
-        raise e
-      except CatchableError as e:
-        pool.active.dec
-        # `perform()` aggregates per-host errors into `PgConnectionError`, so
-        # the exception type alone can't tell an acquire timeout from a run of
-        # connect failures — the deadline is authoritative. The 1ms slack
-        # absorbs asyncdispatch's timer imprecision (it can fire hundreds of
-        # microseconds early).
-        let budgetSpent = hasDeadline and remainingBudget() <= milliseconds(1)
-        let failure =
-          if budgetSpent and connectFailureOf(e) == cfFailed:
-            # Cut short by the caller's budget: nothing learned of the server.
-            cfFailed
-          else:
-            pool.noteConnectFailure(e, backOff = false)
-        pool.respawnForStrandedWaiter(if failure == cfRefused: e else: nil)
-        case failure
-        of cfConfigFault:
-          raise pool.configFaultError()
-        of cfRefused:
-          raise refusedError(e)
-        of cfFailed:
-          discard
-        if budgetSpent:
-          pool.metrics.timeoutCount.inc
-          raise newPoolError(pekAcquireTimeout, "Pool acquire timeout", e)
-        raise newPoolError(pekConnectFailed, "Pool connect failed", e)
-      pool.metrics.createCount.inc
-      # A successful caller-driven connect signals the DB is reachable —
-      # let the maintenance loop resume immediate replenishment.
-      pool.noteConnected()
-      if pool.closed:
-        pool.active.dec
-        pool.closeNoWait(newConn)
-        raisePoolClosed()
-      newConn.ownerPool = pool
-      newConn.borrowed = true
-      recordAcquire()
-      return (newConn, true)
-
-  # Either max connections are reached or waiters are queued ahead of us;
-  # queue up and wait for delivery.
-  if pool.configFault != nil and pool.active == 0 and pool.idle.len == 0:
-    # No borrower will release and no connect can succeed (see `configFault`):
-    # fail now instead of waiting out the acquire budget, along with any waiter
-    # that queued during a ping above while the fault was recorded.
-    pool.failStrandedWaiters()
-    raise pool.configFaultError()
-  if pool.config.maxWaiters >= 0 and pool.waiterCount >= pool.config.maxWaiters:
-    raise newPoolError(
-      pekQueueFull,
-      "Pool acquire queue full (maxWaiters=" & $pool.config.maxWaiters & ")",
-    )
-  # Compute the remaining budget before queueing; whatever the idle
-  # health-check pings consumed comes out of the waiter wait below.
-  var waitBudget = ZeroDuration
-  if hasDeadline:
-    waitBudget = remainingBudget()
-    if waitBudget <= ZeroDuration:
-      raiseAcquireTimeout()
-  # If `close()` finished during any await above, its waiter sweep is done and
-  # nothing will fail a waiter enqueued after it — `await fut` would hang.
-  if pool.closed:
-    raisePoolClosed()
-  let fut = newFuture[PgConnection]("PgPool.acquire")
-  let waiter = Waiter(fut: fut, cancelled: false)
-  pool.waiters.addLast(waiter)
-  pool.waiterCount.inc
-
-  # FIFO fairness: if the pool still has spare capacity but we're queued
-  # behind others, open an out-of-band connection so the front waiter is
-  # served promptly. Without this, the queue would only drain when an
-  # existing borrower releases — broken-conn releases (which discard
-  # instead of handing off) could otherwise leave waiters stalled even
-  # though `active < maxSize`.
-  if pool.active < pool.config.maxSize and pool.canDialForWaiter():
-    pool.active.inc
-    pool.spawnConnectForWaiter()
-
-  if hasDeadline:
-    try:
-      # `settleAbandonedWaiter` reads the outcome after a timeout.
-      let conn = await fut.waitKeepingOutcome(waitBudget)
-      recordAcquire()
-      return (conn, false)
-    except AsyncTimeoutError:
-      pool.metrics.timeoutCount.inc
-      pool.settleAbandonedWaiter(waiter)
-      raise newPoolError(pekAcquireTimeout, "Pool acquire timeout")
-    except CancelledError as e:
-      # External cancellation (e.g. a caller's `wait()`-style deadline such as
-      # pool.withTransactionDeadline or a cluster fallback timeout) can land
-      # here too: `fut.wait()` propagates cancellation into `fut`. Same cleanup
-      # as the no-deadline branch below.
-      pool.settleAbandonedWaiter(waiter)
-      raise e
-  else:
-    try:
-      let conn = await fut
-      recordAcquire()
-      return (conn, false)
-    except CancelledError as e:
-      # The caller's `wait()`-style timeout (e.g. pool.withTransactionDeadline)
-      # cancelled this acquire. Mirrors the AsyncTimeoutError path above.
-      pool.settleAbandonedWaiter(waiter)
-      raise e
+            newConn = await connect(connCfg)
+        except CancelledError as e:
+          # Cancellation (e.g. a caller's wait()-style deadline) must propagate
+          # unwrapped so the canceller's machinery sees it.
+          pool.dialsInFlight.dec
+          raise e
+        except CatchableError as e:
+          pool.dialsInFlight.dec
+          # `perform()` aggregates per-host errors into `PgConnectionError`, so
+          # the exception type alone can't tell an acquire timeout from a run of
+          # connect failures — the deadline is authoritative. The 1ms slack
+          # absorbs asyncdispatch's timer imprecision (it can fire hundreds of
+          # microseconds early).
+          let budgetSpent = hasDeadline and remainingBudget() <= milliseconds(1)
+          let failure =
+            if budgetSpent and connectFailureOf(e) == cfFailed:
+              # Cut short by the caller's budget: nothing learned of the server.
+              cfFailed
+            else:
+              pool.noteConnectFailure(e, backOff = false)
+          case failure
+          of cfConfigFault:
+            raise pool.configFaultError()
+          of cfRefused:
+            refusal = e
+            raise refusedError(e)
+          of cfFailed:
+            discard
+          if budgetSpent:
+            pool.metrics.timeoutCount.inc
+            raise newPoolError(pekAcquireTimeout, "Pool acquire timeout", e)
+          raise newPoolError(pekConnectFailed, "Pool connect failed", e)
+        pool.dialsInFlight.dec
+        pool.metrics.createCount.inc
+        # A successful caller-driven connect signals the DB is reachable —
+        # let the maintenance loop resume immediate replenishment.
+        pool.noteConnected()
+        if pool.closed:
+          pool.closeNoWait(newConn)
+          raisePoolClosed()
+        newConn.ownerPool = pool
+        newConn.borrowed = true
+        recordAcquire()
+        served = true
+        return (newConn, true)
+    finally:
+      if not served:
+        pool.releaseSlot(refusal)
 
 proc acquireCommon(pool: PgPool, byUser: bool): Future[PgConnection] {.async.} =
   ## Shared body of `acquire` and `acquireInternal`: run `acquireImpl` under
@@ -2999,7 +2944,7 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ##
   ## When `timeout > ZeroDuration`, `timeout` is a single deadline shared by
   ## both the active-connection drain and the background-task drain. Pending
-  ## background spawns still in flight when the deadline elapses are
+  ## background closes still running when the deadline elapses are
   ## cancelled so close() returns promptly. Without a timeout (or
   ## `ZeroDuration`), active connections are closed on release and the
   ## background drain waits unbounded.
@@ -3070,10 +3015,10 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   if pool.active > 0:
     await sleepAsync(ZeroDuration)
 
-  # Drain fire-and-forget tasks (closeNoWait, spawnConnectForWaiter). Late
+  # Drain fire-and-forget tasks (closeNoWait, orphaned-connect closes). Late
   # release() may push more mid-await; snapshot-and-clear preserves them.
-  # Bounded by closeDeadline: without it, a stuck spawn's connect pins close()
-  # up to `maintenanceInterval` (30s default) past `timeout`.
+  # Bounded by closeDeadline: without it, a stuck close pins close() past
+  # `timeout`.
   while pool.pendingBackgroundTasks.len > 0:
     let pending = pool.pendingBackgroundTasks
     pool.pendingBackgroundTasks.setLen(0)
