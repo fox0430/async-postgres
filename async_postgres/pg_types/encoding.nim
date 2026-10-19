@@ -1327,20 +1327,16 @@ proc toPgBinaryParam*(
 
 # PgArray[T] element registry. One registration per element type yields its
 # element and array OIDs, the element OIDs its decoders accept and the element
-# encoder, and ``seqPgArrayParams`` gives it the 1-D ``toPgParam(seq[T])`` (and
-# ``toPgParam(seq[Option[T]])`` with ``optSeq``), so they cannot drift apart.
-# The decoders live in ``accessors.nim`` next to ``getArrayND[T]``.
+# encoder, and ``seqPgArrayParams`` gives it the 1-D ``toPgParam(seq[T])`` and
+# ``toPgParam(seq[Option[T]])``, so they cannot drift apart. The decoders live
+# in ``accessors.nim`` next to ``getArrayND[T]``.
 
-const pgArrayElemTypes = CacheSeq"async_postgres.pgArrayElemTypes"
-  ## Every registered element type. Tests read it through ``{.all.}``.
+const pgArrayElemTypes* = CacheSeq"async_postgres.pgArrayElemTypes"
+  ## Every registered element type. Sibling-only: ``accessors.nim`` generates
+  ## its per-type decoders from it.
 
-const pgArrayOptSeqElemTypes = CacheSeq"async_postgres.pgArrayOptSeqElemTypes"
-  ## The registered types with ``optSeq``.
-
-macro recordPgArrayElemType(T: typed, optSeq: static bool): untyped =
+macro recordPgArrayElemType(T: typed): untyped =
   pgArrayElemTypes.add(T)
-  if optSeq:
-    pgArrayOptSeqElemTypes.add(T)
   result = newStmtList()
 
 proc pgArrayElemFixedWidth[T](_: typedesc[T]): int {.inline.} =
@@ -1360,10 +1356,7 @@ template pgTextBytes[T](v: T): string =
     string(v)
 
 template registerPgArrayElem(
-    T: typedesc,
-    elemOid, arrayOid: int32,
-    acceptOids, acceptArrayOids: untyped,
-    optSeq: static bool,
+    T: typedesc, elemOid, arrayOid: int32, acceptOids, acceptArrayOids: untyped
 ) =
   proc pgArrayElemOid*(_: typedesc[T]): int32 =
     elemOid
@@ -1379,21 +1372,15 @@ template registerPgArrayElem(
   template pgArrayAcceptArrayOids*(_: typedesc[T]): untyped =
     acceptArrayOids
 
-  recordPgArrayElemType(T, optSeq)
+  recordPgArrayElemType(T)
 
 template fixedPgArrayElem(
-    T: typedesc,
-    elemOid, arrayOid: int32,
-    width: int,
-    optSeq: static bool,
-    writeExpr: untyped,
+    T: typedesc, elemOid, arrayOid: int32, width: int, writeExpr: untyped
 ) =
   ## ``writeExpr`` writes ``v`` into ``buf[pos ..< pos + width]``. The array
   ## encoders fill one buffer with it instead of a ``seq[byte]`` per element,
   ## so no per-element encoder is generated for a fixed-width type.
-  ## ``optSeq`` adds ``toPgParam(seq[Option[T]])``; it has no default because
-  ## the trailing block would bind to it.
-  registerPgArrayElem(T, elemOid, arrayOid, [elemOid], [arrayOid], optSeq)
+  registerPgArrayElem(T, elemOid, arrayOid, [elemOid], [arrayOid])
 
   proc pgArrayElemFixedWidth(_: typedesc[T]): int {.inline.} =
     width
@@ -1407,26 +1394,22 @@ template varPgArrayElem(
     T: typedesc,
     elemOid, arrayOid: int32,
     acceptOids, acceptArrayOids: untyped,
-    optSeq: static bool,
     encodeExpr: untyped,
 ) =
   ## ``encodeExpr`` returns the element bytes of ``v``.
-  registerPgArrayElem(T, elemOid, arrayOid, acceptOids, acceptArrayOids, optSeq)
+  registerPgArrayElem(T, elemOid, arrayOid, acceptOids, acceptArrayOids)
 
   proc encodePgArrayElement*(v {.inject.}: T): seq[byte] =
     encodeExpr
 
-template varPgArrayElem(
-    T: typedesc, elemOid, arrayOid: int32, optSeq: static bool, encodeExpr: untyped
-) =
-  varPgArrayElem(T, elemOid, arrayOid, [elemOid], [arrayOid], optSeq, encodeExpr)
+template varPgArrayElem(T: typedesc, elemOid, arrayOid: int32, encodeExpr: untyped) =
+  varPgArrayElem(T, elemOid, arrayOid, [elemOid], [arrayOid], encodeExpr)
 
 template textPgArrayElem(
     T: typedesc,
     elemOid, arrayOid: int32,
     acceptOids, acceptArrayOids: untyped,
     what: string,
-    optSeq: static bool,
 ) =
   ## The element bytes are the type's ``string`` form. Their length is known
   ## without copying, so the array encoders check every element before copying
@@ -1437,52 +1420,48 @@ template textPgArrayElem(
   proc pgArrayElemCheckFirst(_: typedesc[T]): bool {.inline.} =
     true
 
-  varPgArrayElem(T, elemOid, arrayOid, acceptOids, acceptArrayOids, optSeq):
+  varPgArrayElem(T, elemOid, arrayOid, acceptOids, acceptArrayOids):
     checkPgArrayElement(v)
     toBytes(pgTextBytes(v))
 
 template textPgArrayElem(
-    T: typedesc,
-    elemOid, arrayOid: int32,
-    acceptOids: untyped,
-    what: string,
-    optSeq: static bool,
+    T: typedesc, elemOid, arrayOid: int32, acceptOids: untyped, what: string
 ) =
-  textPgArrayElem(T, elemOid, arrayOid, acceptOids, [arrayOid], what, optSeq)
+  textPgArrayElem(T, elemOid, arrayOid, acceptOids, [arrayOid], what)
 
-fixedPgArrayElem(int16, OidInt2, OidInt2Array, 2, optSeq = true):
+fixedPgArrayElem(int16, OidInt2, OidInt2Array, 2):
   buf.writeBE16(pos, v)
-fixedPgArrayElem(int32, OidInt4, OidInt4Array, 4, optSeq = true):
+fixedPgArrayElem(int32, OidInt4, OidInt4Array, 4):
   buf.writeBE32(pos, v)
-fixedPgArrayElem(int64, OidInt8, OidInt8Array, 8, optSeq = true):
+fixedPgArrayElem(int64, OidInt8, OidInt8Array, 8):
   buf.writeBE64(pos, v)
-fixedPgArrayElem(float32, OidFloat4, OidFloat4Array, 4, optSeq = true):
+fixedPgArrayElem(float32, OidFloat4, OidFloat4Array, 4):
   buf.writeBE32(pos, cast[int32](v))
-fixedPgArrayElem(float64, OidFloat8, OidFloat8Array, 8, optSeq = true):
+fixedPgArrayElem(float64, OidFloat8, OidFloat8Array, 8):
   buf.writeBE64(pos, cast[int64](v))
-fixedPgArrayElem(bool, OidBool, OidBoolArray, 1, optSeq = true):
+fixedPgArrayElem(bool, OidBool, OidBoolArray, 1):
   buf[pos] = (if v: 1'u8 else: 0'u8)
-fixedPgArrayElem(PgUuid, OidUuid, OidUuidArray, 16, optSeq = false):
+fixedPgArrayElem(PgUuid, OidUuid, OidUuidArray, 16):
   buf.writeUuidAt(pos, v)
-fixedPgArrayElem(PgInterval, OidInterval, OidIntervalArray, 16, optSeq = false):
+fixedPgArrayElem(PgInterval, OidInterval, OidIntervalArray, 16):
   buf.writeIntervalAt(pos, v)
-fixedPgArrayElem(PgTime, OidTime, OidTimeArray, 8, optSeq = false):
+fixedPgArrayElem(PgTime, OidTime, OidTimeArray, 8):
   buf.writeTimeAt(pos, v)
-fixedPgArrayElem(PgTimeTz, OidTimeTz, OidTimeTzArray, 12, optSeq = false):
+fixedPgArrayElem(PgTimeTz, OidTimeTz, OidTimeTzArray, 12):
   buf.writeTimeTzAt(pos, v)
-fixedPgArrayElem(PgMacAddr, OidMacAddr, OidMacAddrArray, 6, optSeq = false):
+fixedPgArrayElem(PgMacAddr, OidMacAddr, OidMacAddrArray, 6):
   buf.writeMacAt(pos, string(v), 6, "PgMacAddr")
-fixedPgArrayElem(PgMacAddr8, OidMacAddr8, OidMacAddr8Array, 8, optSeq = false):
+fixedPgArrayElem(PgMacAddr8, OidMacAddr8, OidMacAddr8Array, 8):
   buf.writeMacAt(pos, string(v), 8, "PgMacAddr8")
-fixedPgArrayElem(PgPoint, OidPoint, OidPointArray, 16, optSeq = false):
+fixedPgArrayElem(PgPoint, OidPoint, OidPointArray, 16):
   buf.writePointAt(pos, v)
-fixedPgArrayElem(PgLine, OidLine, OidLineArray, 24, optSeq = false):
+fixedPgArrayElem(PgLine, OidLine, OidLineArray, 24):
   buf.writeLineAt(pos, v)
-fixedPgArrayElem(PgLseg, OidLseg, OidLsegArray, 32, optSeq = false):
+fixedPgArrayElem(PgLseg, OidLseg, OidLsegArray, 32):
   buf.writeLsegAt(pos, v)
-fixedPgArrayElem(PgBox, OidBox, OidBoxArray, 32, optSeq = false):
+fixedPgArrayElem(PgBox, OidBox, OidBoxArray, 32):
   buf.writeBoxAt(pos, v)
-fixedPgArrayElem(PgCircle, OidCircle, OidCircleArray, 24, optSeq = false):
+fixedPgArrayElem(PgCircle, OidCircle, OidCircleArray, 24):
   buf.writeCircleAt(pos, v)
 
 # A text-typed array of any character type decodes as ``string``.
@@ -1493,39 +1472,28 @@ textPgArrayElem(
   [OidText, OidVarchar, OidBpchar, OidName, OidChar],
   [OidTextArray, OidVarcharArray, OidBpcharArray, OidNameArray, OidCharArray],
   "string",
-  optSeq = true,
 )
-textPgArrayElem(PgXml, OidXml, OidXmlArray, [OidXml], "xml", optSeq = false)
+textPgArrayElem(PgXml, OidXml, OidXmlArray, [OidXml], "xml")
 # ``bit`` and ``bit varying`` share the wire format; arrays are sent as varbit.
 varPgArrayElem(
-  PgBit,
-  OidVarbit,
-  OidVarbitArray,
-  [OidBit, OidVarbit],
-  [OidBitArray, OidVarbitArray],
-  optSeq = false,
+  PgBit, OidVarbit, OidVarbitArray, [OidBit, OidVarbit], [OidBitArray, OidVarbitArray]
 ):
   toPgBinaryParam(v).value.get
 # Always sent as jsonb; ``json[]`` is read too (no version byte on the wire).
 varPgArrayElem(
-  JsonNode,
-  OidJsonb,
-  OidJsonbArray,
-  [OidJson, OidJsonb],
-  [OidJsonArray, OidJsonbArray],
-  optSeq = false,
+  JsonNode, OidJsonb, OidJsonbArray, [OidJson, OidJsonb], [OidJsonArray, OidJsonbArray]
 ):
   encodeJsonbBinary(v)
-varPgArrayElem(PgNumeric, OidNumeric, OidNumericArray, optSeq = false):
+varPgArrayElem(PgNumeric, OidNumeric, OidNumericArray):
   encodeNumericBinary(v)
 # ``inet`` / ``cidr`` carry an IPv4 or IPv6 address, so their width varies.
-varPgArrayElem(PgInet, OidInet, OidInetArray, optSeq = false):
+varPgArrayElem(PgInet, OidInet, OidInetArray):
   encodeInetBinary(v.address, v.mask, false)
-varPgArrayElem(PgCidr, OidCidr, OidCidrArray, optSeq = false):
+varPgArrayElem(PgCidr, OidCidr, OidCidrArray):
   encodeInetBinary(v.address, v.mask, true)
-varPgArrayElem(PgPath, OidPath, OidPathArray, optSeq = false):
+varPgArrayElem(PgPath, OidPath, OidPathArray):
   toPgBinaryParam(v).value.get
-varPgArrayElem(PgPolygon, OidPolygon, OidPolygonArray, optSeq = false):
+varPgArrayElem(PgPolygon, OidPolygon, OidPolygonArray):
   toPgBinaryParam(v).value.get
 
 # Below the registrations on purpose: a template declared where only the
@@ -1603,12 +1571,11 @@ template optSeqPgArrayParam(T: untyped) =
     )
 
 macro seqPgArrayParams(): untyped =
-  ## ``toPgParam(seq[T])`` for every registered ``T``, and
-  ## ``toPgParam(seq[Option[T]])`` for those registered with ``optSeq``.
+  ## ``toPgParam(seq[T])`` and ``toPgParam(seq[Option[T]])`` for every
+  ## registered ``T``.
   result = newStmtList()
   for T in pgArrayElemTypes:
     result.add getAst(seqPgArrayParam(T))
-  for T in pgArrayOptSeqElemTypes:
     result.add getAst(optSeqPgArrayParam(T))
 
 seqPgArrayParams()

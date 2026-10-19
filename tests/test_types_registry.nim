@@ -40,14 +40,6 @@ macro forEachRegistered(check: untyped): untyped =
   for T in pgArrayElemTypes:
     result.add newCall(check, T)
 
-macro forEachRegisteredOptSeq(check: untyped): untyped =
-  var optSeqNames: seq[string]
-  for T in pgArrayOptSeqElemTypes:
-    optSeqNames.add T.repr
-  result = newStmtList()
-  for T in pgArrayElemTypes:
-    result.add newCall(check, T, newLit(T.repr in optSeqNames))
-
 macro typeNames(registered: static bool): untyped =
   var names: seq[string]
   if registered:
@@ -91,15 +83,25 @@ proc encodedElem[T](v: T): seq[byte] =
   else:
     result = encodePgArrayElement(v)
 
-template checkOptSeqPair(T: typedesc, expected: static bool) =
-  block:
-    checkpoint $T
-    # ``optSeq`` registrations yield ``toPgParam(seq[Option[T]])`` while the
-    # generic ``get`` overloads for ``seq[Option[T]]`` delegate to the
-    # hand-written ElemOpt getters. One side without the other is a
-    # half-exposed API, so both sides must match the registry flag.
-    check compiles(toPgParam(default(seq[Option[T]]))) == expected
-    check compiles(get(default(Row), 0, seq[Option[T]])) == expected
+proc textArrayLiteral[T](v: T): string =
+  ## ``{v,NULL}`` in PostgreSQL's text array syntax.
+  let param = toPgParam(v)
+  # Integers, floats and bool encode in binary; their ``$`` is the text form.
+  let elem =
+    if param.format == 0:
+      cast[string](param.value.get)
+    else:
+      $v
+  when T is PgBox:
+    # ``box`` delimits array elements with ``;`` and needs no quoting.
+    "{" & elem & ";NULL}"
+  else:
+    var quoted = "\""
+    for c in elem:
+      if c in {'"', '\\'}:
+        quoted.add '\\'
+      quoted.add c
+    "{" & quoted & "\",NULL}"
 
 template checkRegistered(T: typedesc) =
   block:
@@ -138,11 +140,11 @@ template checkRegistered(T: typedesc) =
     check nDim.oid == arrayOid
     check nDim.value == oneDim.value
     # ``pgParams`` binds only the ``toPgParam`` overloads its module can see.
-    check pgParams(@[v], pgArray(@[v])) == @[oneDim, nDim]
-    # Which types have a ``seq[Option[T]]`` encoder is pinned in test_aggregate.
-    when compiles(toPgParam(@[some(v)])):
-      check pgParams(@[some(v)]) == @[toPgParam(@[some(v)])]
-      check toPgParam(@[some(v), none(T)]) == toPgParam(pgArray(@[some(v), none(T)]))
+    check pgParams(@[v], pgArray(@[v]), @[some(v)]) ==
+      @[oneDim, nDim, toPgParam(@[some(v)])]
+    check toPgParam(@[some(v), none(T)]) == toPgParam(pgArray(@[some(v), none(T)]))
+    let textRow = mkRow(@[some(toBytes(textArrayLiteral(v)))], @[mkField(arrayOid, 0)])
+    check get(textRow, 0, seq[Option[T]]) == @[some(v), none(T)]
     # Every element OID the decoders accept reads back as ``v`` through the
     # scalar, 1-D and N-D accessors alike.
     for oid in pgArrayAcceptOids(T):
@@ -153,6 +155,11 @@ template checkRegistered(T: typedesc) =
         mkRow(@[some(encodeBinaryArray(oid, @[wire]))], @[mkField(arrayOid, 1)])
       check read1D(T, arrRow) == @[v]
       check getArrayND[T](arrRow, 0) == pgArray(@[v])
+      let nullRow = mkRow(
+        @[some(encodeBinaryArray(oid, [2'i32], [some(wire), none(seq[byte])]))],
+        @[mkField(arrayOid, 1)],
+      )
+      check get(nullRow, 0, seq[Option[T]]) == @[some(v), none(T)]
 
 fixture(int16, 7'i16, getInt16, getInt16Array)
 fixture(int32, 7'i32, getInt, getIntArray)
@@ -340,9 +347,6 @@ suite "Array registry vs the scalar codecs and both array codecs":
   test "registered types":
     forEachRegistered(checkRegistered)
 
-  test "optSeq encoders and ElemOpt decoders agree":
-    forEachRegisteredOptSeq(checkOptSeqPair)
-
   test "types outside the registry stay outside":
     # They have scalar or 1-D codecs only; the generic codec rejects them at
     # compile time, mostly with an ``{.error.}`` naming the alternative.
@@ -351,6 +355,7 @@ suite "Array registry vs the scalar codecs and both array codecs":
       check not compiles(pgArrayAcceptArrayOids(T))
       check not compiles(toPgParam(default(PgArray[T])))
       check not compiles(getArrayND[T](default(Row), 0))
+      check not compiles(get(default(Row), 0, seq[Option[T]]))
 
     outside(PgMoney)
     outside(PgTsVector)

@@ -1,4 +1,4 @@
-import std/[options, json, strutils, tables, times]
+import std/[json, macrocache, macros, options, strutils, tables, times]
 
 import ../pg_protocol
 import core, decoding, encoding
@@ -1308,6 +1308,160 @@ proc decodePgArrayElement(_: typedesc[PgCircle], buf: openArray[byte]): PgCircle
   result.center = decodePointBinary(buf, 0)
   result.radius = decodeFloat64BE(buf, 16)
 
+# Text counterpart of ``decodePgArrayElement``, one per registered element type.
+
+proc parsePgArrayElement(_: typedesc[int16], s: string): int16 =
+  pgParseInt16(s)
+
+proc parsePgArrayElement(_: typedesc[int32], s: string): int32 =
+  pgParseInt32(s)
+
+proc parsePgArrayElement(_: typedesc[int64], s: string): int64 =
+  pgParseBiggestInt(s)
+
+proc parsePgArrayElement(_: typedesc[float32], s: string): float32 =
+  pgParseFloat32(s)
+
+proc parsePgArrayElement(_: typedesc[float64], s: string): float64 =
+  pgParseFloat(s)
+
+proc parsePgArrayElement(_: typedesc[bool], s: string): bool =
+  parsePgBoolText(s)
+
+proc parsePgArrayElement(_: typedesc[string], s: string): string =
+  s
+
+proc parsePgArrayElement(_: typedesc[PgXml], s: string): PgXml =
+  PgXml(s)
+
+proc parsePgArrayElement(_: typedesc[PgBit], s: string): PgBit =
+  parseBitString(s)
+
+proc parsePgArrayElement(_: typedesc[JsonNode], s: string): JsonNode =
+  parsePgJson(s, "Invalid JSON element")
+
+proc parsePgArrayElement(_: typedesc[PgUuid], s: string): PgUuid =
+  PgUuid(s)
+
+proc parsePgArrayElement(_: typedesc[PgNumeric], s: string): PgNumeric =
+  parsePgNumeric(s)
+
+proc parsePgArrayElement(_: typedesc[PgInterval], s: string): PgInterval =
+  parseIntervalText(s)
+
+proc parsePgArrayElement(_: typedesc[PgTime], s: string): PgTime =
+  parseTimeText(s)
+
+proc parsePgArrayElement(_: typedesc[PgTimeTz], s: string): PgTimeTz =
+  parseTimeTzText(s)
+
+proc parsePgArrayElement[T: PgInet | PgCidr](_: typedesc[T], s: string): T =
+  let (ip, mask) = parseInetText(s)
+  result.address = ip
+  result.mask = mask
+
+proc parsePgArrayElement(_: typedesc[PgMacAddr], s: string): PgMacAddr =
+  PgMacAddr(s)
+
+proc parsePgArrayElement(_: typedesc[PgMacAddr8], s: string): PgMacAddr8 =
+  PgMacAddr8(s)
+
+proc parsePgArrayElement(_: typedesc[PgPoint], s: string): PgPoint =
+  parsePointText(s)
+
+proc parsePgArrayElement(_: typedesc[PgLine], s: string): PgLine =
+  let v = s.strip()
+  var inner = v
+  if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
+    inner = inner[1 ..^ 2]
+  else:
+    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
+  let parts = inner.split(',')
+  if parts.len != 3:
+    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
+  PgLine(
+    a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
+  )
+
+proc parsePgArrayElement(_: typedesc[PgLseg], s: string): PgLseg =
+  let v = s.strip()
+  var inner = v
+  if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
+    inner = inner[1 ..^ 2]
+  let points = parsePointsText(inner)
+  if points.len != 2:
+    raise newException(PgTypeError, "Invalid lseg (len=" & $v.len & ")")
+  PgLseg(p1: points[0], p2: points[1])
+
+proc parsePgArrayElement(_: typedesc[PgBox], s: string): PgBox =
+  let v = s.strip()
+  let points = parsePointsText(v)
+  if points.len != 2:
+    raise newException(PgTypeError, "Invalid box (len=" & $v.len & ")")
+  PgBox(high: points[0], low: points[1])
+
+proc parsePgArrayElement(_: typedesc[PgPath], s: string): PgPath =
+  let v = s.strip()
+  if not isPathLiteral(v):
+    raise newException(PgTypeError, "Invalid path (len=" & $v.len & ")")
+  let closed = v[0] == '('
+  let inner = v[1 ..^ 2]
+  PgPath(closed: closed, points: parsePointsText(inner))
+
+proc parsePgArrayElement(_: typedesc[PgPolygon], s: string): PgPolygon =
+  let v = s.strip()
+  if v.len < 2 or v[0] != '(' or v[^1] != ')':
+    raise newException(PgTypeError, "Invalid polygon (len=" & $v.len & ")")
+  PgPolygon(points: parsePointsText(v[1 ..^ 2]))
+
+proc parsePgArrayElement(_: typedesc[PgCircle], s: string): PgCircle =
+  let v = s.strip()
+  if v.len < 2 or v[0] != '<' or v[^1] != '>':
+    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
+  let inner = v[1 ..^ 2]
+  var depth = 0
+  var lastComma = -1
+  for j in 0 ..< inner.len:
+    if inner[j] == '(':
+      depth += 1
+    elif inner[j] == ')':
+      depth -= 1
+    elif inner[j] == ',' and depth == 0:
+      lastComma = j
+  if lastComma < 0:
+    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
+  PgCircle(
+    center: parsePointText(inner[0 ..< lastComma]),
+    radius: pgParseFloat(inner[lastComma + 1 ..^ 1]),
+  )
+
+proc boxTextElements(s: string): seq[Option[string]] =
+  ## Elements of a text ``box[]`` literal: ``box`` is the one built-in type
+  ## whose array delimiter is ``;``, so `parseTextArray` cannot split it.
+  if s.len < 2 or s[0] != '{' or s[^1] != '}':
+    # Same rule as `parseTextArray`: point at the brace that is wrong, or at 0
+    # when the literal is too short to have one.
+    let bracePos =
+      if s.len >= 2 and s[0] == '{':
+        s.len - 1
+      else:
+        0
+    raise newException(
+      PgTypeError,
+      "Invalid box array literal (len=" & $s.len & ", pos=" & $bracePos & ")",
+    )
+  let inner = s[1 ..^ 2]
+  if inner.len == 0:
+    return
+  for p in inner.split(';'):
+    let v = p.strip()
+    result.add(
+      if v == "NULL":
+        none(string)
+      else:
+        some(v)
+    )
+
 # Named helpers where typedesc dispatch can't distinguish: DateTime is shared
 # by timestamp/timestamptz/date; JsonNode needs runtime elemOid.
 
@@ -1394,16 +1548,19 @@ template genArrayDecoder(
   )
 
 template genArrayDecoder(
-    getProc: untyped, T: typedesc, typeName: static string, textBody: untyped
+    getProc: untyped, T: typedesc, typeName: static string
 ) {.dirty.} =
-  ## Registered ``T``: the accepted element OIDs come from the array registry.
-  genArrayDecoder(getProc, T, typeName, pgArrayAcceptOids(T), textBody)
+  ## Registered ``T``: the accepted element OIDs and the text parser come from
+  ## the array registry.
+  genArrayDecoder(
+    getProc, T, typeName, pgArrayAcceptOids(T), parsePgArrayElement(T, e.get)
+  )
 
 # Scalar array decoders.
 
-genArrayDecoder(getIntArray, int32, "int", pgParseInt32(e.get))
-genArrayDecoder(getInt16Array, int16, "int16", pgParseInt16(e.get))
-genArrayDecoder(getInt64Array, int64, "int64", pgParseBiggestInt(e.get))
+genArrayDecoder(getIntArray, int32, "int")
+genArrayDecoder(getInt16Array, int16, "int16")
+genArrayDecoder(getInt64Array, int64, "int64")
 
 proc moneyArrayFromBinary(row: Row, col: int, scale: int): seq[PgMoney] =
   ## Shared binary ``money[]`` decode for both `getMoneyArray` overloads.
@@ -1468,12 +1625,12 @@ proc getMoneyArray*(row: Row, col: int, conv: PgMoneyConventions): seq[PgMoney] 
       result.add(parsePgMoney(e, conv))
 
 # ``getFloatArray`` decodes ``float8[]`` only; ``float4[]`` raises PgTypeError.
-genArrayDecoder(getFloatArray, float64, "float", pgParseFloat(e.get))
-genArrayDecoder(getFloat32Array, float32, "float32", pgParseFloat32(e.get))
+genArrayDecoder(getFloatArray, float64, "float")
+genArrayDecoder(getFloat32Array, float32, "float32")
 
-genArrayDecoder(getBoolArray, bool, "bool", parsePgBoolText(e.get))
-genArrayDecoder(getStrArray, string, "string", e.get)
-genArrayDecoder(getBitArray, PgBit, "bit", parseBitString(e.get))
+genArrayDecoder(getBoolArray, bool, "bool")
+genArrayDecoder(getStrArray, string, "string")
+genArrayDecoder(getBitArray, PgBit, "bit")
 
 # Temporal array decoders
 
@@ -1507,27 +1664,22 @@ genArrayDecoderCustom(
   parseDateText(e.get),
 )
 
-genArrayDecoder(getTimeArray, PgTime, "time", parseTimeText(e.get))
-genArrayDecoder(getTimeTzArray, PgTimeTz, "timetz", parseTimeTzText(e.get))
-genArrayDecoder(getIntervalArray, PgInterval, "interval", parseIntervalText(e.get))
+genArrayDecoder(getTimeArray, PgTime, "time")
+genArrayDecoder(getTimeTzArray, PgTimeTz, "timetz")
+genArrayDecoder(getIntervalArray, PgInterval, "interval")
 
 # Identifier / network array decoders
 
-genArrayDecoder(getUuidArray, PgUuid, "uuid", PgUuid(e.get))
+genArrayDecoder(getUuidArray, PgUuid, "uuid")
 
-proc inetElemFromText[T](s: string): T =
-  let (ip, mask) = parseInetText(s)
-  result.address = ip
-  result.mask = mask
-
-genArrayDecoder(getInetArray, PgInet, "inet", inetElemFromText[PgInet](e.get))
-genArrayDecoder(getCidrArray, PgCidr, "cidr", inetElemFromText[PgCidr](e.get))
-genArrayDecoder(getMacAddrArray, PgMacAddr, "macaddr", PgMacAddr(e.get))
-genArrayDecoder(getMacAddr8Array, PgMacAddr8, "macaddr8", PgMacAddr8(e.get))
+genArrayDecoder(getInetArray, PgInet, "inet")
+genArrayDecoder(getCidrArray, PgCidr, "cidr")
+genArrayDecoder(getMacAddrArray, PgMacAddr, "macaddr")
+genArrayDecoder(getMacAddr8Array, PgMacAddr8, "macaddr8")
 
 # Numeric / binary / JSON array decoders
 
-genArrayDecoder(getNumericArray, PgNumeric, "numeric", parsePgNumeric(e.get))
+genArrayDecoder(getNumericArray, PgNumeric, "numeric")
 
 proc bytesElemFromText(s: string): seq[byte] =
   const errCtx = "bytea array element"
@@ -1545,9 +1697,6 @@ proc bytesElemFromText(s: string): seq[byte] =
 
 genArrayDecoder(getBytesArray, seq[byte], "bytea", [OidBytea], bytesElemFromText(e.get))
 
-proc jsonElemFromText(s: string): JsonNode =
-  parsePgJson(s, "Invalid JSON element")
-
 genArrayDecoderCustom(
   getJsonArray,
   JsonNode,
@@ -1556,40 +1705,16 @@ genArrayDecoderCustom(
   decodeJsonArrayElem(
     row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1), decoded.elemOid
   ),
-  jsonElemFromText(e.get),
+  parsePgArrayElement(JsonNode, e.get),
 )
 
 # Geometric array decoders
 
-genArrayDecoder(getPointArray, PgPoint, "point", parsePointText(e.get))
+genArrayDecoder(getPointArray, PgPoint, "point")
 
-proc lineElemFromText(s: string): PgLine =
-  let v = s.strip()
-  var inner = v
-  if inner.len >= 2 and inner[0] == '{' and inner[^1] == '}':
-    inner = inner[1 ..^ 2]
-  else:
-    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
-  let parts = inner.split(',')
-  if parts.len != 3:
-    raise newException(PgTypeError, "Invalid line (len=" & $v.len & ")")
-  PgLine(
-    a: pgParseFloat(parts[0]), b: pgParseFloat(parts[1]), c: pgParseFloat(parts[2])
-  )
+genArrayDecoder(getLineArray, PgLine, "line")
 
-genArrayDecoder(getLineArray, PgLine, "line", lineElemFromText(e.get))
-
-proc lsegElemFromText(s: string): PgLseg =
-  let v = s.strip()
-  var inner = v
-  if inner.len >= 2 and inner[0] == '[' and inner[^1] == ']':
-    inner = inner[1 ..^ 2]
-  let points = parsePointsText(inner)
-  if points.len != 2:
-    raise newException(PgTypeError, "Invalid lseg (len=" & $v.len & ")")
-  PgLseg(p1: points[0], p2: points[1])
-
-genArrayDecoder(getLsegArray, PgLseg, "lseg", lsegElemFromText(e.get))
+genArrayDecoder(getLsegArray, PgLseg, "lseg")
 
 proc getBoxArray*(row: Row, col: int): seq[PgBox] =
   if row.isBinaryCol(col):
@@ -1612,79 +1737,22 @@ proc getBoxArray*(row: Row, col: int): seq[PgBox] =
           PgBox, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
         )
     return
-  # PostgreSQL uses ';' as array element delimiter for box type
-  let s = row.getStr(col)
-  if s.len < 2 or s[0] != '{' or s[^1] != '}':
-    # Same rule as `parseTextArray`: point at the brace that is wrong, or at 0
-    # when the literal is too short to have one.
-    let bracePos =
-      if s.len >= 2 and s[0] == '{':
-        s.len - 1
-      else:
-        0
-    raise newException(
-      PgTypeError,
-      "Column " & $col & ": Invalid box array literal (len=" & $s.len & ", pos=" &
-        $bracePos & ")",
-    )
-  let inner = s[1 ..^ 2]
-  if inner.len == 0:
-    return
-  let parts = inner.split(';')
+  let textCell = row.getStr(col)
   withColumnContext(col):
-    for p in parts:
-      let v = p.strip()
-      if v == "NULL":
+    for e in boxTextElements(textCell):
+      if e.isNone:
         raise newException(PgTypeError, "NULL element in box array")
-      let points = parsePointsText(v)
-      if points.len != 2:
-        raise newException(PgTypeError, "Invalid box (len=" & $v.len & ")")
-      result.add(PgBox(high: points[0], low: points[1]))
+      result.add(parsePgArrayElement(PgBox, e.get))
 
-proc pathElemFromText(s: string): PgPath =
-  let v = s.strip()
-  if not isPathLiteral(v):
-    raise newException(PgTypeError, "Invalid path (len=" & $v.len & ")")
-  let closed = v[0] == '('
-  let inner = v[1 ..^ 2]
-  PgPath(closed: closed, points: parsePointsText(inner))
+genArrayDecoder(getPathArray, PgPath, "path")
 
-genArrayDecoder(getPathArray, PgPath, "path", pathElemFromText(e.get))
+genArrayDecoder(getPolygonArray, PgPolygon, "polygon")
 
-proc polygonElemFromText(s: string): PgPolygon =
-  let v = s.strip()
-  if v.len < 2 or v[0] != '(' or v[^1] != ')':
-    raise newException(PgTypeError, "Invalid polygon (len=" & $v.len & ")")
-  PgPolygon(points: parsePointsText(v[1 ..^ 2]))
-
-genArrayDecoder(getPolygonArray, PgPolygon, "polygon", polygonElemFromText(e.get))
-
-proc circleElemFromText(s: string): PgCircle =
-  let v = s.strip()
-  if v.len < 2 or v[0] != '<' or v[^1] != '>':
-    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
-  let inner = v[1 ..^ 2]
-  var depth = 0
-  var lastComma = -1
-  for j in 0 ..< inner.len:
-    if inner[j] == '(':
-      depth += 1
-    elif inner[j] == ')':
-      depth -= 1
-    elif inner[j] == ',' and depth == 0:
-      lastComma = j
-  if lastComma < 0:
-    raise newException(PgTypeError, "Invalid circle (len=" & $v.len & ")")
-  PgCircle(
-    center: parsePointText(inner[0 ..< lastComma]),
-    radius: pgParseFloat(inner[lastComma + 1 ..^ 1]),
-  )
-
-genArrayDecoder(getCircleArray, PgCircle, "circle", circleElemFromText(e.get))
+genArrayDecoder(getCircleArray, PgCircle, "circle")
 
 # Other array decoders
 
-genArrayDecoder(getXmlArray, PgXml, "xml", PgXml(e.get))
+genArrayDecoder(getXmlArray, PgXml, "xml")
 genArrayDecoder(
   getTsVectorArray, PgTsVector, "tsvector", [OidTsVector], PgTsVector(e.get)
 )
@@ -1695,60 +1763,64 @@ genArrayDecoder(
 
 # Element-level NULL-safe array getters
 
-# Like ``genArrayDecoder`` but yields ``seq[Option[T]]``: a NULL element maps
-# to ``none(T)`` instead of raising. Short form uses ``decodePgArrayElement``;
-# ``…Custom`` takes an explicit ``binBody``.
-template genArrayDecoderElemOptCustom(
-    getProc: untyped, T: typedesc, elemOids: untyped, binBody, textBody: untyped
-) {.dirty.} =
-  proc getProc*(row: Row, col: int): seq[Option[T]] =
-    if row.isBinaryCol(col):
-      let (off, clen) = cellInfo(row, col)
-      if clen == -1:
-        raise newException(PgTypeError, "Column " & $col & " is NULL")
-      let decoded = withColumnContext(
-        col, decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
-      )
-      withColumnContext(col, rejectMultiDim(decoded))
-      withColumnContext(
-        col, checkArrayElemOid(astToStr(getProc), decoded.elemOid, elemOids)
-      )
-      result = newSeq[Option[T]](decoded.elements.len)
-      withColumnContext(col):
-        for i, e in decoded.elements:
-          if e.len == -1:
-            result[i] = none(T)
-          else:
-            result[i] = some(binBody)
-      return
-    let textCell = row.getStr(col)
+proc arrayElemOptImpl[T](row: Row, col: int, accessor: string): seq[Option[T]] =
+  ## Like the ``genArrayDecoder`` getters but a NULL element maps to ``none(T)``
+  ## instead of raising. Shared by every registered element type.
+  if row.isBinaryCol(col):
+    let (off, clen) = cellInfo(row, col)
+    if clen == -1:
+      raise newException(PgTypeError, "Column " & $col & " is NULL")
+    let decoded = withColumnContext(
+      col, decodeBinaryArray(row.data.buf.toOpenArray(off, off + clen - 1))
+    )
+    withColumnContext(col, rejectMultiDim(decoded))
+    withColumnContext(
+      col, checkArrayElemOid(accessor, decoded.elemOid, pgArrayAcceptOids(T))
+    )
+    result = newSeq[Option[T]](decoded.elements.len)
     withColumnContext(col):
-      for e in parseTextArray(textCell):
-        if e.isNone:
-          result.add(none(T))
+      for i, e in decoded.elements:
+        if e.len == -1:
+          result[i] = none(T)
         else:
-          result.add(some(textBody))
+          when T is JsonNode:
+            result[i] = some(
+              decodeJsonArrayElem(
+                row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1),
+                decoded.elemOid,
+              )
+            )
+          else:
+            result[i] = some(
+              decodePgArrayElement(
+                T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
+              )
+            )
+    return
+  let textCell = row.getStr(col)
+  withColumnContext(col):
+    let elems =
+      when T is PgBox:
+        boxTextElements(textCell)
+      else:
+        parseTextArray(textCell)
+    for e in elems:
+      if e.isNone:
+        result.add(none(T))
+      else:
+        result.add(some(parsePgArrayElement(T, e.get)))
 
-template genArrayDecoderElemOpt(
-    getProc: untyped, T: typedesc, textBody: untyped
-) {.dirty.} =
-  genArrayDecoderElemOptCustom(
-    getProc,
-    T,
-    pgArrayAcceptOids(T),
-    decodePgArrayElement(
-      T, row.data.buf.toOpenArray(off + e.off, off + e.off + e.len - 1)
-    ),
-    textBody,
-  )
+template genArrayDecoderElemOpt(getProc: untyped, T: typedesc) =
+  proc getProc*(row: Row, col: int): seq[Option[T]] =
+    arrayElemOptImpl[T](row, col, astToStr(getProc))
 
-genArrayDecoderElemOpt(getIntArrayElemOpt, int32, pgParseInt32(e.get))
-genArrayDecoderElemOpt(getInt16ArrayElemOpt, int16, pgParseInt16(e.get))
-genArrayDecoderElemOpt(getInt64ArrayElemOpt, int64, pgParseBiggestInt(e.get))
-genArrayDecoderElemOpt(getFloatArrayElemOpt, float64, pgParseFloat(e.get))
-genArrayDecoderElemOpt(getFloat32ArrayElemOpt, float32, pgParseFloat32(e.get))
-genArrayDecoderElemOpt(getBoolArrayElemOpt, bool, parsePgBoolText(e.get))
-genArrayDecoderElemOpt(getStrArrayElemOpt, string, e.get)
+genArrayDecoderElemOpt(getIntArrayElemOpt, int32)
+genArrayDecoderElemOpt(getInt16ArrayElemOpt, int16)
+genArrayDecoderElemOpt(getInt64ArrayElemOpt, int64)
+genArrayDecoderElemOpt(getFloatArrayElemOpt, float64)
+genArrayDecoderElemOpt(getFloat32ArrayElemOpt, float32)
+genArrayDecoderElemOpt(getBoolArrayElemOpt, bool)
+genArrayDecoderElemOpt(getStrArrayElemOpt, string)
 
 # Array Opt accessors (text format)
 
@@ -2200,28 +2272,18 @@ proc get*(row: Row, col: int, T: typedesc[seq[PgTsQuery]]): seq[PgTsQuery] =
 proc get*(row: Row, col: int, T: typedesc[seq[PgHstore]]): seq[PgHstore] =
   row.getHstoreArray(col)
 
-# Per-element Option array types
+# Per-element Option array types, one per registered element type
 
-proc get*(row: Row, col: int, T: typedesc[seq[Option[int16]]]): seq[Option[int16]] =
-  row.getInt16ArrayElemOpt(col)
+template arrayElemOptGet(T: untyped) =
+  proc get*(row: Row, col: int, _: typedesc[seq[Option[T]]]): seq[Option[T]] =
+    arrayElemOptImpl[T](row, col, "get(seq[Option[" & $T & "]])")
 
-proc get*(row: Row, col: int, T: typedesc[seq[Option[int32]]]): seq[Option[int32]] =
-  row.getIntArrayElemOpt(col)
+macro arrayElemOptGets(): untyped =
+  result = newStmtList()
+  for T in pgArrayElemTypes:
+    result.add getAst(arrayElemOptGet(T))
 
-proc get*(row: Row, col: int, T: typedesc[seq[Option[int64]]]): seq[Option[int64]] =
-  row.getInt64ArrayElemOpt(col)
-
-proc get*(row: Row, col: int, T: typedesc[seq[Option[float32]]]): seq[Option[float32]] =
-  row.getFloat32ArrayElemOpt(col)
-
-proc get*(row: Row, col: int, T: typedesc[seq[Option[float64]]]): seq[Option[float64]] =
-  row.getFloatArrayElemOpt(col)
-
-proc get*(row: Row, col: int, T: typedesc[seq[Option[bool]]]): seq[Option[bool]] =
-  row.getBoolArrayElemOpt(col)
-
-proc get*(row: Row, col: int, T: typedesc[seq[Option[string]]]): seq[Option[string]] =
-  row.getStrArrayElemOpt(col)
+arrayElemOptGets()
 
 proc columnIndex*(fields: seq[FieldDescription], name: string): int =
   ## Find the index of a column by name. Raises PgTypeError if not found.
