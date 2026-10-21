@@ -106,6 +106,10 @@ proc newPoolCluster*(
   ## negative `PoolConfig` durations do. `onReadFallback` is an optional advisory
   ## hook invoked on each replica->primary read fallback (see
   ## `ReadFallbackCallback`).
+  ##
+  ## Cancelled (chronos), it stops both pools coming up and closes any that did.
+  ## asyncdispatch cannot cancel it: a `wait` that gives up leaves it running,
+  ## and the cluster it returns is for that `wait`'s `onOrphan` to close.
   # Before either pool dials, so a bad value opens no connection.
   if fallbackTimeout < ZeroDuration:
     raise newException(ValueError, "fallbackTimeout must be >= 0")
@@ -117,25 +121,27 @@ proc newPoolCluster*(
   if rCfg.connConfig.targetSessionAttrs == tsaAny:
     rCfg.connConfig.targetSessionAttrs = tsaPreferStandby
 
-  # allFutures settles both sides, so a one-side failure never abandons the
-  # other mid-handshake; close the survivor before raising.
+  # allFuturesCancelling settles both sides, so a one-side failure never
+  # abandons the other mid-handshake; close the survivor before raising.
+  # Cancelled, it cancels both, and each newPool closes its own dials.
   let
     pPoolFut = newPool(pCfg)
     rPoolFut = newPool(rCfg)
-  await allFutures(@[pPoolFut, rPoolFut])
-
   var
     pPool, rPool: PgPool
     firstErr: ref CatchableError
-  if pPoolFut.failed():
-    firstErr = cast[ref CatchableError](pPoolFut.error)
-  else:
+  try:
+    await allFuturesCancelling(@[pPoolFut, rPoolFut])
+  except CancelledError as e:
+    firstErr = e
+  if pPoolFut.completed():
     pPool = pPoolFut.read()
-  if rPoolFut.failed():
-    if firstErr == nil:
-      firstErr = cast[ref CatchableError](rPoolFut.error)
-  else:
+  elif firstErr == nil:
+    firstErr = cast[ref CatchableError](pPoolFut.error)
+  if rPoolFut.completed():
     rPool = rPoolFut.read()
+  elif firstErr == nil:
+    firstErr = cast[ref CatchableError](rPoolFut.error)
 
   if firstErr != nil:
     var closeFuts: seq[Future[void]]
@@ -143,7 +149,7 @@ proc newPoolCluster*(
       closeFuts.add(pPool.close())
     if rPool != nil:
       closeFuts.add(rPool.close())
-    await allFutures(closeFuts)
+    await noCancel allFutures(closeFuts)
     raise firstErr
 
   return PgPoolCluster(

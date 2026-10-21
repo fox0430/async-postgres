@@ -330,12 +330,8 @@ template abortAndFailWaiter(
   # Abort rather than drop the reference: the pump still holds the transport and
   # nilling `listenTask` disarms `close()`'s own teardown. `noCancel` because the
   # cancellation in flight would abort a bare `await`.
-  when hasChronos:
-    if not (await noCancel conn.abortListenTask()):
-      preserveStopFlag = true
-  else:
-    if not (await conn.abortListenTask()):
-      preserveStopFlag = true
+  if not (await noCancel conn.abortListenTask()):
+    preserveStopFlag = true
   conn.markClosed()
   conn.clearListenTask()
   conn.releaseNotifyWaiter(keepWaiter)

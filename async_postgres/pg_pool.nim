@@ -843,9 +843,10 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       continue
 
     # Replenish to minSize (best-effort). Open all needed connections
-    # concurrently via `allFutures` so they complete in the time of the
-    # slowest one rather than sequentially. A failure in one connect does
-    # not prevent the others from completing.
+    # concurrently via `allFuturesCancelling` so they complete in the time of
+    # the slowest one rather than sequentially, and a close() that cancels us
+    # stops them too. A failure in one connect does not prevent the others
+    # from completing.
     let currentTotal = pool.idle.len + pool.active
     var needed = max(0, pool.config.minSize - currentTotal)
     if pool.lastRefusal != nil:
@@ -865,27 +866,26 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       for i in 0 ..< needed:
         connectFuts.add(connect(connCfg))
       try:
-        await allFutures(connectFuts)
+        await allFuturesCancelling(connectFuts)
       except CancelledError as e:
-        # close() cancels us mid-connect: settle the conns that already
-        # landed, release the rest, then re-raise so cancelAndWait
-        # observes completion.
+        # close() cancels us mid-connect, and the connects with us, so none
+        # lands unowned: settle the ones that landed, release the rest.
         for f in connectFuts:
-          if not f.finished or f.failed():
-            pool.active.dec
-          else:
+          if f.completed():
             pool.settleReplenishConnect(f.read())
+          else:
+            pool.active.dec
         raise e
       # Successes first: they clear what earlier rounds recorded, while this
       # round's transient failures still back off.
       var connected = false
       for f in connectFuts:
-        if not f.failed():
+        if f.completed():
           connected = true
           pool.settleReplenishConnect(f.read())
       var refusal: ref CatchableError
       for f in connectFuts:
-        if f.failed():
+        if not f.completed():
           pool.active.dec
           # Same downcast as `newPool`: `connect` only raises `CatchableError`.
           let e = cast[ref CatchableError](f.error)
@@ -901,6 +901,9 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   ## Create a new connection pool and establish `minSize` initial connections.
   ## Raises if any initial connection fails (all opened connections are closed on error).
+  ## Cancelled (chronos), it stops the dials under way and closes the ones that came up.
+  ## asyncdispatch cannot cancel it: a `wait` that gives up leaves it running, and
+  ## the pool it returns is for that `wait`'s `onOrphan` to close.
   ## Raises `ValueError` if `config` is invalid; re-checked here so a directly
   ## constructed `PoolConfig` cannot bypass `initPoolConfig`'s validation.
   validatePoolConfig(config)
@@ -919,39 +922,36 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     dispatchScheduled: false,
   )
 
+  var connectFuts: seq[Future[PgConnection]]
   try:
-    # Open all `minSize` connections concurrently. `allFutures` waits for
-    # every connect to settle (success or failure) without short-circuiting,
-    # so a failure in one does not abandon the others mid-handshake — the
-    # server observes a clean Terminate for each socket that did come up.
-    # Successful connections are parked in `idle`; the first failure (if any)
-    # is raised so the except branch closes the ones that succeeded.
-    var connectFuts: seq[Future[PgConnection]]
+    # Open all `minSize` connections concurrently. `allFuturesCancelling`
+    # waits for every connect to settle (success or failure) without
+    # short-circuiting, so a failure in one does not abandon the others
+    # mid-handshake — the server observes a clean Terminate for each socket
+    # that did come up — and cancelled, it stops them, so none lands unowned.
+    # The first failure (if any) is raised so the except branch closes the
+    # ones that succeeded; they are parked only when all did.
     for i in 0 ..< cfg.minSize:
       connectFuts.add(connect(cfg.connConfig))
-    await allFutures(connectFuts)
-    var firstErr: ref CatchableError = nil
+    await allFuturesCancelling(connectFuts)
     for f in connectFuts:
-      if f.failed():
-        if firstErr == nil:
-          # `connect` only raises `CatchableError`, so the stored exception is
-          # always safe to downcast from `ref Exception` (asyncdispatch) /
-          # `ref CatchableError` (chronos) to the typed `ref CatchableError`.
-          firstErr = cast[ref CatchableError](f.error)
-      else:
-        let conn = f.read()
-        conn.ownerPool = pool
-        pool.metrics.createCount.inc
-        # Stamped after the dials, as a replenished conn is.
-        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
-    if firstErr != nil:
-      raise firstErr
+      if not f.completed():
+        # `connect` only raises `CatchableError`, so the stored exception is
+        # always safe to downcast from `ref Exception` (asyncdispatch) /
+        # `ref CatchableError` (chronos) to the typed `ref CatchableError`.
+        raise cast[ref CatchableError](f.error)
+    for f in connectFuts:
+      let conn = f.read()
+      conn.ownerPool = pool
+      pool.metrics.createCount.inc
+      # Stamped after the dials, as a replenished conn is.
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
   except CatchableError as e:
     var closeFuts: seq[Future[void]]
-    while pool.idle.len > 0:
-      let pc = pool.idle.popFirst()
-      closeFuts.add(pool.tracedClose(pc.conn))
-    await allFutures(closeFuts)
+    for f in connectFuts:
+      if f.completed():
+        closeFuts.add(pool.tracedClose(f.read()))
+    await noCancel allFutures(closeFuts)
     raise e
 
   pool.maintenanceTask = maintenanceLoop(pool)

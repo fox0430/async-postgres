@@ -879,6 +879,48 @@ suite "newPoolCluster concurrent warmup":
     check raised
     check replicaTerminated
 
+  when hasChronos:
+    test "a cancelled newPoolCluster closes the pool that came up and the dial under way":
+      # chronos-only: allFutures does not cancel the two newPool calls, so the
+      # primary pool used to be left running with nobody holding it.
+      proc t() {.async.} =
+        let primaryMs = startMockServer()
+        let replicaMs = startMockServer()
+        var pCfg =
+          initPoolConfig(clusterMockConfig(primaryMs.port), minSize = 1, maxSize = 1)
+        var rCfg =
+          initPoolConfig(clusterMockConfig(replicaMs.port), minSize = 1, maxSize = 1)
+        pCfg.connConfig.connectTimeout = seconds(5)
+        rCfg.connConfig.connectTimeout = seconds(5)
+        let clusterFut = newPoolCluster(pCfg, rCfg)
+
+        let pc = await primaryMs.accept()
+        await drainStartupMessage(pc)
+        let rc = await replicaMs.accept()
+        await drainStartupMessage(rc)
+        await sendFullHandshake(pc, params = primaryHandshakeParams)
+
+        let start = Moment.now()
+        var timedOut = false
+        try:
+          discard await clusterFut.wait(milliseconds(200))
+        except AsyncTimeoutError:
+          timedOut = true
+        doAssert timedOut
+        # The 5s connect timers would mask a cancel stalled on a lost wakeup.
+        doAssert Moment.now() - start < seconds(2)
+
+        let msg = await drainFrontendMessage(pc).wait(seconds(2))
+        doAssert msg.msgType == 'X'
+        doAssert await closedByPeer(rc)
+
+        await closeClient(pc)
+        await closeClient(rc)
+        await closeServer(primaryMs)
+        await closeServer(replicaMs)
+
+      waitFor t()
+
 suite "newPoolCluster validation":
   test "rejects a negative fallbackTimeout before dialing":
     # Both pools point at a freed port with minSize = 1: a dial would fail
