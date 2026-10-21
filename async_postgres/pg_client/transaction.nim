@@ -403,13 +403,14 @@ proc buildRetryTxLoop*(
         raise `dSym`
 
 proc buildRetryDeadlineLoop*(
-    bodyFnSym, retryOptsSym, deadlineMomentSym, connForStateCheck: NimNode,
+    bodyCall, retryOptsSym, deadlineMomentSym, connForStateCheck: NimNode,
     timeoutStillRunning, timeoutUnwound, catchableCleanup: NimNode,
 ): NimNode =
   ## Build the shared retry loop for the deadline-bounded retry macros
-  ## (`withTransactionRetryDeadline`, conn and pool). The caller defines
-  ## `bodyFnSym` (an `async proc(): Future[void]` that runs BEGIN/body/COMMIT for
-  ## one attempt) and binds `retryOptsSym` / `deadlineMomentSym` in scope.
+  ## (`withTransactionRetryDeadline`, conn and pool). `bodyCall` starts one
+  ## attempt: a call to an `async proc` returning `Future[void]` that runs
+  ## BEGIN/body/COMMIT. The caller binds `retryOptsSym` / `deadlineMomentSym`
+  ## in scope.
   ##
   ## Per-variant hooks:
   ## * `timeoutStillRunning` / `timeoutUnwound`: statements run when `wait` times
@@ -417,7 +418,7 @@ proc buildRetryDeadlineLoop*(
   ##   `buildDeadlineAwaitAndTimeout` splits it — a body that could not be
   ##   cancelled still owns the connection, while one that unwound leaves the
   ##   scope its own ROLLBACK. Never retried either way: a timeout exhausts the
-  ##   shared budget.
+  ##   shared budget, so a hook raises, or `break`s to report success.
   ## * `catchableCleanup`: statements run on a non-timeout error before the retry
   ##   decision (conn rolls back here; pool already did so inside `bodyFn`, so it
   ##   passes an empty list).
@@ -466,7 +467,7 @@ proc buildRetryDeadlineLoop*(
     var `attemptSym` = 0
     while true:
       inc `attemptSym`
-      let `bodyFutSym` = `bodyFnSym`()
+      let `bodyFutSym` = `bodyCall`
       try:
         # Each attempt is bounded by the *remaining* shared budget, not the full
         # deadline — so all attempts together finish within `deadline`.
@@ -963,7 +964,7 @@ macro withTransactionRetryDeadline*(
     `timeoutCleanup`
     `connSym`.invalidateOnTimeout("withTransactionRetryDeadline exceeded")
   let loop = buildRetryDeadlineLoop(
-    bodyFnSym,
+    newCall(bodyFnSym),
     retryOptsSym,
     deadlineMomentSym,
     connForStateCheck = connSym,
