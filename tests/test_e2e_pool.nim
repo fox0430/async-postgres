@@ -1250,6 +1250,50 @@ suite "E2E: Pipelined Pool":
 
     waitFor t()
 
+  test "pipelined pool: a batch spreads over the conns free for it":
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 0, maxSize: 4, pipelined: true)
+      )
+      defer:
+        await pool.close()
+
+      # Same tick: one batch of two ops, with room for both conns it may use.
+      let f1 = pool.query("SELECT pg_backend_pid()")
+      let f2 = pool.query("SELECT pg_backend_pid()")
+      let pid1 = (await f1.wait(seconds(5))).rows[0].getInt(0)
+      let pid2 = (await f2.wait(seconds(5))).rows[0].getInt(0)
+      doAssert pid1 != pid2
+
+    waitFor t()
+
+  test "pipelined pool: a batch does not hold a conn while waiting for another":
+    # The test holds three of four conns: a batch that held the fourth while
+    # queueing for another would wait on them, with no acquireTimeout for
+    # good, as batches that each held one would wait on each other.
+    proc t() {.async.} =
+      let pool = await newPool(
+        PoolConfig(connConfig: plainConfig(), minSize: 0, maxSize: 4, pipelined: true)
+      )
+      defer:
+        await pool.close()
+
+      var held: seq[PgConnection]
+      try:
+        for _ in 0 ..< 3:
+          held.add(await pool.acquire())
+        # One batch of two ops, with room for only one conn.
+        let f1 = pool.query("SELECT pg_backend_pid()")
+        let f2 = pool.query("SELECT pg_backend_pid()")
+        let pid1 = (await f1.wait(seconds(5))).rows[0].getInt(0)
+        let pid2 = (await f2.wait(seconds(5))).rows[0].getInt(0)
+        doAssert pid1 == pid2
+      finally:
+        for conn in held:
+          conn.release()
+
+    waitFor t()
+
 suite "E2E: queryRowOpt via pool":
   test "pool queryRowOpt returns first row and none on empty":
     proc t() {.async.} =

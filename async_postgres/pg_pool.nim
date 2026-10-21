@@ -81,7 +81,14 @@ type
       ## for error isolation. One dispatch uses at most `maxSize div 2`
       ## connections (at least 1, or 2 when its ops mix finite and unlimited
       ## timeouts). A dispatch from a later tick can overlap a running one and
-      ## takes its own share, so this does not bound the pool's total.
+      ## takes its own share, so this does not bound the pool's total. A
+      ## dispatch queues only for its first connection (one per timeout
+      ## class) and takes the rest while an idle one or room under `maxSize`
+      ## is free, so on a busy pool it runs on fewer. The ops on one
+      ## connection run as one pipeline and settle when it ends, so each op's
+      ## `timeout` covers the whole pipeline, and one that expires fails its
+      ## op even if the server ran it. `maxPipelineSize` caps the ops one
+      ## dispatch takes.
     maxPipelineSize*: int
       ## Max operations per pipeline batch per connection (default 0=unlimited).
       ## Only used when `pipelined` is true.
@@ -655,6 +662,17 @@ proc boundedConnConfig(pool: PgPool): ConnConfig =
   if result.connectTimeout == ZeroDuration:
     result.connectTimeout = pool.fallbackTimeout()
 
+proc hasCapacity(pool: PgPool, dial = true): bool =
+  ## Whether a slot is free: an idle conn, or, when `dial` and no config fault
+  ## forbid it, room to dial under `maxSize`.
+  pool.idle.len > 0 or
+    (dial and pool.configFault == nil and pool.active < pool.config.maxSize)
+
+proc hasFreeSlot(pool: PgPool): bool =
+  ## Whether an `acquire` would take a slot now instead of queueing: no live
+  ## waiter ahead of it, and a slot free.
+  pool.waiterCount == 0 and pool.hasCapacity()
+
 proc grantSlots(pool: PgPool, dial = true) =
   ## Hand free capacity to queued waiters, head first. A waiter gets an idle
   ## conn with its slot, or, when `dial` and no config fault forbid it, an
@@ -662,11 +680,7 @@ proc grantSlots(pool: PgPool, dial = true) =
   ## within its own budget, like an `acquire` on the fast path.
   if pool.closed:
     return
-  while pool.waiters.len > 0 and (
-    pool.idle.len > 0 or
-    (dial and pool.configFault == nil and pool.active < pool.config.maxSize)
-  )
-  :
+  while pool.waiters.len > 0 and pool.hasCapacity(dial):
     let waiter = pool.waiters.popFirst()
     if waiter.isAbandoned:
       continue
@@ -1193,7 +1207,9 @@ proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
 
 type AcquireResult = tuple[conn: PgConnection, wasCreated: bool]
 
-proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
+proc acquireImpl(pool: PgPool, queue = true): Future[AcquireResult] {.async.} =
+  ## `queue = false` fails wherever the acquire would queue, as under
+  ## `maxWaiters = 0`.
   if pool.closed:
     raise newPoolError(pekClosed, "Pool is closed")
 
@@ -1233,13 +1249,10 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
   # and holds it across every ping and dial below; an idle conn always leaves
   # room for it under `maxSize`. An exit that gets it no conn passes the slot
   # on to the next waiter (`releaseSlot`).
-  var queued = pool.waiterCount > 0
+  var queued = not pool.hasFreeSlot()
   while true:
     var candidate: PooledConn
-    if not queued and (
-      pool.idle.len > 0 or
-      (pool.configFault == nil and pool.active < pool.config.maxSize)
-    ):
+    if not queued:
       pool.active.inc
     else:
       # Either max connections are reached or waiters are queued ahead of us;
@@ -1248,6 +1261,8 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         # No borrower will release and no connect can succeed (see
         # `configFault`): fail now instead of waiting out the acquire budget.
         raise pool.configFaultError()
+      if not queue:
+        raise newPoolError(pekQueueFull, "Pool acquire would queue")
       if pool.config.maxWaiters >= 0 and pool.waiterCount >= pool.config.maxWaiters:
         raise newPoolError(
           pekQueueFull,
@@ -1486,11 +1501,13 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
       if not served:
         pool.releaseSlot(refusal)
 
-proc acquireCommon(pool: PgPool, byUser: bool): Future[PgConnection] {.async.} =
+proc acquireCommon(
+    pool: PgPool, byUser: bool, queue = true
+): Future[PgConnection] {.async.} =
   ## Shared body of `acquire` and `acquireInternal`: run `acquireImpl` under
   ## the pool-acquire tracing span and stamp the borrower on the connection.
   if pool.config.tracer == nil:
-    let ar = await pool.acquireImpl()
+    let ar = await pool.acquireImpl(queue)
     # Assigned, not merely left alone: a reused connection still carries the
     # flag from whoever borrowed it last.
     ar.conn.borrowedByUser = byUser
@@ -1507,15 +1524,15 @@ proc acquireCommon(pool: PgPool, byUser: bool): Future[PgConnection] {.async.} =
     TracePoolAcquireEndData,
     TracePoolAcquireEndData(conn: ar.conn, wasCreated: ar.wasCreated),
   ):
-    ar = await pool.acquireImpl()
+    ar = await pool.acquireImpl(queue)
   ar.conn.borrowedByUser = byUser
   return ar.conn
 
-proc acquireInternal(pool: PgPool): Future[PgConnection] {.async.} =
+proc acquireInternal(pool: PgPool, queue = true): Future[PgConnection] {.async.} =
   ## `acquire` for the pool's own convenience methods. The application never
   ## sees this connection, so a close taken on it during shutdown stays a
   ## `PgConnectionError` (see `releaseCore`).
-  return await pool.acquireCommon(byUser = false)
+  return await pool.acquireCommon(byUser = false, queue = queue)
 
 proc acquire*(pool: PgPool): Future[PgConnection] {.async.} =
   ## Acquire a connection from the pool. Tries idle connections first (with
@@ -1851,7 +1868,8 @@ proc dispatchHomogeneous(
   ## single-class: mixing a finite op with an unlimited one would force one
   ## onto the other's deadline (see `batchTimeout`). A lone op skips the
   ## pipeline; otherwise ops are spread round-robin over up to `maxConns`
-  ## connections and run in parallel.
+  ## connections and run in parallel. Only the first is queued for; the rest
+  ## are taken only from free capacity, though still pinged or dialed.
   if ops.len == 0:
     return
 
@@ -1922,8 +1940,12 @@ proc dispatchHomogeneous(
   var acquireErr: ref Exception
   let nConns = min(ops.len, max(1, maxConns))
   for i in 0 ..< nConns:
+    # Queueing for another conn while holding one would let batches that each
+    # hold one wait on each other until `acquireTimeout`, or for good without.
+    if i > 0 and not pool.hasFreeSlot():
+      break
     try:
-      let conn = await pool.acquireInternal()
+      let conn = await pool.acquireInternal(queue = i == 0)
       conns.add(conn)
     except CatchableError as e:
       acquireErr = e

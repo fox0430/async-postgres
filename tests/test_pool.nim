@@ -1870,6 +1870,34 @@ suite "Pool acquire":
     discard waitFor acquireFut
     check pool.pendingAcquires == 0
 
+  test "an acquire that may not queue fails at max instead of waiting":
+    let pool = makePool(maxSize = 1)
+    pool.active = 1
+
+    let acquireFut = pool.acquireInternal(queue = false)
+    check acquireFut.failed
+    check acquireFut.readError of PgPoolError
+    check (ref PgPoolError)(acquireFut.readError).kind == pekQueueFull
+    check pool.waiters.len == 0
+    check pool.waiterCount == 0
+    check pool.active == 1
+
+  test "an acquire that may not queue fails once a config fault skips its dial":
+    # Free on arrival, so it takes a slot, but the only idle conn is dead and
+    # a config fault forbids dialing: it would queue for a release.
+    let pool = makePool(maxSize = 2)
+    pool.active = 1
+    pool.configFault = newException(PgConfigError, "bad config")
+    pool.idle.addLast(mockConn(csClosed).toPooled())
+
+    let acquireFut = pool.acquireInternal(queue = false)
+    check acquireFut.failed
+    check (ref PgPoolError)(acquireFut.readError).kind == pekQueueFull
+    check pool.waiters.len == 0
+    check pool.waiterCount == 0
+    check pool.active == 1
+    check pool.idle.len == 0
+
 suite "Pool acquireHandle":
   test "acquireHandle returns handle pairing conn with its pool":
     let pool = makePool()
@@ -7239,6 +7267,46 @@ suite "The direct macros pre-flight before pendingStmtCloses is drained":
       expect Defect:
         discard waitFor conn.execDirect("SELECT $1", 1'i32)
       check checkMsgLenBoundCalls == 7
+
+suite "dispatchHomogeneous takes extra conns only from free capacity":
+  # NUL fails each op's validation before anything is sent, so the mock conns
+  # need no transport.
+  proc nulOps(n: int): seq[PendingPoolOp] =
+    for _ in 0 ..< n:
+      result.add(
+        PendingPoolOp(
+          kind: popExec,
+          sql: "SELECT 1\0",
+          execFut: newFuture[CommandResult]("nulOp"),
+          timeout: ZeroDuration,
+        )
+      )
+
+  test "a batch spreads over free conns":
+    let pool = makePool(maxSize = 4)
+    pool.idle.addLast(mockConn(pool = pool).toPooled())
+    pool.idle.addLast(mockConn(pool = pool).toPooled())
+    let ops = nulOps(2)
+    waitFor pool.dispatchHomogeneous(ops, 2).wait(seconds(2))
+    for op in ops:
+      check op.execFut.readError of PgTypeError
+    check pool.metrics.acquireCount == 2
+    check pool.active == 0
+    check pool.idle.len == 2
+
+  test "a batch runs on one conn instead of queueing for a second":
+    # The other three slots are borrowed and never come back.
+    let pool = makePool(maxSize = 4)
+    pool.active = 3
+    pool.idle.addLast(mockConn(pool = pool).toPooled())
+    let ops = nulOps(2)
+    waitFor pool.dispatchHomogeneous(ops, 2).wait(seconds(2))
+    for op in ops:
+      check op.execFut.readError of PgTypeError
+    check pool.metrics.acquireCount == 1
+    check pool.waiters.len == 0
+    check pool.active == 3
+    check pool.idle.len == 1
 
 suite "executeBatch releases connection when every op fails validation":
   test "all ops rejected as PgTypeError still releases pool slot":
