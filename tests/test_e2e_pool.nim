@@ -781,6 +781,43 @@ suite "E2E: Pool minSize Replenishment":
 
     waitFor t()
 
+  for (label, connConfig) in [("plaintext", plainConfig()), ("TLS", sslConfig())]:
+    test "replaces an idle " & label & " conn whose backend was terminated":
+      # The backend writes a FATAL ahead of its FIN (under TLS, a close_notify
+      # too), and no acquire comes to ping the conn, so only the maintenance
+      # sweep can retire it.
+      proc t(connConfig: ConnConfig) {.async.} =
+        let pool = await newPool(
+          PoolConfig(
+            connConfig: connConfig,
+            minSize: 1,
+            maxSize: 2,
+            maintenanceInterval: milliseconds(50),
+          )
+        )
+
+        let conn = await pool.acquire()
+        let pid = conn.pid
+        conn.release()
+        let before = pool.metrics.closeCount
+
+        let killer = await connect(plainConfig())
+        discard await killer.exec("SELECT pg_terminate_backend($1)", @[toPgParam(pid)])
+        await killer.close()
+
+        var replaced = false
+        let deadline = Moment.now() + seconds(5)
+        while Moment.now() < deadline:
+          if pool.metrics.closeCount - before == 1 and pool.idleCount == 1:
+            replaced = true
+            break
+          await sleepAsync(milliseconds(20))
+
+        await pool.close()
+        doAssert replaced
+
+      waitFor t(connConfig)
+
 suite "E2E: Pool Stress":
   test "concurrent pool operations":
     proc t() {.async.} =

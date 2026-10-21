@@ -23,12 +23,17 @@ type
     healthCheckTimeout*: Duration
       ## Ping idle connections older than this before returning (default 5s, ZeroDuration=disabled).
       ## Applies to plaintext connections. For TLS connections, see `tlsHealthCheckTimeout`.
+      ## An idle connection that received bytes since it parked (a NOTIFY, or
+      ## what a closing backend sends ahead of its FIN) is pinged regardless,
+      ## by `acquire` and by the maintenance sweep, if the liveness probe sees
+      ## them. It misses bytes a lower layer has already read off the socket:
+      ## the TLS layer, or under chronos on Windows its posted read, which
+      ## takes them as they arrive.
     tlsHealthCheckTimeout*: Duration
       ## Same as `healthCheckTimeout` but for TLS connections (default 500ms,
       ## ZeroDuration=disabled).
-      ## MSG_PEEK-based liveness detection is blind to TLS alerts and to any
-      ## ErrorResponse already encrypted into the TCP buffer, so TLS pools
-      ## need a much shorter idle window than plaintext to stay correct.
+      ## The liveness probe cannot see bytes the TLS layer has already read off
+      ## the socket, so TLS pools keep a much shorter idle window than plaintext.
     pingTimeout*: Duration
       ## Max time to wait for a health check ping response (default 5s, ZeroDuration=no timeout)
     acquireTimeout*: Duration
@@ -636,15 +641,19 @@ proc canAttemptConnect(pool: PgPool): bool =
     return false
   pool.consecutiveConnectFailures == 0 or Moment.now() >= pool.nextConnectRetryAt
 
+proc fallbackTimeout(pool: PgPool): Duration =
+  ## Bound for a wait that no acquire budget and no user timeout bounds, so a
+  ## stall cannot hold the maintenance loop, or `close()`'s wait for it, open
+  ## indefinitely. A zero `maintenanceInterval` would read as no timeout: floor
+  ## it so the bound holds.
+  max(milliseconds(1), pool.config.maintenanceInterval)
+
 proc boundedConnConfig(pool: PgPool): ConnConfig =
   ## `connConfig` for a dial no acquire budget bounds: an unset
-  ## `connectTimeout` falls back to `maintenanceInterval`, so a stalled dial or
-  ## handshake cannot hold the maintenance loop, or `close()`'s wait for it, open
-  ## indefinitely. A zero `maintenanceInterval` would leave the fallback zero,
-  ## which would read as no timeout: floor it so the bound holds.
+  ## `connectTimeout` falls back to `fallbackTimeout`.
   result = pool.config.connConfig
   if result.connectTimeout == ZeroDuration:
-    result.connectTimeout = max(milliseconds(1), pool.config.maintenanceInterval)
+    result.connectTimeout = pool.fallbackTimeout()
 
 proc grantSlots(pool: PgPool, dial = true) =
   ## Hand free capacity to queued waiters, head first. A waiter gets an idle
@@ -680,9 +689,11 @@ proc releaseSlot(pool: PgPool, refusal: ref CatchableError = nil) =
   pool.grantSlots(dial = refusal == nil)
   pool.failStrandedWaiters(refusal)
 
-proc settleReplenishConnect(pool: PgPool, conn: PgConnection, now: Moment) =
+proc settleReplenishConnect(pool: PgPool, conn: PgConnection) =
   ## Settle a fresh replenishment connection: the pre-reserved `pool.active`
-  ## slot is consumed on waiter handoff, released on park or close.
+  ## slot is consumed on waiter handoff, released on park or close. Parked, it
+  ## is stamped now, not at the sweep's start: the sweep's pings and the dial
+  ## itself may have taken a while.
   conn.ownerPool = pool
   pool.metrics.createCount.inc
   pool.noteConnected()
@@ -696,12 +707,24 @@ proc settleReplenishConnect(pool: PgPool, conn: PgConnection, now: Moment) =
     discard # reservation stays consumed: the conn is now the waiter's
   else:
     pool.active.dec
-    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
+    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
 
 proc isExpired(pool: PgPool, conn: PgConnection, at: Moment): bool =
   ## Whether `conn` is past `maxLifetime` at `at`.
   pool.config.maxLifetime > ZeroDuration and
     at - conn.createdAt > pool.config.maxLifetime
+
+proc isIdleExpired(pool: PgPool, pc: PooledConn, at: Moment): bool =
+  ## Whether `pc` has sat idle past `idleTimeout` at `at`.
+  pool.config.idleTimeout > ZeroDuration and at - pc.lastUsedAt > pool.config.idleTimeout
+
+proc parkedPingTimeout(pool: PgPool): Duration =
+  ## `pingTimeout` for a ping no acquire budget bounds: unset, it falls back to
+  ## `fallbackTimeout`.
+  if pool.config.pingTimeout > ZeroDuration:
+    pool.config.pingTimeout
+  else:
+    pool.fallbackTimeout()
 
 proc maintenanceLoop(pool: PgPool) {.async.} =
   while not pool.closed:
@@ -709,42 +732,93 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
     if pool.closed:
       break
 
-    # closeNoWait keeps the sweep yield-free: a yield here would leave healthy
-    # entries popped into `remaining` but uncounted, so concurrent acquires
-    # could overshoot maxSize opening replacements.
-    var remaining = initDeque[PooledConn]()
+    # closeNoWait keeps both passes yield-free: a yield here would leave
+    # healthy entries popped but uncounted, so concurrent acquires could
+    # overshoot maxSize opening replacements.
+    var survivors: seq[PooledConn]
+    var toPing: seq[PooledConn]
     let now = Moment.now()
 
     while pool.idle.len > 0:
-      var pc = pool.idle.popFirst()
+      let pc = pool.idle.popFirst()
 
-      # Always close broken or in-transaction connections (unusable)
-      if pc.conn.state != csReady or pc.conn.txStatus != tsIdle:
+      # Always close broken, in-transaction or max-lifetime-exceeded
+      # connections (acquire rejects them anyway).
+      if pc.conn.state != csReady or pc.conn.txStatus != tsIdle or
+          pool.isExpired(pc.conn, now):
         pool.closeNoWait(pc.conn)
         continue
 
-      # Always close max-lifetime-exceeded connections (acquire rejects them anyway)
-      if pool.isExpired(pc.conn, now):
+      # A peer's close leaves `state` at csReady until a read sees it, so
+      # without the probe a dead conn would count toward minSize until an
+      # acquire.
+      case pc.conn.idleProbe()
+      of ipDead:
         pool.closeNoWait(pc.conn)
-        continue
+      of ipActivity:
+        toPing.add(pc)
+      of ipQuiet:
+        survivors.add(pc)
 
-      # Idle timeout respects minSize
-      if pool.config.idleTimeout > ZeroDuration and
-          now - pc.lastUsedAt > pool.config.idleTimeout:
-        let totalCount = remaining.len + pool.idle.len + pool.active
-        if totalCount >= pool.config.minSize:
-          pool.closeNoWait(pc.conn)
-          continue
+    # Idle timeout respects minSize, counting only the conns sure to stay: one
+    # closed above or awaiting its ping would leave the pool short.
+    var total = survivors.len + pool.active
+    for pc in survivors:
+      if pool.isIdleExpired(pc, now) and total > pool.config.minSize:
+        pool.closeNoWait(pc.conn)
+        total.dec
+      else:
+        pool.idle.addLast(pc)
 
-      remaining.addLast(pc)
-
-    pool.idle = remaining
+    # Reserved like a replenish connect, so acquires cannot overshoot maxSize
+    # while the pings run.
+    pool.active.inc(toPing.len)
 
     # Ahead of the backoff gate below: the backoff paces the replenish only, so
     # a waiter still gets an empty slot to dial into, and a config fault fails
     # the waiters instead.
     pool.grantSlots()
     pool.failStrandedWaiters()
+
+    if toPing.len > 0:
+      var pingFuts: seq[Future[void]]
+      let pingTimeout = pool.parkedPingTimeout()
+      for pc in toPing:
+        pingFuts.add(pc.conn.ping(pingTimeout))
+      try:
+        await allFutures(pingFuts)
+      except CancelledError as e:
+        # close() cancels us mid-ping, leaving the pings' conns mid-protocol.
+        for pc in toPing:
+          pool.closeNoWait(pc.conn)
+          pool.active.dec
+        raise e
+      # Failed and expired conns close first, so the idle timeout below counts
+      # only the conns that stay, but their slots go to waiters last: granted
+      # first, a waiter dials while a live conn past idleTimeout closes.
+      let settledAt = Moment.now()
+      var live: seq[PooledConn]
+      for i, pc in toPing:
+        if pingFuts[i].completed() and not pool.closed and
+            not pool.isExpired(pc.conn, settledAt):
+          live.add(pc)
+        else:
+          pool.closeNoWait(pc.conn)
+          pool.active.dec
+      for pc in live:
+        if pool.tryHandoffToWaiter(pc.conn):
+          continue # reservation stays consumed: the conn is now the waiter's
+        pool.active.dec
+        # The idle-timeout pass above skipped it, and a conn that keeps getting
+        # NOTIFYs is pinged every sweep instead, never timed out.
+        if pool.isIdleExpired(pc, settledAt) and
+            pool.idle.len + pool.active >= pool.config.minSize:
+          pool.closeNoWait(pc.conn)
+        else:
+          # `lastUsedAt` kept: the ping was the pool's, not a borrow.
+          pool.idle.addLast(pc)
+      pool.grantSlots()
+      pool.failStrandedWaiters()
 
     # Skip the replenish phase for good after a config fault (see
     # `configFault`), and while we are inside a backoff window from a recent
@@ -786,7 +860,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
           if not f.finished or f.failed():
             pool.active.dec
           else:
-            pool.settleReplenishConnect(f.read(), now)
+            pool.settleReplenishConnect(f.read())
         raise e
       # Successes first: they clear what earlier rounds recorded, while this
       # round's transient failures still back off.
@@ -794,7 +868,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       for f in connectFuts:
         if not f.failed():
           connected = true
-          pool.settleReplenishConnect(f.read(), now)
+          pool.settleReplenishConnect(f.read())
       var refusal: ref CatchableError
       for f in connectFuts:
         if f.failed():
@@ -832,7 +906,6 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
   )
 
   try:
-    let now = Moment.now()
     # Open all `minSize` connections concurrently. `allFutures` waits for
     # every connect to settle (success or failure) without short-circuiting,
     # so a failure in one does not abandon the others mid-handshake — the
@@ -855,7 +928,8 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
         let conn = f.read()
         conn.ownerPool = pool
         pool.metrics.createCount.inc
-        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
+        # Stamped after the dials, as a replenished conn is.
+        pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now()))
     if firstErr != nil:
       raise firstErr
   except CatchableError as e:
@@ -1244,7 +1318,12 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
           break
         # Re-taken per conn: the health-check ping below awaits.
         let now = Moment.now()
-        if pc.conn.state != csReady or pc.conn.socketHasFin():
+        let probe =
+          if pc.conn.state == csReady:
+            pc.conn.idleProbe()
+          else:
+            ipDead
+        if probe == ipDead:
           # closeNoWait: avoid an await point where a cancellation could be
           # swallowed by tracedClose and leak the next acquired conn (see ping guard).
           pool.closeNoWait(pc.conn)
@@ -1252,16 +1331,18 @@ proc acquireImpl(pool: PgPool): Future[AcquireResult] {.async.} =
         if pool.isExpired(pc.conn, now):
           pool.closeNoWait(pc.conn)
           continue
-        # Health check: ping connections that have been idle too long.
-        # TLS connections use the tighter `tlsHealthCheckTimeout` window because
-        # the MSG_PEEK probe above cannot see TLS alerts or any ErrorResponse
-        # already encrypted into the TCP buffer — only a real round-trip can.
+        # Health check: ping connections that have been idle too long, or that
+        # bytes reached while parked (a NOTIFY, or what a closing backend sends
+        # ahead of its FIN). TLS connections use the tighter
+        # `tlsHealthCheckTimeout` window because the probe above cannot see
+        # bytes the TLS layer has already read — only a real round-trip can.
         let idleThreshold =
           if pc.conn.sslEnabled:
             pool.config.tlsHealthCheckTimeout
           else:
             pool.config.healthCheckTimeout
-        if idleThreshold > ZeroDuration and now - pc.lastUsedAt > idleThreshold:
+        if probe == ipActivity or
+            (idleThreshold > ZeroDuration and now - pc.lastUsedAt > idleThreshold):
           var pingBudget = pool.config.pingTimeout
           if hasDeadline:
             let rem = remainingBudget()
@@ -2951,8 +3032,8 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ##
   ## asyncdispatch cannot cancel a future: there the maintenance loop, and
   ## background tasks still running at the deadline, outlive close() until
-  ## their current sleep, connect or close ends. A connection they open after
-  ## close() is closed, not kept.
+  ## their current sleep, connect, ping or close ends. A connection they open
+  ## or ping after close() is closed, not kept.
   pool.closed = true
 
   let hasDeadline = timeout > ZeroDuration

@@ -92,6 +92,18 @@ when hasChronos:
       (int(hdr[1]) shl 24) or (int(hdr[2]) shl 16) or (int(hdr[3]) shl 8) or int(hdr[4])
     await client.readN(bodyLen - 4)
 
+  proc sendOnceBorrowed(
+      client: MockClient, conn: PgConnection, data: seq[byte]
+  ) {.async.} =
+    ## Send the replies to requests the counting writer keeps off the wire once
+    ## the pool hands `conn` out: sent sooner, they reach it parked, and the
+    ## pool pings a parked conn that bytes reached.
+    let deadline = Moment.now() + seconds(5)
+    while not conn.borrowed and Moment.now() < deadline:
+      await sleepAsync(milliseconds(1))
+    doAssert conn.borrowed, "the pool never handed the parked conn out"
+    await client.sendBytes(data)
+
   proc buildExecReplies(n: int): seq[byte] =
     ## Extended-protocol replies for `n` sequential exec ops with per-op SYNC
     ## (executeIsolated): ParseComplete + BindComplete + CommandComplete +
@@ -310,12 +322,10 @@ when hasChronos:
         var serverClient: MockClient
         proc serverHandler() {.async.} =
           serverClient = await acceptAndReady(ms)
-          # The counting mock writer swallows the op's Parse/Bind before it
-          # reaches the wire, so pre-send the replies for the client's pump.
-          await serverClient.sendBytes(buildExecReplies(1))
 
         let serverFut = serverHandler()
         let conn = await connect(mockConfig(ms.port, nil))
+        await serverFut
         let origWriter = conn.writer
         # The op send is write #1 (succeeds); the release-path resetQuery is
         # write #2 (raises a Defect).
@@ -324,13 +334,16 @@ when hasChronos:
         let pool = makePool(resetQuery = "SELECT 1", pipelined = true)
         conn.ownerPool = pool
         pool.idle.addLast(conn.toPooled())
+        # The counting mock writer swallows the op's Parse/Bind before it
+        # reaches the wire, so send the replies for the client's pump.
+        let replyFut = serverClient.sendOnceBorrowed(conn, buildExecReplies(1))
 
         var raised = false
         try:
           discard await pool.exec("SELECT 1")
         except PgPoolError:
           raised = true
-        await serverFut
+        await replyFut
 
         doAssert not raised,
           "a release-path Defect must not fail a successful pipelined op (raised=" &
@@ -361,12 +374,10 @@ when hasChronos:
         var serverClient: MockClient
         proc serverHandler() {.async.} =
           serverClient = await acceptAndReady(ms)
-          # Two ops, one pipeline; the counting mock writer swallows the batch
-          # send, so pre-send the replies for both ops.
-          await serverClient.sendBytes(buildExecReplies(2))
 
         let serverFut = serverHandler()
         let conn = await connect(mockConfig(ms.port, nil))
+        await serverFut
         let origWriter = conn.writer
         # The batch send is write #1 (succeeds); the release-path resetQuery
         # is write #2 (raises a Defect).
@@ -376,6 +387,9 @@ when hasChronos:
         let pool = makePool(maxSize = 2, resetQuery = "SELECT 1", pipelined = true)
         conn.ownerPool = pool
         pool.idle.addLast(conn.toPooled())
+        # Two ops, one pipeline; the counting mock writer swallows the batch
+        # send, so send the replies for both ops.
+        let replyFut = serverClient.sendOnceBorrowed(conn, buildExecReplies(2))
 
         # Enqueue both ops synchronously so one dispatch drains them as a
         # batch (dispatch runs on the next event loop tick).
@@ -390,7 +404,7 @@ when hasChronos:
             discard await f
           except PgPoolError:
             inc raised
-        await serverFut
+        await replyFut
 
         doAssert raised == 0,
           "a release-path Defect must not fail completed batch ops (raised=" & $raised &
@@ -422,12 +436,10 @@ when hasChronos:
         var serverClient: MockClient
         proc serverHandler() {.async.} =
           serverClient = await acceptAndReady(ms)
-          # The counting mock writer swallows the op Query before it reaches
-          # the wire, so pre-send the op's idle reply for the client's pump.
-          await serverClient.sendBytes(buildReadyForQuery('I'))
 
         let serverFut = serverHandler()
         let conn = await connect(mockConfig(ms.port, nil))
+        await serverFut
         let origWriter = conn.writer
         # The op Query is write #1 (succeeds); the release-path resetQuery is
         # write #2 (raises a Defect).
@@ -443,13 +455,16 @@ when hasChronos:
         pool.config.tracer = tracer
         conn.ownerPool = pool
         pool.idle.addLast(conn.toPooled())
+        # The counting mock writer swallows the op Query before it reaches
+        # the wire, so send the op's idle reply for the client's pump.
+        let replyFut = serverClient.sendOnceBorrowed(conn, buildReadyForQuery('I'))
 
         var raised = false
         try:
           discard await pool.simpleExec("SELECT 1")
         except PgPoolError:
           raised = true
-        await serverFut
+        await replyFut
 
         doAssert not raised,
           "a release-path Defect must not fail a successful op (raised=" & $raised & ")"
