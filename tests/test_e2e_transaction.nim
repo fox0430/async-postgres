@@ -2247,20 +2247,19 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
-  test "pool.withTransactionDeadline reports timeout when deadline expires during release":
-    # Regression: the deadline must not be swallowed when it fires while
-    # `resetSessionAndRelease` is still running: the outer handler must
-    # report PgTimeoutError, not success.
+  test "pool.withTransactionDeadline succeeds when the deadline expires in the reset after COMMIT":
+    # The transaction committed: a PgTimeoutError would invite a retry that
+    # commits it again.
     #
-    # Deterministic construction: a fast body plus a pg_sleep(1) resetQuery
-    # puts the 300ms deadline inside the release window with a ~280ms margin.
-    # `pg_sleep(1)` blocks the server for at least 1s, so the 300ms deadline is
-    # guaranteed to fire while `resetSessionAndRelease` is still running —
-    # the only way this could regress to "no timeout" is the event loop
-    # itself stalling for >300ms, which would break any timing-based test.
-    # The `resetStartedAt` discriminator below pins the firing point so the
-    # test cannot silently drift to the body-phase.
+    # A fast body plus a pg_sleep(1) resetQuery puts the 300ms deadline inside
+    # the reset with a ~280ms margin. `resetStartedAt` pins the firing point,
+    # and returning well before the reset could end shows the deadline fired.
     proc t() {.async.} =
+      let admin = await connect(plainConfig())
+      defer:
+        await admin.close()
+      discard await admin.exec("DROP TABLE IF EXISTS test_ptxd_reset")
+      discard await admin.exec("CREATE TABLE test_ptxd_reset (id int)")
       var cfg = plainConfig()
       let (tracer, resetStartedAt, resetStarted) = resetStartTracer()
       cfg.tracer = tracer
@@ -2270,29 +2269,23 @@ suite "E2E: Deadline-bounded Transaction":
       defer:
         await pool.close()
 
-      var raised = false
-      var deadlineFiredAt = Moment.now()
-      try:
-        pool.withTransactionDeadline(conn, milliseconds(300)):
-          discard await conn.query("SELECT 1")
-      except PgTimeoutError:
-        deadlineFiredAt = Moment.now()
-        raised = true
+      let startedAt = Moment.now()
+      pool.withTransactionDeadline(conn, milliseconds(300)):
+        discard await conn.exec("INSERT INTO test_ptxd_reset VALUES (1)")
+      let returnedAt = Moment.now()
 
-      doAssert raised, "deadline during release must raise PgTimeoutError"
-      doAssert resetStarted[],
-        "the deadline must fire after the body completed and the release " &
-          "(reset) started"
-      doAssert resetStartedAt[] < deadlineFiredAt,
-        "the deadline must fire while the release (reset) is in flight"
+      doAssert resetStarted[], "the reset must have started before the call returned"
+      doAssert resetStartedAt[] < returnedAt
+      doAssert returnedAt - startedAt < seconds(1),
+        "the call must return at the deadline, not after the reset"
+      let res = await admin.query("SELECT count(*) FROM test_ptxd_reset")
+      doAssert res.rows[0].getStr(0) == "1"
       when hasChronos:
-        # chronos: cancellation settles bodyFn (release included) before the
-        # timeout surfaces, so the slot is already free. asyncdispatch leaves
-        # the orphaned bodyFn running; its release completes asynchronously.
+        # chronos: the cancelled reset released the conn before `wait` raised.
         doAssert pool.activeCount == 0
       else:
-        # asyncdispatch: the orphaned release takes ~1s (pg_sleep); 20s poll
-        # bound so slow CI does not flake.
+        # asyncdispatch: bodyFn finishes the ~1s reset after the call returns;
+        # 20s poll bound so slow CI does not flake.
         var released = false
         for _ in 0 ..< 2000:
           if pool.activeCount == 0:
@@ -2300,18 +2293,19 @@ suite "E2E: Deadline-bounded Transaction":
             break
           await sleepAsync(milliseconds(10))
         doAssert released, "release must complete within the poll window"
-        doAssert pool.activeCount == 0
+
+      discard await admin.exec("DROP TABLE test_ptxd_reset")
 
     waitFor t()
 
-  test "pool.withTransactionRetryDeadline reports timeout when deadline expires during release":
-    # Regression: same class as the withTransactionDeadline variant above —
-    # the shared deadline must not be swallowed when it fires during release.
-    # Deterministic construction as in that test (fast body + pg_sleep(1)
-    # resetQuery, ~280ms margin); pg_sleep(1) guarantees the 300ms deadline
-    # fires inside the release window (see the sibling test). The same
-    # `resetStartedAt` discriminator pins the firing point.
+  test "pool.withTransactionRetryDeadline succeeds when the deadline expires in the reset after COMMIT":
+    # Same construction as the withTransactionDeadline variant above.
     proc t() {.async.} =
+      let admin = await connect(plainConfig())
+      defer:
+        await admin.close()
+      discard await admin.exec("DROP TABLE IF EXISTS test_ptxrd_reset")
+      discard await admin.exec("CREATE TABLE test_ptxrd_reset (id int)")
       var cfg = plainConfig()
       let (tracer, resetStartedAt, resetStarted) = resetStartTracer()
       cfg.tracer = tracer
@@ -2321,28 +2315,26 @@ suite "E2E: Deadline-bounded Transaction":
       defer:
         await pool.close()
 
-      var raised = false
-      var deadlineFiredAt = Moment.now()
-      try:
-        pool.withTransactionRetryDeadline(
-          RetryOptions(maxAttempts: 3), conn, milliseconds(300)
-        ):
-          discard await conn.query("SELECT 1")
-      except PgTimeoutError:
-        deadlineFiredAt = Moment.now()
-        raised = true
+      var runs = 0
+      let startedAt = Moment.now()
+      pool.withTransactionRetryDeadline(
+        RetryOptions(maxAttempts: 3), conn, milliseconds(300)
+      ):
+        inc runs
+        discard await conn.exec("INSERT INTO test_ptxrd_reset VALUES (1)")
+      let returnedAt = Moment.now()
 
-      doAssert raised, "deadline during release must raise PgTimeoutError"
-      doAssert resetStarted[],
-        "the deadline must fire after the body completed and the release " &
-          "(reset) started"
-      doAssert resetStartedAt[] < deadlineFiredAt,
-        "the deadline must fire while the release (reset) is in flight"
+      doAssert runs == 1
+      doAssert resetStarted[], "the reset must have started before the call returned"
+      doAssert resetStartedAt[] < returnedAt
+      doAssert returnedAt - startedAt < seconds(1),
+        "the call must return at the deadline, not after the reset"
+      let res = await admin.query("SELECT count(*) FROM test_ptxrd_reset")
+      doAssert res.rows[0].getStr(0) == "1"
       when hasChronos:
         doAssert pool.activeCount == 0
       else:
-        # asyncdispatch: orphaned release takes ~1s; 20s poll bound (see the
-        # sibling test).
+        # asyncdispatch: see the sibling test.
         var released = false
         for _ in 0 ..< 2000:
           if pool.activeCount == 0:
@@ -2350,7 +2342,8 @@ suite "E2E: Deadline-bounded Transaction":
             break
           await sleepAsync(milliseconds(10))
         doAssert released, "release must complete within the poll window"
-        doAssert pool.activeCount == 0
+
+      discard await admin.exec("DROP TABLE test_ptxrd_reset")
 
     waitFor t()
 

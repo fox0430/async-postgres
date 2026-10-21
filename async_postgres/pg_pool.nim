@@ -2621,6 +2621,13 @@ macro withTransactionRetry*(
       `bodyDefectSym` = `dSym`
     `releaseBlock`
 
+type PoolTxDeadlineState = ref tuple[
+  acquired: Option[PgConnection], released, abandoned, committed: bool
+]
+  ## What a pool deadline transaction's timeout handler shares with its body
+  ## proc. Passed in, not captured: a loop around the macro reuses the caller's
+  ## env slots, so an abandoned call's late acquire would read the next call's.
+
 macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## Execute `body` inside a BEGIN/COMMIT transaction bounded by a single
   ## wall-clock deadline that covers `pool.acquire()`, BEGIN, the body, and
@@ -2643,9 +2650,15 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## asyncdispatch the still-running body keeps the connection, which is retired
   ## `csClosed` without a ROLLBACK and dropped on its eventual release. Whenever
   ## ROLLBACK is skipped, dropping the connection is what ends the server-side
-  ## transaction. If the timeout fires while still waiting for `acquire()`, the
-  ## waiter remains queued (cancelled best-effort) until the underlying
-  ## acquire future settles; this is unavoidable under asyncdispatch.
+  ## transaction. If the timeout fires while still waiting for `acquire()`,
+  ## chronos cancels that acquire. Under asyncdispatch it stays queued,
+  ## counting toward `maxWaiters`, until it gets a connection or its own
+  ## `acquireTimeout` expires. A connection it still gets goes straight back to
+  ## the pool: the body never runs, so a caller that retries does not run it
+  ## twice. A deadline that expires after COMMIT, during the pool's session
+  ## reset, raises nothing: the transaction committed. Under chronos the reset
+  ## is cancelled and the connection dropped. Under asyncdispatch the reset
+  ## runs on, bounded only by `resetQueryTimeout`, as on any release.
   ##
   ## This holds for the acquire phase too: a deadline that expires while
   ## waiting for `acquire()` raises `PgTimeoutError`, not
@@ -2705,13 +2718,17 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let deadlineMomentSym = macroSym(nskLet, "deadlineMoment")
   let bodyFnSym = macroSym(nskProc, "poolTxBodyDeadline")
   let bodyFutSym = macroSym(nskLet, "bodyFut")
-  let connOptSym = macroSym(nskVar, "connOpt")
-  let releasedSym = macroSym(nskVar, "released")
+  let poolArgSym = macroSym(nskParam, "pool")
+  let deadlineArgSym = macroSym(nskParam, "deadlineMoment")
+  let stateSym = macroSym(nskVar, "txState")
+  let stateArgSym = macroSym(nskParam, "txState")
+  let stateTypeSym = bindSym"PoolTxDeadlineState"
   let cancelledSym = macroSym(nskLet, "cancelled")
   let bodyErrSym = macroSym(nskVar, "bodyErr")
   let bodyDefectSym = macroSym(nskVar, "bodyDefect")
   let releaseErrSym = macroSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
+  let releaseReclaimedSym = bindSym"releaseReclaimed"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"waitKeepingOutcome"
@@ -2721,26 +2738,34 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
   let commitSym = bindSym"commitTx"
 
-  # asyncdispatch-safe release (see `buildReleaseAndReraise`): `releasedSym`
-  # is set on release, success or failure, as the old try/finally did.
+  # asyncdispatch-safe release (see `buildReleaseAndReraise`): `released` is
+  # set on release, success or failure, as the old try/finally did.
   result = quote:
     let `poolSym` = `poolExpr`
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
-    var `connOptSym` = none(PgConnection)
-    var `releasedSym` = false
-    proc `bodyFnSym`(): Future[void] {.async.} =
-      let `connIdent` = await `poolSym`.acquire()
-      `connOptSym` = some(`connIdent`)
+    var `stateSym`: `stateTypeSym`
+    new(`stateSym`)
+    proc `bodyFnSym`(
+        `poolArgSym`: PgPool, `deadlineArgSym`: Moment, `stateArgSym`: `stateTypeSym`
+    ): Future[void] {.async.} =
+      let `connIdent` = await `poolArgSym`.acquire()
+      if `stateArgSym`.abandoned:
+        # asyncdispatch: the deadline gave up on this acquire but could not
+        # cancel it; the caller was told it timed out, so open no transaction.
+        `releaseReclaimedSym`(`connIdent`)
+        return
+      `stateArgSym`.acquired = some(`connIdent`)
       var `bodyErrSym`: ref CatchableError = nil
       var `bodyDefectSym`: ref Defect = nil
       try:
         discard await `connIdent`.simpleExec(
-          `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
+          `beginSql`, timeout = `remainingSym`(`deadlineArgSym`)
         )
         try:
           `body`
-          await `commitSym`(`connIdent`, `remainingSym`(`deadlineMomentSym`))
+          await `commitSym`(`connIdent`, `remainingSym`(`deadlineArgSym`))
+          `stateArgSym`.committed = true
         except CancelledError as `cancelSym`:
           # Skip ROLLBACK on body-cancel; the outer handler aborts server-side.
           raise `cancelSym`
@@ -2759,22 +2784,22 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
       except Defect as `dSym`:
         `bodyDefectSym` = `dSym`
       try:
-        await `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
+        await `resetSessionAndReleaseSym`(`poolArgSym`, `connIdent`)
       except CancelledError as `cancelSym`:
         # Already released: mark so the outer handler doesn't double-invalidate.
-        `releasedSym` = true
+        `stateArgSym`.released = true
         raise `cancelSym`
       except Defect as `dSym`:
-        `releasedSym` = true
+        `stateArgSym`.released = true
         # Wrap the Defect (see runAndReleaseImpl) unless it shadows the body error.
         if `bodyErrSym` == nil and `bodyDefectSym` == nil:
           raise newPoolError(pekDefectWrapped, `dSym`.msg, `dSym`)
       except CatchableError as `releaseErrSym`:
         # Already released: re-raise only when the body succeeded.
-        `releasedSym` = true
+        `stateArgSym`.released = true
         if `bodyErrSym` == nil and `bodyDefectSym` == nil:
           raise `releaseErrSym`
-      `releasedSym` = true
+      `stateArgSym`.released = true
       if `bodyErrSym` != nil:
         raise `bodyErrSym`
       if `bodyDefectSym` != nil:
@@ -2782,7 +2807,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
         # Defects eagerly.
         raise newPoolError(pekDefectWrapped, `bodyDefectSym`.msg, `bodyDefectSym`)
 
-    let `bodyFutSym` = `bodyFnSym`()
+    let `bodyFutSym` = `bodyFnSym`(`poolSym`, `deadlineMomentSym`, `stateSym`)
     try:
       await `waitSym`(`bodyFutSym`, `totalDurSym`)
     except `timeoutErrSym`:
@@ -2794,13 +2819,18 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
       # the-same-tick should suppress the timeout report.
       if `bodyFutSym`.completed():
         discard
-      elif `connOptSym`.isNone:
+      elif `stateSym`.committed:
+        # Only the session reset was left, and a timeout would invite a retry
+        # that commits again. bodyFn still releases the conn.
+        discard
+      elif `stateSym`.acquired.isNone:
+        `stateSym`.abandoned = true
         raise newException(
           PgTimeoutError, "withTransactionDeadline (pool): acquire timed out"
         )
-      elif `releasedSym`:
+      elif `stateSym`.released:
         # chronos: cancellation already ran bodyFn's release (set
-        # `releasedSym`), so the conn is back in the pool and must not be
+        # `released`), so the conn is back in the pool and must not be
         # invalidated here.
         raise newException(PgTimeoutError, "withTransactionDeadline (pool) exceeded")
       else:
@@ -2808,7 +2838,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
         # retirement is owed to that ownership rather than to the wire.
         # `retireOnTimeout` marks it csClosed unconditionally, so release()
         # discards it and the orphan cannot commit a timed-out transaction.
-        `retireSym`(`connOptSym`.get, "withTransactionDeadline (pool) exceeded")
+        `retireSym`(`stateSym`.acquired.get, "withTransactionDeadline (pool) exceeded")
 
 macro withTransactionRetryDeadline*(
     pool: PgPool, retryOpts: RetryOptions, args: varargs[untyped]
@@ -2829,14 +2859,14 @@ macro withTransactionRetryDeadline*(
   ## the pool's health check rather than reused. Worst-case wall-clock is
   ## `deadline`, not `maxAttempts * deadline`.
   ##
-  ## **On deadline exceeded:** `PgTimeoutError` is raised — never retried; the
-  ## in-flight connection is handled as in `withTransactionDeadline`. This
+  ## **On deadline exceeded:** `PgTimeoutError` is raised — never retried. This
   ## holds for the acquire phase too: a deadline that expires while waiting
   ## for `acquire()` raises `PgTimeoutError`, not
   ## `PgPoolError(pekAcquireTimeout)` as a bare `acquire()` would. An
   ## `except PgPoolError` clause alone therefore misses it — catch
   ## `PgTimeoutError` first (see `acquire`). `retryAdvice` returns `raRetry`
-  ## for both timeout types.
+  ## for both timeout types. The in-flight connection, and a deadline that
+  ## expires after COMMIT, are handled as in `withTransactionDeadline`.
   ## **On a retryable error:**
   ## ROLLBACK runs with `rollbackGrace` and the transaction is retried if budget
   ## remains. A COMMIT the server rolled back (`25P02`) is retried as in
@@ -2879,13 +2909,17 @@ macro withTransactionRetryDeadline*(
   let totalDurSym = macroSym(nskLet, "totalDur")
   let deadlineMomentSym = macroSym(nskLet, "deadlineMoment")
   let bodyFnSym = macroSym(nskProc, "poolTxBodyRetryDeadline")
-  let connOptSym = macroSym(nskVar, "connOpt")
-  let releasedSym = macroSym(nskVar, "released")
+  let poolArgSym = macroSym(nskParam, "pool")
+  let deadlineArgSym = macroSym(nskParam, "deadlineMoment")
+  let stateSym = macroSym(nskVar, "txState")
+  let stateArgSym = macroSym(nskParam, "txState")
+  let stateTypeSym = bindSym"PoolTxDeadlineState"
   let cancelledSym = macroSym(nskLet, "cancelled")
   let bodyErrSym = macroSym(nskVar, "bodyErr")
   let bodyDefectSym = macroSym(nskVar, "bodyDefect")
   let releaseErrSym = macroSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
+  let releaseReclaimedSym = bindSym"releaseReclaimed"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let graceSym = bindSym"rollbackGrace"
@@ -2894,20 +2928,26 @@ macro withTransactionRetryDeadline*(
   # (ROLLBACK + release) happens inside bodyFn; the outer loop adds no cleanup
   # and omits the conn-state retry gate (connForStateCheck = nil).
   # See withTransactionDeadline for the released/isNone branch rationale.
-  # Both timeout branches are the same here: `releasedSym` already says whether
+  # Both timeout branches are the same here: `released` already says whether
   # the body unwound and released, and a body that did not is retired whatever
   # the wire looks like.
   let timeoutElse = quote:
-    if `connOptSym`.isNone:
+    if `stateSym`.committed:
+      # See withTransactionDeadline: the attempt committed, so report success.
+      break
+    elif `stateSym`.acquired.isNone:
+      `stateSym`.abandoned = true
       raise newException(
         PgTimeoutError, "withTransactionRetryDeadline (pool): acquire timed out"
       )
-    elif `releasedSym`:
+    elif `stateSym`.released:
       raise newException(PgTimeoutError, "withTransactionRetryDeadline (pool) exceeded")
     else:
-      `retireSym`(`connOptSym`.get, "withTransactionRetryDeadline (pool) exceeded")
+      `retireSym`(
+        `stateSym`.acquired.get, "withTransactionRetryDeadline (pool) exceeded"
+      )
   let loop = buildRetryDeadlineLoop(
-    bodyFnSym,
+    newCall(bodyFnSym, poolSym, deadlineMomentSym, stateSym),
     retryOptsSym,
     deadlineMomentSym,
     connForStateCheck = nil,
@@ -2922,23 +2962,32 @@ macro withTransactionRetryDeadline*(
     let `retryOptsSym` = `retryOpts`
     let `totalDurSym` = `deadline`
     let `deadlineMomentSym` = Moment.now() + `totalDurSym`
-    var `connOptSym` = none(PgConnection)
-    var `releasedSym` = false
-    proc `bodyFnSym`(): Future[void] {.async.} =
-      `connOptSym` = none(PgConnection)
-      `releasedSym` = false
-      let `connIdent` = await `poolSym`.acquire()
-      `connOptSym` = some(`connIdent`)
+    var `stateSym`: `stateTypeSym`
+    new(`stateSym`)
+    proc `bodyFnSym`(
+        `poolArgSym`: PgPool, `deadlineArgSym`: Moment, `stateArgSym`: `stateTypeSym`
+    ): Future[void] {.async.} =
+      `stateArgSym`.acquired = none(PgConnection)
+      `stateArgSym`.released = false
+      `stateArgSym`.committed = false
+      let `connIdent` = await `poolArgSym`.acquire()
+      if `stateArgSym`.abandoned:
+        # See withTransactionDeadline: a timeout never retries, so this is the
+        # last attempt and its late conn goes straight back.
+        `releaseReclaimedSym`(`connIdent`)
+        return
+      `stateArgSym`.acquired = some(`connIdent`)
       # asyncdispatch-safe release (see withTransactionDeadline).
       var `bodyErrSym`: ref CatchableError = nil
       var `bodyDefectSym`: ref Defect = nil
       try:
         discard await `connIdent`.simpleExec(
-          `beginSql`, timeout = `remainingSym`(`deadlineMomentSym`)
+          `beginSql`, timeout = `remainingSym`(`deadlineArgSym`)
         )
         try:
           `body`
-          await `commitSym`(`connIdent`, `remainingSym`(`deadlineMomentSym`))
+          await `commitSym`(`connIdent`, `remainingSym`(`deadlineArgSym`))
+          `stateArgSym`.committed = true
         except CancelledError as `cancelSym`:
           # See withTransactionDeadline — skip ROLLBACK on body-cancel.
           raise `cancelSym`
@@ -2957,22 +3006,22 @@ macro withTransactionRetryDeadline*(
       except Defect as `dSym`:
         `bodyDefectSym` = `dSym`
       try:
-        await `resetSessionAndReleaseSym`(`poolSym`, `connIdent`)
+        await `resetSessionAndReleaseSym`(`poolArgSym`, `connIdent`)
       except CancelledError as `cancelSym`:
         # Already released: mark so the outer handler doesn't double-invalidate.
-        `releasedSym` = true
+        `stateArgSym`.released = true
         raise `cancelSym`
       except Defect as `dSym`:
-        `releasedSym` = true
+        `stateArgSym`.released = true
         # Wrap the Defect (see runAndReleaseImpl) unless it shadows the body error.
         if `bodyErrSym` == nil and `bodyDefectSym` == nil:
           raise newPoolError(pekDefectWrapped, `dSym`.msg, `dSym`)
       except CatchableError as `releaseErrSym`:
         # Already released: re-raise only when the body succeeded.
-        `releasedSym` = true
+        `stateArgSym`.released = true
         if `bodyErrSym` == nil and `bodyDefectSym` == nil:
           raise `releaseErrSym`
-      `releasedSym` = true
+      `stateArgSym`.released = true
       if `bodyErrSym` != nil:
         raise `bodyErrSym`
       if `bodyDefectSym` != nil:

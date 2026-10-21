@@ -1555,6 +1555,94 @@ suite "Pool transaction and pipeline macros":
 
       waitFor t()
 
+  test "withTransactionDeadline retried after an acquire timeout runs the body once":
+    # asyncdispatch's `wait` cannot stop the acquire: the conn freed later went
+    # to the abandoned attempt, which could commit what was reported as timed
+    # out. The retry runs in the same frame, so the attempts' macro locals
+    # share one closure env slot.
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[simpleOk("BEGIN", 'T'), simpleOk("INSERT 0 1", 'T'), simpleOk("COMMIT", 'I')],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      let held = await pool.acquire()
+      var runs = 0
+      var outcomes: seq[string]
+      proc run() {.async.} =
+        for deadline in [milliseconds(50), seconds(5)]:
+          try:
+            pool.withTransactionDeadline(txConn, deadline):
+              inc runs
+              discard await txConn.simpleExec("INSERT INTO t VALUES (1)")
+            outcomes.add("ok")
+          except PgTimeoutError as e:
+            outcomes.add(if "acquire timed out" in e.msg: "acquire timeout" else: e.msg)
+            held.release()
+          except CatchableError as e:
+            outcomes.add(e.msg)
+
+      await run().wait(seconds(10))
+      doAssert outcomes == @["acquire timeout", "ok"], $outcomes
+      doAssert runs == 1
+      doAssert log[] == @["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"], $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      doAssert log[][^1] == "<terminate>", $log[]
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline retried after an acquire timeout runs the body once":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[simpleOk("BEGIN", 'T'), simpleOk("INSERT 0 1", 'T'), simpleOk("COMMIT", 'I')],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      let held = await pool.acquire()
+      var runs = 0
+      var outcomes: seq[string]
+      proc run() {.async.} =
+        for deadline in [milliseconds(50), seconds(5)]:
+          try:
+            pool.withTransactionRetryDeadline(
+              RetryOptions(maxAttempts: 3, baseDelayMs: 0, jitter: false),
+              txConn,
+              deadline,
+            ):
+              inc runs
+              discard await txConn.simpleExec("INSERT INTO t VALUES (1)")
+            outcomes.add("ok")
+          except PgTimeoutError as e:
+            outcomes.add(if "acquire timed out" in e.msg: "acquire timeout" else: e.msg)
+            held.release()
+          except CatchableError as e:
+            outcomes.add(e.msg)
+
+      await run().wait(seconds(10))
+      doAssert outcomes == @["acquire timeout", "ok"], $outcomes
+      doAssert runs == 1
+      doAssert log[] == @["BEGIN", "INSERT INTO t VALUES (1)", "COMMIT"], $log[]
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      doAssert log[][^1] == "<terminate>", $log[]
+      await closeServer(ms)
+
+    waitFor t()
+
   test "withPipeline runs the batch on one connection and releases it":
     proc t() {.async.} =
       let ms = startMockServer()
