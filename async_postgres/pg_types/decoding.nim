@@ -86,6 +86,10 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric {.raises: [PgError].
       pgNegative
     of 0xC000'u16:
       pgNaN
+    of 0xD000'u16:
+      pgInf
+    of 0xF000'u16:
+      pgNegInf
     else:
       # No decoded sign in the message: `PgTypeError` reports input
       # lengths/offsets only (see pg_errors.nim).
@@ -96,8 +100,9 @@ proc decodeNumericBinary*(data: openArray[byte]): PgNumeric {.raises: [PgError].
       PgTypeError,
       "Numeric binary: expected length " & $expectedLen & " got " & $data.len,
     )
-  if sign == pgNaN:
-    return PgNumeric(sign: pgNaN)
+  if not PgNumeric(sign: sign).isFinite:
+    # The server sends the infinities with dscale 32; only the sign counts.
+    return PgNumeric(sign: sign)
   var digits = newSeq[int16](ndigits)
   for i in 0 ..< ndigits:
     let d = fromBE16(data.toOpenArray(8 + i * 2, 9 + i * 2))

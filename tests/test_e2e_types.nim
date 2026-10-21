@@ -1,4 +1,4 @@
-import std/[unittest, options, times, strutils]
+import std/[unittest, options, sequtils, times, strutils]
 
 import ../async_postgres/[async_backend, pg_types]
 
@@ -470,6 +470,56 @@ suite "E2E: JSON and Numeric":
       doAssert res.rows.len == 1
       doAssert $res.rows[0].getNumeric(0) == "-123.456"
       doAssert $res.rows[0].getNumeric(1) == "NaN"
+      await conn.close()
+
+    waitFor t()
+
+  test "numeric infinities read the same on a statement-cache hit":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      # The first execution reads text, the cache hit binary.
+      let sql =
+        "SELECT 'Infinity'::numeric, '-Infinity'::numeric, " &
+        "ARRAY['-Infinity', 1.5, 'Infinity', 'NaN']::numeric[], " &
+        "numrange('-Infinity', 'Infinity'), nummultirange(numrange(1, 'Infinity'))"
+      let first = (await conn.query(sql)).rows[0]
+      let cached = (await conn.query(sql)).rows[0]
+      doAssert not first.isBinaryCol(0), "first execution must be text"
+      doAssert cached.isBinaryCol(0), "numeric must turn binary on a cache hit"
+      for row in [first, cached]:
+        doAssert row.getStr(0) == "Infinity"
+        doAssert row.getStr(1) == "-Infinity"
+        doAssert row.getNumeric(0).sign == pgInf
+        doAssert row.getNumeric(1).sign == pgNegInf
+        doAssert row.getNumericArray(2).mapIt($it) ==
+          @["-Infinity", "1.5", "Infinity", "NaN"]
+        let r = row.getNumRange(3)
+        doAssert r.hasLower and r.hasUpper
+        doAssert r.lower.value.sign == pgNegInf
+        doAssert r.upper.value.sign == pgInf
+        let mr = seq[PgRange[PgNumeric]](row.getNumMultirange(4))
+        doAssert mr.len == 1 and $mr[0].lower.value == "1"
+        doAssert mr[0].upper.value.sign == pgInf
+      await conn.close()
+
+    waitFor t()
+
+  test "numeric infinities as parameters":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let inf = parsePgNumeric("Infinity")
+      let negInf = parsePgNumeric("-Infinity")
+      for (p, q) in [
+        (toPgParam(inf), toPgParam(negInf)),
+        (toPgBinaryParam(inf), toPgBinaryParam(negInf)),
+      ]:
+        let res = await conn.query(
+          "SELECT $1::numeric = 'Infinity', $2::numeric = '-Infinity', $1::numeric",
+          @[p, q],
+        )
+        doAssert res.rows[0].getBool(0)
+        doAssert res.rows[0].getBool(1)
+        doAssert res.rows[0].getNumeric(2) == inf
       await conn.close()
 
     waitFor t()

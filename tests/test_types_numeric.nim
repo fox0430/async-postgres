@@ -14,8 +14,8 @@ suite "PgNumeric":
     # The pre-flight uses the bound so it does not render; under-charging would
     # let an oversized Bind reach the encoder after the Close drain.
     for s in [
-      "0", "-1", "NaN", "0.00", "12345.6789", "-0.001", "100000000", "0.00001",
-      "999.999", "-123456789012345678901234567890.123456789",
+      "0", "-1", "NaN", "Infinity", "-Infinity", "0.00", "12345.6789", "-0.001",
+      "100000000", "0.00001", "999.999", "-123456789012345678901234567890.123456789",
     ]:
       let n = parsePgNumeric(s)
       check paramValueLenBound(n) >= paramValueLen(n)
@@ -36,12 +36,19 @@ suite "PgNumeric":
 
   test "toPgBinaryParam PgNumeric roundtrip variants":
     for s in [
-      "0", "-1", "NaN", "0.00", "12345.6789", "-0.001", "100000000", "0.00001",
-      "999.999",
+      "0", "-1", "NaN", "Infinity", "-Infinity", "0.00", "12345.6789", "-0.001",
+      "100000000", "0.00001", "999.999",
     ]:
       let p = toPgBinaryParam(parsePgNumeric(s))
       let decoded = $decodeNumericBinary(p.value.get)
       check decoded == s
+
+  test "encodeNumericBinary sends NaN and the infinities as the sign alone":
+    # The other fields are ignored, as by `$` on the text path.
+    for (sign, hi) in [(pgNaN, 0xC0'u8), (pgInf, 0xD0'u8), (pgNegInf, 0xF0'u8)]:
+      check encodeNumericBinary(
+        PgNumeric(weight: 3, sign: sign, dscale: -1, digits: @[12345'i16])
+      ) == @[0x00'u8, 0x00, 0x00, 0x00, hi, 0x00, 0x00, 0x00]
 
   test "encodeNumericBinary rejects out-of-range base-10000 digit":
     # User-constructed PgNumeric with digits outside [0, 9999] must fail
@@ -75,8 +82,12 @@ suite "PgNumeric":
     check parsePgNumeric("1.0") == parsePgNumeric("1.00") # value-based equality
     check parsePgNumeric("0") == parsePgNumeric("0.00")
     check parsePgNumeric("NaN") == parsePgNumeric("NaN")
+    check parsePgNumeric("Infinity") == parsePgNumeric("Infinity")
+    check parsePgNumeric("-Infinity") == parsePgNumeric("-Infinity")
     check parsePgNumeric("1") != parsePgNumeric("2")
     check parsePgNumeric("1") != parsePgNumeric("-1")
+    check parsePgNumeric("Infinity") != parsePgNumeric("-Infinity")
+    check parsePgNumeric("Infinity") != parsePgNumeric("NaN")
 
   test "PgNumeric comparison":
     check parsePgNumeric("1") < parsePgNumeric("2")
@@ -94,17 +105,36 @@ suite "PgNumeric":
     check parsePgNumeric("NaN") > parsePgNumeric("-999999999")
     check parsePgNumeric("NaN") >= parsePgNumeric("NaN")
     check parsePgNumeric("NaN") <= parsePgNumeric("NaN")
+    # -Infinity < every finite value < Infinity < NaN, as in PostgreSQL
+    for s in ["-999999999", "-0.001", "0", "0.00", "999999999"]:
+      check parsePgNumeric("-Infinity") < parsePgNumeric(s)
+      check parsePgNumeric(s) < parsePgNumeric("Infinity")
+    check parsePgNumeric("-Infinity") < parsePgNumeric("Infinity")
+    check parsePgNumeric("Infinity") < parsePgNumeric("NaN")
+    check parsePgNumeric("-Infinity") < parsePgNumeric("NaN")
+    check parsePgNumeric("Infinity") <= parsePgNumeric("Infinity")
+    check parsePgNumeric("-Infinity") >= parsePgNumeric("-Infinity")
+
+  test "PgNumeric isFinite and isZero":
+    for s in ["0", "0.00", "-1.5", "12345.6789"]:
+      check parsePgNumeric(s).isFinite
+    for s in ["NaN", "Infinity", "-Infinity"]:
+      check not parsePgNumeric(s).isFinite
+      check not parsePgNumeric(s).isZero
+    check parsePgNumeric("0.00").isZero
 
   test "PgNumeric hash consistency":
     # Equal values must have equal hashes
     check hash(parsePgNumeric("1.0")) == hash(parsePgNumeric("1.00"))
     check hash(parsePgNumeric("0")) == hash(parsePgNumeric("0.00"))
     check hash(parsePgNumeric("NaN")) == hash(parsePgNumeric("NaN"))
+    check hash(parsePgNumeric("Infinity")) == hash(parsePgNumeric("Infinity"))
+    check hash(parsePgNumeric("-Infinity")) == hash(parsePgNumeric("-Infinity"))
 
   test "parsePgNumeric roundtrip":
     for s in [
-      "0", "1", "-1", "0.00", "12345.6789", "-0.001", "NaN", "100000000", "0.00001",
-      "999.999",
+      "0", "1", "-1", "0.00", "12345.6789", "-0.001", "NaN", "Infinity", "-Infinity",
+      "100000000", "0.00001", "999.999",
     ]:
       check $parsePgNumeric(s) == s
 
@@ -221,6 +251,19 @@ suite "PgNumeric":
     let fields = @[mkField(OidNumeric, 1)]
     let row = mkRow(@[some(data)], fields)
     check $row.getNumeric(0) == "NaN"
+
+  test "decodeNumericBinary - Infinity and -Infinity":
+    # PostgreSQL 14+ sends dscale 32 with both; only the sign is the value.
+    let fields = @[mkField(OidNumeric, 1)]
+    let posInf: seq[byte] = @[0x00'u8, 0x00, 0x00, 0x00, 0xD0, 0x00, 0x00, 0x20]
+    let negInf: seq[byte] = @[0x00'u8, 0x00, 0x00, 0x00, 0xF0, 0x00, 0x00, 0x20]
+    let row = mkRow(@[some(posInf), some(negInf)], fields & fields)
+    check row.getNumeric(0).sign == pgInf
+    check row.getNumeric(1).sign == pgNegInf
+    check row.getNumeric(0) == parsePgNumeric("Infinity")
+    check row.getNumeric(1) == parsePgNumeric("-Infinity")
+    check row.getStr(0) == "Infinity"
+    check row.getStr(1) == "-Infinity"
 
   test "decodeNumericBinary - small decimal 0.00001":
     # 0.00001: weight=-2 (first digit at 10^(-2*4)=10^-8 place)

@@ -1736,7 +1736,9 @@ async_postgres/pg_types/core.nim	PgNumeric.dscale
 async_postgres/pg_types/core.nim	PgNumeric.sign
 async_postgres/pg_types/core.nim	PgNumeric.weight
 async_postgres/pg_types/core.nim	PgNumericSign
+async_postgres/pg_types/core.nim	PgNumericSign.pgInf
 async_postgres/pg_types/core.nim	PgNumericSign.pgNaN
+async_postgres/pg_types/core.nim	PgNumericSign.pgNegInf
 async_postgres/pg_types/core.nim	PgNumericSign.pgNegative
 async_postgres/pg_types/core.nim	PgNumericSign.pgPositive
 async_postgres/pg_types/core.nim	PgParam
@@ -1853,6 +1855,7 @@ async_postgres/pg_types/core.nim	inferPgMoneyConventions
 async_postgres/pg_types/core.nim	initPgBit
 async_postgres/pg_types/core.nim	initPgMoney
 async_postgres/pg_types/core.nim	initPgMoneyConventions
+async_postgres/pg_types/core.nim	isFinite
 async_postgres/pg_types/core.nim	isZero
 async_postgres/pg_types/core.nim	nbits
 async_postgres/pg_types/core.nim	parseBitString
