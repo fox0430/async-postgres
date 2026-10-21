@@ -750,12 +750,18 @@ suite "E2E: Pool Extended Query":
 
     waitFor t()
 
+proc withDialTimeout(connConfig: ConnConfig): ConnConfig =
+  ## Unset, a replenish dial is bounded by `maintenanceInterval`: 50ms below,
+  ## shorter than a connect on a slow runner.
+  result = connConfig
+  result.connectTimeout = seconds(5)
+
 suite "E2E: Pool minSize Replenishment":
   test "replenishes to minSize after maxLifetime expiry":
     proc t() {.async.} =
       let pool = await newPool(
         PoolConfig(
-          connConfig: plainConfig(),
+          connConfig: plainConfig().withDialTimeout(),
           minSize: 2,
           maxSize: 5,
           maxLifetime: milliseconds(200),
@@ -763,25 +769,34 @@ suite "E2E: Pool minSize Replenishment":
         )
       )
 
-      doAssert pool.idleCount == 2
+      try:
+        doAssert pool.idleCount == 2
 
-      # Wait for maxLifetime to expire + maintenance to clean + replenish
-      await sleepAsync(milliseconds(300))
+        # Wait for maxLifetime to expire + maintenance to clean + replenish
+        var replenished = false
+        let deadline = Moment.now() + seconds(5)
+        while Moment.now() < deadline:
+          if pool.metrics.closeCount >= 2 and pool.idleCount == 2:
+            replenished = true
+            break
+          await sleepAsync(milliseconds(20))
+        doAssert replenished
 
-      doAssert pool.idleCount == 2
-
-      # Verify replenished connections are functional
-      let conn = await pool.acquire()
-      doAssert conn.state == csReady
-      let res = await conn.simpleQuery("SELECT 1")
-      doAssert res[0].rows[0][0].get().toString() == "1"
-      conn.release()
-
-      await pool.close()
+        # Verify replenished connections are functional
+        let conn = await pool.acquire()
+        doAssert conn.state == csReady
+        let res = await conn.simpleQuery("SELECT 1")
+        doAssert res[0].rows[0][0].get().toString() == "1"
+        conn.release()
+      finally:
+        await pool.close()
 
     waitFor t()
 
-  for (label, connConfig) in [("plaintext", plainConfig()), ("TLS", sslConfig())]:
+  for (label, connConfig) in [
+    ("plaintext", plainConfig().withDialTimeout()),
+    ("TLS", sslConfig().withDialTimeout()),
+  ]:
     test "replaces an idle " & label & " conn whose backend was terminated":
       # The backend writes a FATAL ahead of its FIN (under TLS, a close_notify
       # too), and no acquire comes to ping the conn, so only the maintenance
