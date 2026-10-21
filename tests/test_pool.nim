@@ -3647,6 +3647,31 @@ when hasChronos:
 
       waitFor t()
 
+    test "idle timeout counts toward minSize only the conns the sweep keeps":
+      proc t() {.async.} =
+        let pool = makePool(minSize = 1)
+        pool.config.idleTimeout = milliseconds(10)
+        pool.config.maintenanceInterval = milliseconds(20)
+
+        # The broken conn behind it leaves with the same sweep, so closing the
+        # stale one would take the pool below minSize.
+        let stale = mockConn()
+        pool.idle.addLast(
+          PooledConn(conn: stale, lastUsedAt: Moment.now() - milliseconds(100))
+        )
+        pool.idle.addLast(toPooled(mockConn(csClosed)))
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+        await sleepAsync(milliseconds(60))
+
+        doAssert pool.idle.len == 1
+        doAssert pool.idle.peekFirst().conn == stale
+
+        pool.closed = true
+        await cancelAndWait(pool.maintenanceTask)
+
+      waitFor t()
+
     test "maxLifetime removes old connections in maintenance":
       proc t() {.async.} =
         let pool = makePool(minSize = 0)
@@ -5467,7 +5492,7 @@ suite "Pool broken connection handling (integration)":
     # Half-open scenario: the server has sent FIN but the client has not
     # read it yet, so the conn's logical state remains csReady. Without
     # an OS-level probe, the pool would happily hand this corpse out;
-    # acquire must call socketHasFin and discard it.
+    # acquire must probe it (`idleProbe`) and discard it.
     var idleAfter = -1
     var closeCountDelta: int64 = -1
     var stateAtAcquire = csConnecting
@@ -5518,6 +5543,458 @@ suite "Pool broken connection handling (integration)":
     check stateAtAcquire == csReady
     check closeCountDelta == 1
     check idleAfter == 0
+
+  type IdleEnding = enum
+    ## How a server ends a session while the client sits idle.
+    ieFin = "a bare FIN"
+    ieFatal = "a FATAL ahead of its FIN" # pg_terminate_backend, idle_session_timeout
+    ieWarning = "a WARNING ahead of its FIN" # crash restart, immediate shutdown
+    ieNotifyFatal = "a NOTIFY and a FATAL ahead of its FIN"
+
+  proc endIdle(client: MockClient, ending: IdleEnding) {.async.} =
+    var bytes: seq[byte]
+    if ending == ieNotifyFatal:
+      bytes.add(buildNotificationResponse(4321, "ch", "payload"))
+    if ending in {ieFatal, ieNotifyFatal}:
+      bytes.add(
+        buildErrorResponse(
+          "57P01", "terminating connection due to administrator command", "FATAL"
+        )
+      )
+    if ending == ieWarning:
+      # A NoticeResponse carries the same fields as an ErrorResponse.
+      var notice = buildErrorResponse(
+        "57P02", "terminating connection because of crash of another server process",
+        "WARNING",
+      )
+      notice[0] = byte('N')
+      bytes.add(notice)
+    if bytes.len > 0:
+      await sendBytes(client, bytes)
+    await closeClient(client)
+
+  proc answerPing(client: MockClient) {.async.} =
+    let msg = await drainFrontendMessage(client)
+    doAssert msg.msgType == 'Q'
+    await sendBytes(client, buildEmptyQueryResponse() & buildReadyForQuery())
+
+  for ending in ieFatal .. ieNotifyFatal:
+    test "acquire skips an idle conn whose backend sent " & $ending:
+      # The probe sees bytes, not the FIN behind them, and the conn idled under
+      # healthCheckTimeout: only the ping those bytes trigger can retire it.
+      var idleAfter = -1
+      var closeCountDelta: int64 = -1
+
+      proc testBody(ending: IdleEnding) {.async.} =
+        let ms = startMockServer()
+        var serverSide: MockClient
+
+        proc serverHandler() {.async.} =
+          try:
+            serverSide = await acceptAndReady(ms)
+          except CatchableError:
+            discard
+
+        let serverFut = serverHandler()
+
+        let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+        let pool = await newPool(cfg)
+
+        let broken = await pool.acquire()
+        pool.release(broken)
+        await serverFut
+        doAssert pool.idle.len == 1
+
+        await endIdle(serverSide, ending)
+        await sleepAsync(milliseconds(50))
+        doAssert broken.state == csReady
+
+        let good = mockConn()
+        pool.idle.addLast(toPooled(good))
+
+        let before = pool.metrics.closeCount
+        let acquired = await pool.acquire()
+        closeCountDelta = pool.metrics.closeCount - before
+        idleAfter = pool.idle.len
+
+        pool.release(acquired)
+        await pool.close()
+        await closeServer(ms)
+        doAssert acquired == good
+
+      waitFor testBody(ending)
+      check closeCountDelta == 1
+      check idleAfter == 0
+
+  # chronos on Windows keeps a read posted that takes the NOTIFY off the
+  # socket as it arrives, so the probe never sees it and nothing pings.
+  when not (hasChronos and defined(windows)):
+    test "acquire pings and keeps an idle conn a NOTIFY reached":
+      var closeCountDelta: int64 = -1
+      var sameConn = false
+      var queued = -1
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let serverFut = acceptAndReady(ms)
+        let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+        let pool = await newPool(cfg)
+
+        let conn = await pool.acquire()
+        pool.release(conn)
+        let serverSide = await serverFut.wait(seconds(5))
+
+        await sendBytes(serverSide, buildNotificationResponse(4321, "ch", "payload"))
+        await sleepAsync(milliseconds(50))
+
+        let before = pool.metrics.closeCount
+        let pingFut = answerPing(serverSide)
+        let acquired = await pool.acquire()
+        await pingFut.wait(seconds(5))
+        closeCountDelta = pool.metrics.closeCount - before
+        sameConn = acquired == conn
+        queued = conn.notifyQueue.len
+
+        pool.release(acquired)
+        await pool.close()
+        await closeClient(serverSide)
+        await closeServer(ms)
+
+      waitFor testBody()
+      check closeCountDelta == 0
+      check sameConn
+      check queued == 1
+
+  test "acquire keeps an idle conn whose recvBuf holds the start of a NOTIFY":
+    # The rest of the message waits in the kernel and starts with 'E', which a
+    # probe reading that byte as a message type would take for a FATAL.
+    var closeCountDelta: int64 = -1
+    var sameConn = false
+    var queued = -1
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      let serverFut = acceptAndReady(ms)
+      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let pool = await newPool(cfg)
+
+      let conn = await pool.acquire()
+      pool.release(conn)
+      let serverSide = await serverFut.wait(seconds(5))
+
+      let notification = buildNotificationResponse(4321, "ch", "xEx")
+      let split = notification.find(byte('E'))
+      doAssert split > 0
+      conn.recvBuf.add(notification[0 ..< split])
+      await sendBytes(serverSide, notification[split .. ^1])
+      await sleepAsync(milliseconds(50))
+
+      let before = pool.metrics.closeCount
+      let pingFut = answerPing(serverSide)
+      let acquired = await pool.acquire()
+      await pingFut.wait(seconds(5))
+      closeCountDelta = pool.metrics.closeCount - before
+      sameConn = acquired == conn
+      queued = conn.notifyQueue.len
+
+      pool.release(acquired)
+      await pool.close()
+      await closeClient(serverSide)
+      await closeServer(ms)
+
+    waitFor testBody()
+    check closeCountDelta == 0
+    check sameConn
+    check queued == 1
+
+  for ending in IdleEnding:
+    test "maintenance retires an idle conn whose backend sent " & $ending &
+      " and replenishes minSize":
+      # No acquire comes to probe the conn, so only the maintenance sweep can;
+      # without it the corpse holds the minSize slot for good.
+      var closeCountDelta: int64 = -1
+      var replenished = false
+
+      proc testBody(ending: IdleEnding) {.async.} =
+        let ms = startMockServer()
+        let firstFut = acceptAndReady(ms)
+
+        let cfg = initPoolConfig(
+          mockConfig(ms.port),
+          minSize = 1,
+          maxSize = 2,
+          maintenanceInterval = milliseconds(20),
+        )
+        let pool = await newPool(cfg)
+        let first = await firstFut.wait(seconds(5))
+        doAssert pool.idle.len == 1
+        let broken = pool.idle.peekFirst().conn
+
+        let before = pool.metrics.closeCount
+        await endIdle(first, ending)
+        let second = await acceptAndReady(ms).wait(seconds(5))
+        closeCountDelta = pool.metrics.closeCount - before
+
+        # The replenished conn parks once the client reads ReadyForQuery.
+        let deadline = Moment.now() + seconds(5)
+        while Moment.now() < deadline:
+          if pool.idle.len == 1 and pool.idle.peekFirst().conn != broken:
+            replenished = true
+            break
+          await sleepAsync(milliseconds(5))
+
+        await pool.close()
+        await closeClient(second)
+        await closeServer(ms)
+
+      waitFor testBody(ending)
+      check closeCountDelta == 1
+      check replenished
+
+  # The same blind spot as the acquire NOTIFY test above.
+  when not (hasChronos and defined(windows)):
+    test "maintenance pings and keeps an idle conn a NOTIFY reached":
+      var closeCountDelta: int64 = -1
+      var kept = false
+      var stampKept = false
+      var queued = -1
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let firstFut = acceptAndReady(ms)
+
+        let cfg = initPoolConfig(
+          mockConfig(ms.port),
+          minSize = 1,
+          maxSize = 2,
+          maintenanceInterval = milliseconds(20),
+        )
+        let pool = await newPool(cfg)
+        let serverSide = await firstFut.wait(seconds(5))
+        doAssert pool.idle.len == 1
+        let conn = pool.idle.peekFirst().conn
+        let lastUsedAt = pool.idle.peekFirst().lastUsedAt
+
+        let before = pool.metrics.closeCount
+        await sendBytes(serverSide, buildNotificationResponse(4321, "ch", "payload"))
+        await answerPing(serverSide).wait(seconds(5))
+
+        # The pinged conn parks again once the client reads ReadyForQuery.
+        let deadline = Moment.now() + seconds(5)
+        while Moment.now() < deadline:
+          if pool.idle.len == 1:
+            break
+          await sleepAsync(milliseconds(5))
+        closeCountDelta = pool.metrics.closeCount - before
+        if pool.idle.len == 1:
+          kept = pool.idle.peekFirst().conn == conn
+          stampKept = pool.idle.peekFirst().lastUsedAt == lastUsedAt
+        queued = conn.notifyQueue.len
+
+        await pool.close()
+        await closeClient(serverSide)
+        await closeServer(ms)
+
+      waitFor testBody()
+      check closeCountDelta == 0
+      check kept
+      check stampKept
+      check queued == 1
+
+    proc parkConnected(
+        pool: PgPool, ms: MockServer, lastUsedAt: Moment
+    ): Future[MockClient] {.async.} =
+      ## Park a conn to `ms` in `pool` and return the server's side of it.
+      let connFut = connect(mockConfig(ms.port))
+      result = await acceptAndReady(ms).wait(seconds(5))
+      let conn = await connFut
+      conn.ownerPool = pool
+      pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: lastUsedAt))
+
+    test "maintenance closes pinged conns past idleTimeout down to minSize":
+      # A conn still LISTENing gets bytes every sweep, so the sweep pings it
+      # instead of timing it out with the quiet ones.
+      var closeCountDelta: int64 = -1
+      var idleAfter = -1
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let pool = makePool(minSize = 1)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.idleTimeout = seconds(1)
+        pool.config.maintenanceInterval = milliseconds(20)
+        pool.config.pingTimeout = seconds(5)
+
+        var servers: seq[MockClient]
+        for _ in 0 ..< 2:
+          let server = await pool.parkConnected(ms, Moment.now() - seconds(2))
+          await sendBytes(server, buildNotificationResponse(4321, "ch", "payload"))
+          servers.add(server)
+        await sleepAsync(milliseconds(50))
+
+        let before = pool.metrics.closeCount
+        pool.maintenanceTask = maintenanceLoop(pool)
+        for server in servers:
+          let ping = await drainFrontendMessage(server).wait(seconds(5))
+          doAssert ping.msgType == 'Q'
+        # Hold off the next sweep while the pings still wait: they drain the
+        # NOTIFYs, so it would time the then quiet conns out itself.
+        pool.config.maintenanceInterval = seconds(30)
+        for server in servers:
+          await sendBytes(server, buildEmptyQueryResponse() & buildReadyForQuery())
+
+        let deadline = Moment.now() + seconds(5)
+        while pool.active > 0 and Moment.now() < deadline:
+          await sleepAsync(milliseconds(5))
+        closeCountDelta = pool.metrics.closeCount - before
+        idleAfter = pool.idle.len
+
+        await pool.close()
+        for server in servers:
+          await closeClient(server)
+        await closeServer(ms)
+
+      waitFor testBody()
+      check closeCountDelta == 1
+      check idleAfter == 1
+
+    test "maintenance counts toward minSize only the pinged conns that stay":
+      # One that outlives maxLifetime during its ping closes too, so closing the
+      # other for idleness on its count would leave the pool short.
+      var closeCountDelta: int64 = -1
+      var keptStale = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let pool = makePool(minSize = 1)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.idleTimeout = seconds(1)
+        pool.config.maxLifetime = seconds(30)
+        pool.config.maintenanceInterval = milliseconds(20)
+        pool.config.pingTimeout = seconds(5)
+
+        var servers: seq[MockClient]
+        for _ in 0 ..< 2:
+          let server = await pool.parkConnected(ms, Moment.now() - seconds(2))
+          await sendBytes(server, buildNotificationResponse(4321, "ch", "payload"))
+          servers.add(server)
+        let stale = pool.idle.peekFirst().conn
+        let expiring = pool.idle.peekLast().conn
+        await sleepAsync(milliseconds(50))
+
+        let before = pool.metrics.closeCount
+        pool.maintenanceTask = maintenanceLoop(pool)
+        for server in servers:
+          let ping = await drainFrontendMessage(server).wait(seconds(5))
+          doAssert ping.msgType == 'Q'
+        # Hold off the next sweep while the pings still wait (see above).
+        pool.config.maintenanceInterval = seconds(30)
+        expiring.createdAt = Moment.now() - minutes(1)
+        for server in servers:
+          await sendBytes(server, buildEmptyQueryResponse() & buildReadyForQuery())
+
+        let deadline = Moment.now() + seconds(5)
+        while pool.active > 0 and Moment.now() < deadline:
+          await sleepAsync(milliseconds(5))
+        closeCountDelta = pool.metrics.closeCount - before
+        keptStale = pool.idle.len == 1 and pool.idle.peekFirst().conn == stale
+
+        await pool.close()
+        for server in servers:
+          await closeClient(server)
+        await closeServer(ms)
+
+      waitFor testBody()
+      check closeCountDelta == 1
+      check keptStale
+
+    test "maintenance hands a pinged conn to a waiter before freeing failed pings' slots":
+      # A freed slot granted first counts the waiter's dial toward minSize, so the
+      # live conn, past idleTimeout, is closed while the waiter dials.
+      var gotLive = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let pool = makePool(maxSize = 2)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.idleTimeout = seconds(1)
+        pool.config.maintenanceInterval = milliseconds(20)
+        pool.config.pingTimeout = seconds(5)
+        pool.config.acquireTimeout = seconds(1)
+
+        var servers: seq[MockClient]
+        for _ in 0 ..< 2:
+          let server = await pool.parkConnected(ms, Moment.now() - seconds(2))
+          await sendBytes(server, buildNotificationResponse(4321, "ch", "payload"))
+          servers.add(server)
+        let live = pool.idle.peekLast().conn
+        await sleepAsync(milliseconds(50))
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+        for server in servers:
+          let ping = await drainFrontendMessage(server).wait(seconds(5))
+          doAssert ping.msgType == 'Q'
+        # Both slots are the pings' now, so the acquire queues.
+        let acquireFut = pool.acquire()
+        doAssert pool.waiterCount == 1
+        await closeClient(servers[0])
+        await sendBytes(servers[1], buildEmptyQueryResponse() & buildReadyForQuery())
+
+        try:
+          let acquired = await acquireFut
+          gotLive = acquired == live
+          pool.release(acquired)
+        except PgPoolError:
+          discard
+
+        await pool.close()
+        await closeClient(servers[1])
+        await closeServer(ms)
+
+      waitFor testBody()
+      check gotLive
+
+    test "maintenance stamps a replenished conn after the sweep's pings":
+      # The replenish waits for the pings; a stamp taken at the sweep's start
+      # would age the fresh conn by that wait.
+      var stampedAfterPing = false
+
+      proc testBody() {.async.} =
+        let ms = startMockServer()
+        let pool = makePool(minSize = 2)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.maintenanceInterval = milliseconds(20)
+        pool.config.pingTimeout = seconds(5)
+
+        let server = await pool.parkConnected(ms, Moment.now())
+        let conn = pool.idle.peekFirst().conn
+        await sendBytes(server, buildNotificationResponse(4321, "ch", "payload"))
+        await sleepAsync(milliseconds(50))
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+        let ping = await drainFrontendMessage(server).wait(seconds(5))
+        doAssert ping.msgType == 'Q'
+        await sleepAsync(milliseconds(100))
+        let answeredAt = Moment.now()
+        await sendBytes(server, buildEmptyQueryResponse() & buildReadyForQuery())
+        let fresh = await acceptAndReady(ms).wait(seconds(5))
+
+        let deadline = Moment.now() + seconds(5)
+        while Moment.now() < deadline:
+          if pool.idle.len == 2:
+            break
+          await sleepAsync(milliseconds(5))
+        for pc in pool.idle:
+          if pc.conn != conn:
+            stampedAfterPing = pc.lastUsedAt >= answeredAt
+
+        await pool.close()
+        await closeClient(server)
+        await closeClient(fresh)
+        await closeServer(ms)
+
+      waitFor testBody()
+      check stampedAfterPing
 
 suite "Pool replenish close-race":
   test "replenish closes a connection won after the pool is closed":

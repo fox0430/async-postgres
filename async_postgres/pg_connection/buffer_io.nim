@@ -66,6 +66,12 @@ type
     spError ## any other `recv` error
     spUnavailable ## no transport handle
 
+  IdleProbe* = enum
+    ## What `idleProbe` sees of a connection parked at ReadyForQuery.
+    ipQuiet ## nothing arrived since and no FIN/RST observed
+    ipActivity ## bytes arrived since, unread in `recvBuf` or the kernel
+    ipDead ## FIN/RST observed
+
 # Host / address helpers
 
 proc isUnixSocket*(host: string): bool {.inline.} =
@@ -896,7 +902,8 @@ proc peekSocket(conn: PgConnection): SocketPeek =
   ## pre-TLS-injection checks (`MSG_DONTWAIT` on POSIX; Windows sockets are
   ## non-blocking in both backends). Classifies the kernel's view of the socket
   ## without consuming data or blocking; retries on `EINTR`. Callers decide
-  ## what each outcome means (see `socketHasFin` / `socketHasPendingData`).
+  ## what each outcome means (see `socketHasFin` / `idleProbe` /
+  ## `socketHasPendingData`).
   when defined(posix):
     when hasChronos:
       if conn.transport.isNil:
@@ -960,6 +967,22 @@ proc socketHasFin*(conn: PgConnection): bool =
     # about peer state, so keep the live socket rather than force a reconnect),
     # or no probe available.
     false
+
+proc idleProbe*(conn: PgConnection): IdleProbe =
+  ## Non-consuming liveness probe for a connection parked at ReadyForQuery. A
+  ## healthy idle session normally receives nothing, so any byte (a NOTIFY, or
+  ## the FATAL/WARNING a closing backend sends ahead of its FIN) is activity
+  ## that only a round trip can judge; the bytes are not interpreted. Bytes a
+  ## lower layer already read off the socket stay out of sight: those the TLS
+  ## layer took, and under chronos on Windows all of them, since its posted
+  ## read takes them as they arrive.
+  case conn.peekSocket()
+  of spClosed, spError:
+    ipDead
+  of spData:
+    ipActivity
+  of spIdle, spTransient, spUnavailable:
+    if conn.recvBufLen() > 0: ipActivity else: ipQuiet
 
 proc socketHasPendingData*(conn: PgConnection): bool =
   ## True if the kernel has readable bytes (pre-TLS injection check; kernel

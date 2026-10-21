@@ -60,6 +60,15 @@ when hasChronos:
       buildCommandComplete("BEGIN") & buildReadyForQuery('T')
     )
 
+  proc answerBegin(serverTransport: StreamTransport) {.async.} =
+    ## Reply to BEGIN once it arrives. For a pooled conn, a reply sent ahead
+    ## reaches it parked, and the pool pings a parked conn that bytes reached.
+    var header: array[5, byte]
+    await serverTransport.readExactly(addr header[0], header.len)
+    var body = newSeq[byte](decodeInt32(header, 1) - 4)
+    await serverTransport.readExactly(addr body[0], body.len)
+    await preBufferBeginReply(serverTransport)
+
   proc makeMinimalPool(resetQuery = ""): PgPool =
     ## Minimal PgPool wiring for `pool.withTransaction`; no maintenance/waiters.
     ## `resetQuery` (with its timeout left at the zero default = no timeout)
@@ -302,7 +311,7 @@ when hasChronos:
       # Same guarantee as the conn-side variant on pool.withTransaction's inner try.
       proc t() {.async.} =
         let (conn, server, sTx) = await makeScriptedConn()
-        await preBufferBeginReply(sTx)
+        let beginReplyFut = answerBegin(sTx)
 
         let pool = makeMinimalPool()
         conn.ownerPool = pool
@@ -324,6 +333,7 @@ when hasChronos:
           sawCancel = true
         except AsyncTimeoutError:
           sawTimeout = true
+        await beginReplyFut.wait(seconds(1))
 
         doAssert sawCancel, "expected CancelledError to propagate immediately"
         doAssert not sawTimeout, "cleanup ran and hung on ROLLBACK"
