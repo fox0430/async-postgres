@@ -2621,8 +2621,9 @@ macro withTransactionRetry*(
       `bodyDefectSym` = `dSym`
     `releaseBlock`
 
-type PoolTxDeadlineState =
-  ref tuple[acquired: Option[PgConnection], released, abandoned, committed: bool]
+type PoolTxDeadlineState = ref tuple[
+  acquired: Option[PgConnection], released, abandoned, committed: bool
+]
   ## What a pool deadline transaction's timeout handler shares with its body
   ## proc. Passed in, not captured: a loop around the macro reuses the caller's
   ## env slots, so an abandoned call's late acquire would read the next call's.
@@ -2942,7 +2943,9 @@ macro withTransactionRetryDeadline*(
     elif `stateSym`.released:
       raise newException(PgTimeoutError, "withTransactionRetryDeadline (pool) exceeded")
     else:
-      `retireSym`(`stateSym`.acquired.get, "withTransactionRetryDeadline (pool) exceeded")
+      `retireSym`(
+        `stateSym`.acquired.get, "withTransactionRetryDeadline (pool) exceeded"
+      )
   let loop = buildRetryDeadlineLoop(
     newCall(bodyFnSym, poolSym, deadlineMomentSym, stateSym),
     retryOptsSym,
