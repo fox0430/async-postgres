@@ -738,6 +738,11 @@ proc toPgBinaryParam*(v: PgTimeTz): PgParam {.raises: [PgTypeError].} =
 
 proc encodeNumericBinary*(v: PgNumeric): seq[byte] {.raises: [PgTypeError].} =
   ## Encode PgNumeric as PostgreSQL binary numeric format.
+  if not v.isFinite:
+    # Header only, as `$` renders the sign alone.
+    result = newSeq[byte](8)
+    result.writeBE16(4, cast[int16](v.sign.uint16))
+    return
   if v.digits.len > int(int16.high):
     raise newException(
       PgTypeError, "Numeric binary: too many digit groups: " & $v.digits.len
@@ -1932,8 +1937,9 @@ func paramValueLenBound*[T](v: T): int =
 
 func paramValueLenBound*(v: PgNumeric): int =
   # Mirrors `$`: sign, `weight + 1` base-10000 groups, point, `dscale` digits.
-  if v.sign == pgNaN:
-    return 3
+  if not v.isFinite:
+    # A short fixed word: rendering it is cheap and cannot drift from `$`.
+    return ($v).len
   if v.digits.len == 0:
     return 2 + max(v.dscale.int, 0)
   result = 1 + max((v.weight.int + 1) * 4, 1)

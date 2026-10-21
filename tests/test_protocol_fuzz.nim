@@ -710,7 +710,7 @@ suite "Binary decoders: errors expose no wire values":
       msg
 
   test "numeric: sign and digit":
-    # ndigits=1, sign=0x1234 (outside {0x0000, 0x4000, 0xC000}), no digits.
+    # ndigits=1, sign=0x1234 (not a numeric sign), no digits.
     check typeErrorMsg(decodeNumericBinary(@[byte 0, 1, 0, 0, 0x12, 0x34, 0, 0])) ==
       "Numeric binary: invalid sign"
     # sign=0, dscale=0, weight=0, one digit = 10000 (outside 0..9999).

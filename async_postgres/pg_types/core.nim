@@ -70,13 +70,17 @@ type
     pgPositive = 0x0000
     pgNegative = 0x4000
     pgNaN = 0xC000
+    pgInf = 0xD000 ## ``Infinity`` (PostgreSQL 14+)
+    pgNegInf = 0xF000 ## ``-Infinity`` (PostgreSQL 14+)
 
   PgNumeric* = object
     ## Arbitrary-precision numeric value using PostgreSQL's internal base-10000 representation.
     ## Supports comparison operators but not arithmetic.
     ## Use this instead of float64 to avoid precision loss with PostgreSQL numeric/decimal.
     weight*: int16 ## exponent of first digit group (value = digit * 10000^weight)
-    sign*: PgNumericSign ## positive, negative, or NaN
+    sign*: PgNumericSign
+      ## positive, negative, NaN, or an infinity. NaN and the infinities ignore
+      ## the other fields.
     dscale*: int16 ## number of digits after decimal point (display scale)
     digits*: seq[int16] ## base-10000 digit groups, each 0..9999
 
@@ -1368,11 +1372,16 @@ proc parseBitString*(s: string): PgBit =
   initPgBit(nbits, data)
 
 proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [PgTypeError].} =
-  ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN") into PgNumeric.
+  ## Parse a decimal string (e.g. "123.45", "-0.001", "NaN", "-Infinity") into
+  ## PgNumeric.
   if s.len == 0:
     raise newException(PgTypeError, "Invalid numeric: empty string")
   if s == "NaN":
     return PgNumeric(sign: pgNaN)
+  if s == "Infinity":
+    return PgNumeric(sign: pgInf)
+  if s == "-Infinity":
+    return PgNumeric(sign: pgNegInf)
   var src = s
   var sign = pgPositive
   if src[0] == '-':
@@ -1460,8 +1469,15 @@ proc parsePgNumeric*(s: string): PgNumeric {.gcsafe, raises: [PgTypeError].} =
 
 proc `$`*(v: PgNumeric): string =
   ## Convert PgNumeric to its decimal string representation.
-  if v.sign == pgNaN:
+  case v.sign
+  of pgNaN:
     return "NaN"
+  of pgInf:
+    return "Infinity"
+  of pgNegInf:
+    return "-Infinity"
+  of pgPositive, pgNegative:
+    discard
   if v.digits.len == 0:
     if v.dscale > 0:
       result = "0."
@@ -1545,19 +1561,28 @@ proc cmpMagnitude(a, b: PgNumeric): int =
       return if ad < bd: -1 else: 1
   return 0
 
+proc isFinite*(v: PgNumeric): bool =
+  ## Whether the value is a number: not NaN, ``Infinity`` or ``-Infinity``.
+  v.sign in {pgPositive, pgNegative}
+
 proc isZero*(v: PgNumeric): bool =
   ## Check if the numeric value is zero.
-  v.sign != pgNaN and v.digits.len == 0
+  v.isFinite and v.digits.len == 0
+
+proc specialRank(sign: PgNumericSign): int =
+  case sign
+  of pgNegInf: -1
+  of pgPositive, pgNegative: 0
+  of pgInf: 1
+  of pgNaN: 2
 
 proc cmp*(a, b: PgNumeric): int =
-  ## Compare two PgNumeric values. NaN sorts highest (PostgreSQL convention).
-  # NaN handling
-  if a.sign == pgNaN and b.sign == pgNaN:
-    return 0
-  if a.sign == pgNaN:
-    return 1
-  if b.sign == pgNaN:
-    return -1
+  ## Compare two PgNumeric values. As in PostgreSQL, ``-Infinity`` sorts below
+  ## every finite value, ``Infinity`` above, and NaN highest.
+  let aRank = specialRank(a.sign)
+  let bRank = specialRank(b.sign)
+  if aRank != 0 or bRank != 0:
+    return cmp(aRank, bRank)
   # Zero handling
   let aZero = a.isZero
   let bZero = b.isZero
@@ -1589,8 +1614,8 @@ proc `<=`*(a, b: PgNumeric): bool =
 
 proc hash*(v: PgNumeric): Hash =
   ## Hash consistent with value-based ==.
-  if v.sign == pgNaN:
-    return !$(0 !& hash(pgNaN.ord))
+  if not v.isFinite:
+    return !$(0 !& hash(v.sign.ord))
   var lastNonZero = v.digits.len - 1
   while lastNonZero >= 0 and v.digits[lastNonZero] == 0:
     dec lastNonZero
