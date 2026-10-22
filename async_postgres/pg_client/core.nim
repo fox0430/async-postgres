@@ -39,7 +39,8 @@ type
     ## Retry config for ``withTransactionRetry``; unset fields keep the
     ## defaults below. Fields are not validated: a backoff that computes
     ## negative (e.g. a negative ``baseDelayMs`` or ``maxDelayMs``) becomes
-    ## 0ms, an immediate retry.
+    ## 0ms, an immediate retry, and one longer than about 146 years is cut to
+    ## that.
     maxAttempts*: int = 3 ## Total attempts (``<=1`` = no retry).
     baseDelayMs*: int = 20 ## Initial backoff ms.
     maxDelayMs*: int = 1000 ## Max backoff ms.
@@ -316,12 +317,24 @@ template retryStmtCacheInvalidation*(
       retried = true
       conn.checkReady()
 
+const maxBackoffDelayMs = int(min(int64.high div 2_000_000, int64(int.high)))
+  ## Half the longest `Duration` (about 146 years): the sleep and the deadline
+  ## check add the backoff to `Moment.now()`, so a full-range one overflows.
+
 proc backoffDelayMs*(opts: RetryOptions, attempt: int): int =
   ## Backoff ms for attempt (1-based). Exponential with jitter.
   let raw = opts.baseDelayMs.float * pow(opts.multiplier, float(attempt - 1))
-  var ms = int(min(raw, opts.maxDelayMs.float))
-  if ms < 0:
-    ms = 0
+  let cap = min(opts.maxDelayMs, maxBackoffDelayMs)
+  # Compare in float before converting: `int()` of a float past `int.high`
+  # yields `int.min`. A NaN (e.g. a NaN multiplier) backs off fully rather
+  # than retrying at once.
+  var ms =
+    if raw >= cap.float or raw.isNaN:
+      max(cap, 0)
+    elif raw > 0.0:
+      int(raw)
+    else:
+      0
   if opts.jitter and ms > 0:
     ms = rand(ms)
   ms
