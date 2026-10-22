@@ -5,7 +5,7 @@
 
 import std/unittest
 
-import ../async_postgres/[pg_errors, pg_protocol, pg_types]
+import ../async_postgres/[async_backend, pg_errors, pg_protocol, pg_types]
 import ../async_postgres/pg_client/core
 
 suite "core: format codes":
@@ -69,6 +69,35 @@ suite "core: backoff and OID matching":
     check backoffDelayMs(opts, 1) == 100
     check backoffDelayMs(opts, 2) == 200
     check backoffDelayMs(opts, 10) == 1000
+
+  test "backoffDelayMs saturates at a sleepable delay":
+    let opts = RetryOptions(
+      maxAttempts: 100,
+      baseDelayMs: 20,
+      maxDelayMs: int.high,
+      multiplier: 2.0,
+      jitter: false,
+    )
+    # Past ~9.2e12ms the delay overflows a `Duration`; past 2^63ms the
+    # float-to-int conversion wraps to 0.
+    var prev = 0
+    for attempt in 1 .. 100:
+      let ms = backoffDelayMs(opts, attempt)
+      check ms >= prev
+      # The deadline variant adds it to now.
+      check Moment.now() < Moment.now() + milliseconds(ms)
+      prev = ms
+    # About 146 years.
+    check prev == int(min(int64.high div 2_000_000, int64(int.high)))
+    # The plain retry sleeps it. asyncdispatch keeps the timer; it never fires.
+    let sleeper = sleepMsAsync(prev)
+    check not sleeper.finished()
+    cancelTimer(sleeper)
+
+  test "backoffDelayMs backs off fully on a NaN":
+    let opts =
+      RetryOptions(baseDelayMs: 20, maxDelayMs: 1000, multiplier: NaN, jitter: false)
+    check backoffDelayMs(opts, 2) == 1000
 
   test "paramOidsMatch treats 0 as wildcard":
     check paramOidsMatch([23'i32], [0'i32])
