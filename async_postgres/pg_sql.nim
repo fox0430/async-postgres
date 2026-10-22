@@ -32,154 +32,15 @@
 
 import std/[macros, strutils]
 
-import async_backend, pg_types, pg_client, pg_pool
+import async_backend, pg_types, pg_client, pg_pool, pg_sql_lexer
 import pg_connection/types
 
-type
-  SqlQuery* = object ## A parameterised SQL query with its bound parameters.
-    query*: string
-    params*: seq[PgParam]
-
-  SqlParseState = enum
-    sNormal
-    sSingleQuote
-    sEString
-    sDoubleQuote
-    sDollarQuote
-    sLineComment
-    sBlockComment
+type SqlQuery* = object ## A parameterised SQL query with its bound parameters.
+  query*: string
+  params*: seq[PgParam]
 
 const sqlOperatorChars =
   {'+', '-', '*', '/', '<', '>', '=', '~', '!', '@', '#', '%', '^', '&', '|', '`', '?'}
-
-template sqlParseLoop(
-    sql: string,
-    output: var string,
-    idx: var int,
-    state: var SqlParseState,
-    dollarTag: var string,
-    normalBody: untyped,
-) =
-  ## Shared SQL parsing loop that handles quote/comment-state transitions.
-  ## ``normalBody`` is executed for characters in ``sNormal`` that are not
-  ## quote transitions (``'``, ``"``, ``$``-quote) or comment starts
-  ## (``--``, ``/*``). Inside ``normalBody``, ``c`` is the current character
-  ## at ``sql[idx]``.
-  var blockDepth = 0
-  while idx < sql.len:
-    let c {.inject.} = sql[idx]
-    case state
-    of sNormal:
-      case c
-      of '\'':
-        let isE =
-          idx > 0 and sql[idx - 1] in {'E', 'e'} and
-          (idx < 2 or sql[idx - 2] notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'})
-        state = if isE: sEString else: sSingleQuote
-        output.add(c)
-        inc idx
-      of '"':
-        state = sDoubleQuote
-        output.add(c)
-        inc idx
-      of '$':
-        var j = idx + 1
-        var matched = false
-        if j < sql.len and sql[j] == '$':
-          dollarTag = "$$"
-          state = sDollarQuote
-          output.add("$$")
-          idx = j + 1
-          matched = true
-        elif j < sql.len and sql[j] in {'a' .. 'z', 'A' .. 'Z', '_'}:
-          while j < sql.len and sql[j] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}:
-            inc j
-          if j < sql.len and sql[j] == '$':
-            dollarTag = sql[idx .. j]
-            state = sDollarQuote
-            output.add(dollarTag)
-            idx = j + 1
-            matched = true
-        if not matched:
-          output.add(c)
-          inc idx
-      of '-':
-        if idx + 1 < sql.len and sql[idx + 1] == '-':
-          state = sLineComment
-          output.add("--")
-          idx += 2
-        else:
-          normalBody
-      of '/':
-        if idx + 1 < sql.len and sql[idx + 1] == '*':
-          state = sBlockComment
-          blockDepth = 1
-          output.add("/*")
-          idx += 2
-        else:
-          normalBody
-      else:
-        normalBody
-    of sSingleQuote:
-      output.add(c)
-      if c == '\'':
-        if idx + 1 < sql.len and sql[idx + 1] == '\'':
-          output.add('\'')
-          inc idx
-        else:
-          state = sNormal
-      inc idx
-    of sEString:
-      output.add(c)
-      if c == '\\':
-        if idx + 1 < sql.len:
-          inc idx
-          output.add(sql[idx])
-      elif c == '\'':
-        if idx + 1 < sql.len and sql[idx + 1] == '\'':
-          output.add('\'')
-          inc idx
-        else:
-          state = sNormal
-      inc idx
-    of sDoubleQuote:
-      output.add(c)
-      if c == '"':
-        if idx + 1 < sql.len and sql[idx + 1] == '"':
-          output.add('"')
-          inc idx
-        else:
-          state = sNormal
-      inc idx
-    of sDollarQuote:
-      if c == '$' and idx + dollarTag.len <= sql.len and
-          sql[idx ..< idx + dollarTag.len] == dollarTag:
-        output.add(dollarTag)
-        idx += dollarTag.len
-        state = sNormal
-      else:
-        output.add(c)
-        inc idx
-    of sLineComment:
-      output.add(c)
-      if c == '\n':
-        state = sNormal
-      inc idx
-    of sBlockComment:
-      # PostgreSQL block comments nest — track depth.
-      if c == '/' and idx + 1 < sql.len and sql[idx + 1] == '*':
-        output.add("/*")
-        inc blockDepth
-        idx += 2
-      elif c == '*' and idx + 1 < sql.len and sql[idx + 1] == '/':
-        output.add("*/")
-        dec blockDepth
-        idx += 2
-        if blockDepth == 0:
-          state = sNormal
-      else:
-        output.add(c)
-        inc idx
 
 func sqlParams*(sql: string): string =
   ## Convert ``?``-style placeholders to PostgreSQL ``$1, $2, …`` positional
@@ -201,13 +62,11 @@ func sqlParams*(sql: string): string =
   result = newStringOfCap(sql.len + 16)
   var i = 0
   var paramIdx = 0
-  var state = sNormal
-  var dollarTag = ""
   # Input span of the operator token being emitted. Placeholders, comments
   # and quotes end it, as they split PG's operator token after substitution.
   var opStart, opEnd = -1
 
-  sqlParseLoop(sql, result, i, state, dollarTag):
+  sqlParseLoop(sql, result, i):
     case c
     of '?':
       let tokenStart = opEnd != i
@@ -264,10 +123,8 @@ macro sql*(queryStr: static[string]): untyped =
   var paramNodes = newNimNode(nnkBracket)
   var paramIdx = 0
   var i = 0
-  var state = sNormal
-  var dollarTag = ""
 
-  sqlParseLoop(queryStr, resultSql, i, state, dollarTag):
+  sqlParseLoop(queryStr, resultSql, i):
     case c
     of '{':
       if i + 1 < queryStr.len and queryStr[i + 1] == '{':

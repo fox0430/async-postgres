@@ -6,7 +6,7 @@
 
 import std/[algorithm, macros, options, sets]
 
-import ../[async_backend, pg_gensym, pg_protocol, pg_types]
+import ../[async_backend, pg_gensym, pg_protocol, pg_sql_lexer, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
 import ../pg_types/encoding
 import ./core
@@ -86,135 +86,26 @@ proc buildInvalidateOnOidMismatchStmt(
     invalidateIfOidMismatch(`connSym`, `sqlSym`, `cachedSym`, `bracket`, `cacheHitSym`)
 
 proc scanPlaceholders(sql: string): tuple[seen: HashSet[int], badZero: bool] =
-  ## Compile-time SQL scanner: walks ``sql`` and collects every ``$N``
-  ## placeholder index appearing in normal code positions, skipping single-
-  ## quoted strings, ``E'...'`` C-style strings, double-quoted identifiers,
-  ## dollar-quoted blocks (``$$...$$`` and ``$tag$...$tag$``), ``--`` line
-  ## comments and ``/* ... */`` block comments (nestable, per PostgreSQL).
-  ## Sets ``badZero`` when ``$0`` is encountered (PostgreSQL placeholders are
-  ## 1-based).
-  type ScanState = enum
-    sNormal
-    sSingleQuote
-    sEString
-    sDoubleQuote
-    sDollarQuote
-    sLineComment
-    sBlockComment
-
-  var state = sNormal
-  var dollarTag = ""
-  var blockDepth = 0
+  ## Compile-time SQL scanner: collects every ``$N`` placeholder index in
+  ## normal code, skipping what ``sqlParseLoop`` lexes as quoted or commented
+  ## out. Sets ``badZero`` when ``$0`` is encountered (PostgreSQL placeholders
+  ## are 1-based).
+  var copied = "" # sqlParseLoop's output; only the $N matter here
   var i = 0
-  let n = sql.len
-
-  while i < n:
-    let c = sql[i]
-    case state
-    of sNormal:
-      case c
-      of '\'':
-        let isE =
-          i > 0 and sql[i - 1] in {'E', 'e'} and
-          (i < 2 or sql[i - 2] notin {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'})
-        state = if isE: sEString else: sSingleQuote
-        inc i
-      of '"':
-        state = sDoubleQuote
-        inc i
-      of '-':
-        if i + 1 < n and sql[i + 1] == '-':
-          state = sLineComment
-          i += 2
-        else:
-          inc i
-      of '/':
-        if i + 1 < n and sql[i + 1] == '*':
-          state = sBlockComment
-          blockDepth = 1
-          i += 2
-        else:
-          inc i
-      of '$':
-        var j = i + 1
-        if j < n and sql[j] == '$':
-          dollarTag = "$$"
-          state = sDollarQuote
-          i = j + 1
-        elif j < n and sql[j] in {'a' .. 'z', 'A' .. 'Z', '_'}:
-          while j < n and sql[j] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'}:
-            inc j
-          if j < n and sql[j] == '$':
-            dollarTag = sql[i .. j]
-            state = sDollarQuote
-            i = j + 1
-          else:
-            i = j
-        elif j < n and sql[j] in {'0' .. '9'}:
-          var num = 0
-          while j < n and sql[j] in {'0' .. '9'}:
-            num = num * 10 + (sql[j].ord - '0'.ord)
-            inc j
-          if num == 0:
-            result.badZero = true
-          else:
-            result.seen.incl(num)
-          i = j
-        else:
-          inc i
+  sqlParseLoop(sql, copied, i):
+    if c == '$' and i + 1 < sql.len and sql[i + 1] in {'0' .. '9'}:
+      var j = i + 1
+      var num = 0
+      while j < sql.len and sql[j] in {'0' .. '9'}:
+        num = num * 10 + (sql[j].ord - '0'.ord)
+        inc j
+      if num == 0:
+        result.badZero = true
       else:
-        inc i
-    of sSingleQuote:
-      if c == '\'':
-        if i + 1 < n and sql[i + 1] == '\'':
-          i += 2
-        else:
-          state = sNormal
-          inc i
-      else:
-        inc i
-    of sEString:
-      if c == '\\':
-        i += (if i + 1 < n: 2 else: 1)
-      elif c == '\'':
-        if i + 1 < n and sql[i + 1] == '\'':
-          i += 2
-        else:
-          state = sNormal
-          inc i
-      else:
-        inc i
-    of sDoubleQuote:
-      if c == '"':
-        if i + 1 < n and sql[i + 1] == '"':
-          i += 2
-        else:
-          state = sNormal
-          inc i
-      else:
-        inc i
-    of sDollarQuote:
-      if c == '$' and i + dollarTag.len <= n and
-          sql[i ..< i + dollarTag.len] == dollarTag:
-        i += dollarTag.len
-        state = sNormal
-      else:
-        inc i
-    of sLineComment:
-      if c == '\n':
-        state = sNormal
+        result.seen.incl(num)
+      i = j
+    else:
       inc i
-    of sBlockComment:
-      if c == '*' and i + 1 < n and sql[i + 1] == '/':
-        dec blockDepth
-        i += 2
-        if blockDepth == 0:
-          state = sNormal
-      elif c == '/' and i + 1 < n and sql[i + 1] == '*':
-        inc blockDepth
-        i += 2
-      else:
-        inc i
 
 proc formatPlaceholders(xs: HashSet[int]): string =
   ## Render a HashSet of placeholder indices as a sorted ``$1, $2, ...`` string
