@@ -2,7 +2,7 @@ import std/[unittest, options, tables, importutils, net]
 
 import
   ../async_postgres/
-    [async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection]
+    [async_backend, pg_protocol, pg_types, pg_client, pg_pool, pg_connection, pg_sql]
 import ../async_postgres/pg_client/core
 import ../async_postgres/pg_connection/types
 
@@ -2117,6 +2117,22 @@ suite "E2E: simpleExec":
       let tag = await pool.simpleExec("SELECT 1")
       doAssert tag == "SELECT 1"
       await pool.close()
+
+    waitFor t()
+
+suite "E2E: sqlParams / sql":
+  test "a placeholder right after LIMIT binds the limit":
+    # Unspaced, ``LIMIT$1`` aliases the function and every row comes back.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let n = 2'i32
+      let res = await conn.query(
+        "SELECT * FROM generate_series(1, 5) LIMIT?".sqlParams, pgParams(n)
+      )
+      doAssert res.rows.len == 2
+      let res2 = await conn.query(sql"SELECT * FROM generate_series(1, 5) LIMIT{n}")
+      doAssert res2.rows.len == 2
+      await conn.close()
 
     waitFor t()
 

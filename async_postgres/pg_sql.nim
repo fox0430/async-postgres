@@ -42,6 +42,16 @@ type SqlQuery* = object ## A parameterised SQL query with its bound parameters.
 const sqlOperatorChars =
   {'+', '-', '*', '/', '<', '>', '=', '~', '!', '@', '#', '%', '^', '&', '|', '`', '?'}
 
+func addPlaceholder(output: var string, n: int, sql: string, next: int) =
+  ## Adds ``$n``, spaced from a neighbour that would join its token as in
+  ## ``LIMIT$1``. ``next`` indexes the input after the placeholder.
+  if output.len > 0 and output[^1] in sqlIdentContChars:
+    output.add(' ')
+  output.add('$')
+  output.addInt(n)
+  if next < sql.len and sql[next] in sqlIdentContChars:
+    output.add(' ')
+
 func sqlParams*(sql: string): string =
   ## Convert ``?``-style placeholders to PostgreSQL ``$1, $2, …`` positional
   ## placeholders.
@@ -59,6 +69,8 @@ func sqlParams*(sql: string): string =
   ## - ``?`` inside ``/* … */`` block comments (nestable) is preserved
   ## - a literal ``$n`` is left as is and shares the numbering, so do not mix
   ##   it with ``?``
+  ## - a space separates ``$n`` from an adjacent identifier, number or ``$``,
+  ##   so ``LIMIT?`` becomes ``LIMIT $1``, not the identifier ``LIMIT$1``
   result = newStringOfCap(sql.len + 16)
   var i = 0
   var paramIdx = 0
@@ -92,8 +104,7 @@ func sqlParams*(sql: string): string =
         opEnd = i
       else:
         inc paramIdx
-        result.add('$')
-        result.addInt(paramIdx)
+        result.addPlaceholder(paramIdx, sql, i + 1)
         inc i
     else:
       if c in sqlOperatorChars:
@@ -112,7 +123,9 @@ macro sql*(queryStr: static[string]): untyped =
   ## single-quoted SQL strings, ``E'…'`` strings, double-quoted identifiers,
   ## dollar-quoted strings, and SQL comments (``-- …`` and ``/* … */``,
   ## nestable) are left as-is. A literal ``$n`` is left as-is too and shares
-  ## the numbering, so do not mix it with ``{expr}``.
+  ## the numbering, so do not mix it with ``{expr}``. A space separates the
+  ## ``$n`` from an adjacent identifier, number or ``$``, so ``col{x}``
+  ## becomes ``col $1``.
   ##
   ## Inside ``{expr}`` the following Nim syntax is recognised so ``{``/``}`` in
   ## their content does not affect brace matching: ``"…"`` / ``r"…"`` (raw) /
@@ -217,8 +230,7 @@ macro sql*(queryStr: static[string]): untyped =
         let exprStr = queryStr[start ..< j]
         let exprNode = parseExpr(exprStr)
         inc paramIdx
-        resultSql.add('$')
-        resultSql.addInt(paramIdx)
+        resultSql.addPlaceholder(paramIdx, queryStr, j + 1)
         paramNodes.add(newCall(bindSym("toPgParam", brOpen), exprNode))
         i = j + 1
     of '}':
