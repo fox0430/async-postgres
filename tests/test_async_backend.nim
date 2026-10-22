@@ -283,6 +283,48 @@ suite "allFutures":
     expect ValueError:
       discard waitFor bad
 
+suite "allFuturesCancelling":
+  test "completes when every future settles, including failures":
+    proc okOne(): Future[int] {.async.} =
+      await sleepMsAsync(1)
+      1
+
+    proc badOne(): Future[int] {.async.} =
+      raise newException(ValueError, "boom")
+
+    let ok = okOne()
+    let bad = badOne()
+    waitFor allFuturesCancelling(@[ok, bad])
+    check ok.completed()
+    check bad.failed
+
+  when hasChronos:
+    test "cancelled, it cancels the inputs and waits for them to settle":
+      proc slow(): Future[int] {.async.} =
+        await sleepAsync(seconds(5))
+        1
+
+      let a = slow()
+      let b = slow()
+      let joined = allFuturesCancelling(@[a, b])
+      let start = Moment.now()
+      waitFor cancelAndWaitPumped(joined)
+      check Moment.now() - start < seconds(2)
+      check joined.cancelled
+      check a.cancelled
+      check b.cancelled
+
+suite "noCancel":
+  test "awaits the future it wraps on both backends":
+    proc okOne(): Future[int] {.async.} =
+      await sleepMsAsync(1)
+      1
+
+    proc viaNoCancel(): Future[int] {.async.} =
+      return await noCancel okOne()
+
+    check (waitFor viaNoCancel()) == 1
+
 suite "completed":
   test "reflects success, failure and pending state":
     proc okOne(): Future[int] {.async.} =

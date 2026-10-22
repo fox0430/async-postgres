@@ -149,6 +149,8 @@ async_postgres/async_backend.nim	`<`
 async_postgres/async_backend.nim	`<`#2
 async_postgres/async_backend.nim	`==`
 async_postgres/async_backend.nim	allFutures
+async_postgres/async_backend.nim	allFuturesCancelling
+async_postgres/async_backend.nim	allFuturesCancelling#2
 async_postgres/async_backend.nim	asyncSpawn
 async_postgres/async_backend.nim	cancelAndWait
 async_postgres/async_backend.nim	cancelAndWaitPumped
@@ -169,6 +171,7 @@ async_postgres/async_backend.nim	milliseconds
 async_postgres/async_backend.nim	minutes
 async_postgres/async_backend.nim	nanoseconds
 async_postgres/async_backend.nim	nanoseconds#2
+async_postgres/async_backend.nim	noCancel
 async_postgres/async_backend.nim	now
 async_postgres/async_backend.nim	registerFdReader
 async_postgres/async_backend.nim	registerFdReader#2

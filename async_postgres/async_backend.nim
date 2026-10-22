@@ -43,7 +43,7 @@ when hasChronos:
     if not fut.finished():
       fut.cancelSoon()
 
-  proc cancelAndWaitPumped*(fut: Future[void]): Future[void] {.async.} =
+  proc cancelAndWaitPumped*(fut: FutureBase): Future[void] {.async.} =
     ## Cancel `fut` and wait until it settles, keeping the event loop awake.
     ##
     ## chronos 4.4.x may park a cancellation retry until the next I/O or timer
@@ -57,7 +57,7 @@ when hasChronos:
     while not fut.finished():
       var timer = sleepAsync(milliseconds(1))
       try:
-        discard await race(FutureBase(fut), FutureBase(timer))
+        discard await race(fut, FutureBase(timer))
       except CatchableError:
         # Keep pumping through our own cancellation.
         discard
@@ -65,6 +65,20 @@ when hasChronos:
         # Fire-and-forget: awaiting the timer would let our own cancellation
         # escape, breaking "Never raises". `cancelTimer` cannot suspend.
         cancelTimer(timer)
+
+  proc allFuturesCancelling*[T](futs: seq[Future[T]]): Future[void] {.async.} =
+    ## `allFutures`, except that cancelling it cancels `futs` too: the
+    ## `CancelledError` goes on only once every one of them has settled.
+    ## chronos' `allFutures` leaves its inputs running when cancelled.
+    try:
+      await allFutures(futs)
+    except CancelledError as e:
+      for fut in futs:
+        if not fut.finished():
+          fut.cancelSoon()
+      for fut in futs:
+        await cancelAndWaitPumped(fut)
+      raise e
 
   # chronos exposes raw-fd readiness registration only on selector-based
   # (posix) dispatchers; the Windows IOCP dispatcher has no equivalent.
@@ -251,10 +265,15 @@ elif hasAsyncDispatch:
     ##   properly.
     discard
 
-  proc cancelAndWaitPumped*(fut: Future[void]): Future[void] {.async.} =
+  proc cancelAndWaitPumped*(fut: FutureBase): Future[void] {.async.} =
     ## No-op like `cancelAndWait`: asyncdispatch has no cancellation primitive
     ## and nothing to pump. Exists so close paths call one name on both backends.
     discard
+
+  template noCancel*(fut: untyped): untyped =
+    ## Pass-through: asyncdispatch has no cancellation to shield `fut` from.
+    ## Exists so cleanup paths write `await noCancel fut` on both backends.
+    fut
 
   proc asyncSpawn*(fut: Future[void]) =
     ## Fire-and-forget a future. If the future fails with an unhandled exception,
@@ -287,6 +306,10 @@ elif hasAsyncDispatch:
             retFuture.complete()
       )
     return retFuture
+
+  proc allFuturesCancelling*[T](futs: seq[Future[T]]): Future[void] =
+    ## `allFutures`: asyncdispatch has no cancellation to pass on to `futs`.
+    allFutures(futs)
 
   proc sleepAsync*(d: Duration): Future[void] =
     ## Sleep for the given Duration.

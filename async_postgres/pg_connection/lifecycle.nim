@@ -788,10 +788,7 @@ proc matchesOrClose(
   except CatchableError as e:
     # A cancelled connection's bare awaits re-raise immediately, so force the
     # teardown to run under chronos; close() swallows its own errors.
-    when hasChronos:
-      await noCancel conn.closeImpl(byUser = false)
-    else:
-      await conn.closeImpl(byUser = false)
+    await noCancel conn.closeImpl(byUser = false)
     # Re-raise the captured exception rather than a bare `raise`: if close()
     # suspended, the resumed coroutine has no "current exception" and a bare
     # raise dies with ReraiseDefect ("no exception to reraise").

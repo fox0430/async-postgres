@@ -6256,7 +6256,7 @@ suite "Pool replenish capacity race":
     doAssert pool.boundedConnConfig().connectTimeout == seconds(7)
 
   when hasChronos:
-    test "close cancelling in-flight replenish releases its reservations (landed and in-flight)":
+    test "close cancelling in-flight replenish settles the landed conn and cuts the dial under way":
       # chronos-only: one replenish connect lands before close() cancels the
       # loop (settled via the except path); the other stays in flight.
       proc t() {.async.} =
@@ -6281,14 +6281,10 @@ suite "Pool replenish capacity race":
         doAssert pool.active == 0
         doAssert pool.metrics.closeCount == 1 # landed conn settled via closeNoWait
 
-        # Read the landed conn until EOF: the pool must have closed it.
-        var closedByPool = false
-        try:
-          while true:
-            discard await client1.readN(1)
-        except CatchableError:
-          closedByPool = true
-        doAssert closedByPool
+        doAssert await closedByPeer(client1)
+        # allFutures does not cancel the connects: left running, the second
+        # would land after close() with nobody to close it.
+        doAssert await closedByPeer(client2)
 
         await closeServer(ms)
         await closeClient(client1)
@@ -6533,6 +6529,38 @@ suite "Pool warmup parallelization":
     waitFor t()
     check raised
 
+  test "newPool closes the conn that came up when another initial connect fails":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 2)
+      cfg.connConfig.connectTimeout = seconds(5)
+      let poolFut = newPool(cfg)
+
+      let client1 = await ms.accept()
+      await drainStartupMessage(client1)
+      let client2 = await ms.accept()
+      await drainStartupMessage(client2)
+      await sendFullHandshake(client1)
+      # The other dial fails: the server hangs up before authenticating it.
+      await closeClient(client2)
+
+      var raised = false
+      try:
+        discard await poolFut.wait(seconds(5))
+      except AsyncTimeoutError:
+        discard
+      except CatchableError:
+        raised = true
+      doAssert raised
+
+      let msg = await drainFrontendMessage(client1).wait(seconds(2))
+      doAssert msg.msgType == 'X'
+
+      await closeClient(client1)
+      await closeServer(ms)
+
+    waitFor t()
+
   test "newPool issues warmup connects concurrently (gate-based)":
     # Prove that `newPool` opens all `minSize` connects in parallel, not
     # serially. The server accepts client #1 and drains its startup message
@@ -6583,6 +6611,42 @@ suite "Pool warmup parallelization":
     waitFor t()
     check ok
     check idleAfter == 2
+
+  when hasChronos:
+    test "a cancelled newPool closes the conn that came up and cuts the dial under way":
+      # chronos-only: allFutures does not cancel the connects, so both used to
+      # be left open, the landed one unparked and the other still dialing.
+      proc t() {.async.} =
+        let ms = startMockServer()
+        var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 2)
+        cfg.connConfig.connectTimeout = seconds(5)
+        let poolFut = newPool(cfg)
+
+        let client1 = await ms.accept()
+        await drainStartupMessage(client1)
+        let client2 = await ms.accept()
+        await drainStartupMessage(client2)
+        await sendFullHandshake(client1)
+
+        let start = Moment.now()
+        var timedOut = false
+        try:
+          discard await poolFut.wait(milliseconds(200))
+        except AsyncTimeoutError:
+          timedOut = true
+        doAssert timedOut
+        # The 5s connect timer would mask a cancel stalled on a lost wakeup.
+        doAssert Moment.now() - start < seconds(2)
+
+        let msg = await drainFrontendMessage(client1).wait(seconds(2))
+        doAssert msg.msgType == 'X'
+        doAssert await closedByPeer(client2)
+
+        await closeClient(client1)
+        await closeClient(client2)
+        await closeServer(ms)
+
+      waitFor t()
 
 suite "Pipeline rejects unencodable SQL at add time":
   ## Regression: SQL was only checked in `buildSendPhase`, long after the op

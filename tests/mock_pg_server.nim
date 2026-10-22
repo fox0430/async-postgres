@@ -476,6 +476,20 @@ proc drainFrontendMessage*(
   if msgLen > 4:
     result.body = await readN(client, msgLen - 4)
 
+proc closedByPeer*(client: MockClient, timeout = seconds(2)): Future[bool] {.async.} =
+  ## Whether the client's side closes the socket within `timeout` of the last
+  ## byte; anything it sends first (a Terminate) is read past. A reset counts:
+  ## Winsock resets a socket chronos closes with its read still posted.
+  try:
+    while true:
+      discard await client.readN(1).wait(timeout)
+  except AsyncTimeoutError:
+    return false
+  except CancelledError as e:
+    raise e
+  except CatchableError:
+    return true
+
 proc drainThroughCopyDone*(client: MockClient) {.async.} =
   ## Read frontend messages through the client's CopyDone. A stop writes its
   ## final status first; closing before CopyDone arrives can fail that write.

@@ -873,10 +873,7 @@ proc closeTransport*(conn: PgConnection) {.async.} =
     # `noCancel` and swallowed: this caller neither started nor cancelled the
     # teardown, so it must not inherit its outcome.
     try:
-      when hasChronos:
-        await noCancel inFlight
-      else:
-        await inFlight
+      await noCancel inFlight
     except CatchableError:
       discard
     return
@@ -885,10 +882,7 @@ proc closeTransport*(conn: PgConnection) {.async.} =
   # `noCancel` on the owner too: the handles are detached before the first
   # suspension, so a cancelled teardown would strand the only references to
   # them and leak the fd for the process lifetime.
-  when hasChronos:
-    await noCancel fut
-  else:
-    await fut
+  await noCancel fut
   # Released once finished: the guard above only cares about a running
   # teardown, and a connection that reconnects in place must not carry the
   # finished frame of the transport before last.
