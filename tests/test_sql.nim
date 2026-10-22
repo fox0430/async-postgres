@@ -252,6 +252,16 @@ suite "sqlParams":
       "SELECT * FROM t WHERE a=$1||'x' AND id = $2"
     check sqlParams("SELECT * FROM t WHERE a=?-1") == "SELECT * FROM t WHERE a=$1-1"
 
+  test "placeholder spaced from an adjacent identifier, number or $":
+    # Unspaced, PG reads ``LIMIT$1`` as an identifier, ``$$1`` as a dollar
+    # quote, ``$1AND`` as junk and ``$11`` as another parameter.
+    check sqlParams("SELECT * FROM t LIMIT?") == "SELECT * FROM t LIMIT $1"
+    check sqlParams("SELECT price$?, x1?, é?") == "SELECT price$ $1, x1 $2, é $3"
+    check sqlParams("SELECT $?") == "SELECT $ $1"
+    check sqlParams("SELECT ?AND ?_x ?é") == "SELECT $1 AND $2 _x $3 é"
+    check sqlParams("SELECT ?1, ?$a$x$a$") == "SELECT $1 1, $2 $a$x$a$"
+    check sqlParams("SELECT f(?,?)=?") == "SELECT f($1,$2)=$3"
+
 suite "sql macro":
   test "basic parameter extraction":
     let x = 42'i32
@@ -370,8 +380,14 @@ suite "sql macro":
     let a = 1'i32
     let b = 2'i32
     let sq = sql"SELECT {a}{b}"
-    check sq.query == "SELECT $1$2"
+    check sq.query == "SELECT $1 $2"
     check sq.params.len == 2
+
+  test "placeholder spaced from an adjacent identifier, number or $":
+    let x = 1'i32
+    let sq = sql"SELECT col{x}, {x}AND, {x}1, ${x}, ({x})"
+    check sq.query == "SELECT col $1, $2 AND, $3 1, $ $4, ($5)"
+    check sq.params.len == 5
 
   test "{{ immediately followed by parameter":
     let x = 1'i32

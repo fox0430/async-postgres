@@ -14,7 +14,7 @@ type SqlParseState = enum
 const
   # PG's ident_start/ident_cont and dolq_start/dolq_cont (scan.l).
   sqlIdentStartChars = {'a' .. 'z', 'A' .. 'Z', '_', '\x80' .. '\xff'}
-  sqlIdentContChars = sqlIdentStartChars + {'0' .. '9', '$'}
+  sqlIdentContChars* = sqlIdentStartChars + {'0' .. '9', '$'}
   sqlDollarTagContChars = sqlIdentStartChars + {'0' .. '9'}
 
 func dollarTagLen(sql: string, idx: int): int =
