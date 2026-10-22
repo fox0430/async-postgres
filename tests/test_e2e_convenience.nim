@@ -2525,6 +2525,15 @@ suite "Compile-time: queryDirect / execDirect arity":
 
     )
 
+  test "queryDirect: $1 after a line comment ended by a lone CR is counted":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT 1 -- unused\r, $1::int4", 1'i32)
+
+    )
+
   test "queryDirect: $5 inside /* */ block comment is ignored":
     doAssert compiles(
       block:
@@ -2667,6 +2676,35 @@ suite "Compile-time: queryDirect / execDirect arity":
         proc t() {.async.} =
           let conn = await connect(plainConfig())
           discard await conn.queryDirect("SELECT 'a''b' || $1::text", "x")
+
+    )
+
+  test "queryDirect: $ inside an identifier is neither a quote nor a placeholder":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect(
+            "SELECT price$usd$x, x1$2 FROM t WHERE id = $1::int4", 1'i32
+          )
+
+    )
+
+  test "queryDirect: $2 inside a dollar quote with a non-ASCII tag is ignored":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT $é$ $2 $é$, $1::int4", 1'i32)
+
+    )
+
+  test "queryDirect: E after $ in an identifier does not start an E-string":
+    doAssert compiles(
+      block:
+        proc t() {.async.} =
+          let conn = await connect(plainConfig())
+          discard await conn.queryDirect("SELECT a$e'\\', $1::int4", 1'i32)
 
     )
 

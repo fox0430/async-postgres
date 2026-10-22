@@ -67,6 +67,11 @@ suite "sqlParams":
     # CRATE'?' — the E in CRATE is part of an identifier, not E-string prefix
     check sqlParams("SELECT CRATE'?' WHERE id = ?") == "SELECT CRATE'?' WHERE id = $1"
 
+  test "E-string not triggered by an identifier with $ or non-ASCII letters":
+    # PG reads a$e'\' as a cast of the standard string '\' to type a$e.
+    check sqlParams("SELECT a$e'\\' WHERE id = ?") == "SELECT a$e'\\' WHERE id = $1"
+    check sqlParams("SELECT ée'\\' WHERE id = ?") == "SELECT ée'\\' WHERE id = $1"
+
   test "? inside dollar-quoted string preserved":
     check sqlParams("SELECT $$hello ? world$$ WHERE id = ?") ==
       "SELECT $$hello ? world$$ WHERE id = $1"
@@ -77,6 +82,24 @@ suite "sqlParams":
 
   test "dollar sign not starting a dollar-quote":
     check sqlParams("SELECT $1 WHERE id = ?") == "SELECT $1 WHERE id = $1"
+
+  test "$ inside an identifier does not start a dollar quote":
+    check sqlParams("SELECT price$usd$x FROM t WHERE id = ?") ==
+      "SELECT price$usd$x FROM t WHERE id = $1"
+    check sqlParams("SELECT x1$a$ FROM t WHERE id = ?") ==
+      "SELECT x1$a$ FROM t WHERE id = $1"
+
+  test "dollar quote right after a number, quoted identifier or closing tag":
+    # PG starts a new token at each of these $, unlike after an identifier.
+    check sqlParams("SELECT 1$a$?$a$, ?") == "SELECT 1$a$?$a$, $1"
+    check sqlParams("""SELECT "q"$a$?$a$, ?""") == """SELECT "q"$a$?$a$, $1"""
+    check sqlParams("SELECT $a$x$a$$b$?$b$, ?") == "SELECT $a$x$a$$b$?$b$, $1"
+
+  test "? inside a dollar quote with a non-ASCII tag preserved":
+    check sqlParams("SELECT $é$what?$é$ WHERE id = ?") ==
+      "SELECT $é$what?$é$ WHERE id = $1"
+    check sqlParams("SELECT $fné1$what?$fné1$ WHERE id = ?") ==
+      "SELECT $fné1$what?$fné1$ WHERE id = $1"
 
   test "?| at end of string":
     check sqlParams("SELECT col ?|") == "SELECT col ?|"
@@ -115,6 +138,10 @@ suite "sqlParams":
   test "line comment ends at newline, ? after is bound":
     check sqlParams("SELECT -- what?\ncol FROM t WHERE id = ?") ==
       "SELECT -- what?\ncol FROM t WHERE id = $1"
+
+  test "line comment ends at a lone CR, ? after is bound":
+    check sqlParams("SELECT -- what?\rcol FROM t WHERE id = ?") ==
+      "SELECT -- what?\rcol FROM t WHERE id = $1"
 
   test "? and ' inside block comment preserved":
     check sqlParams("SELECT 1 /* it's here ? */ ? FROM t") ==
@@ -310,6 +337,18 @@ suite "sql macro":
     let x = 1'i32
     let sq = sql"SELECT $fn${hello}$fn$ WHERE id = {x}"
     check sq.query == "SELECT $fn${hello}$fn$ WHERE id = $1"
+    check sq.params.len == 1
+
+  test "$ inside an identifier does not start a dollar quote":
+    let x = 1'i32
+    let sq = sql"SELECT price$usd$x FROM t WHERE id = {x}"
+    check sq.query == "SELECT price$usd$x FROM t WHERE id = $1"
+    check sq.params.len == 1
+
+  test "placeholder inside a dollar quote with a non-ASCII tag preserved":
+    let x = 1'i32
+    let sq = sql"SELECT $é${x}$é$ WHERE id = {x}"
+    check sq.query == "SELECT $é${x}$é$ WHERE id = $1"
     check sq.params.len == 1
 
   test "expression containing char literal with closing brace":

@@ -448,6 +448,7 @@ async_postgres/pg_protocol.nim	startupUserKey
 async_postgres/pg_protocol.nim	typeByte
 async_postgres/pg_protocol.nim	withAtomicMessage
 async_postgres/pg_saslprep.nim	saslprep
+async_postgres/pg_sql_lexer.nim	sqlParseLoop
 async_postgres/pg_types/accessors.nim	cellInfo
 async_postgres/pg_types/accessors.nim	checkArrayElemOid
 async_postgres/pg_types/accessors.nim	checkScalarColOid
