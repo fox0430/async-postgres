@@ -800,7 +800,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       for pc in toPing:
         pingFuts.add(pc.conn.ping(pingTimeout))
       try:
-        await allFutures(pingFuts)
+        await allFuturesCancelling(pingFuts)
       except CancelledError as e:
         # close() cancels us mid-ping, leaving the pings' conns mid-protocol.
         for pc in toPing:

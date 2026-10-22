@@ -314,6 +314,26 @@ suite "allFuturesCancelling":
       check a.cancelled
       check b.cancelled
 
+    test "cancelled, it cancels each input once, sparing their cleanup awaits":
+      var cleanedUp = 0
+      proc slow(cleanupMs: int): Future[int] {.async.} =
+        try:
+          await sleepAsync(seconds(5))
+          return 1
+        except CancelledError as e:
+          await sleepAsync(milliseconds(cleanupMs))
+          inc cleanedUp
+          raise e
+
+      # `b` is still in its cleanup when `a` settles.
+      let a = slow(1)
+      let b = slow(50)
+      let joined = allFuturesCancelling(@[a, b])
+      waitFor cancelAndWaitPumped(joined)
+      check cleanedUp == 2
+      check a.cancelled
+      check b.cancelled
+
 suite "noCancel":
   test "awaits the future it wraps on both backends":
     proc okOne(): Future[int] {.async.} =

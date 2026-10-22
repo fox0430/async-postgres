@@ -43,17 +43,8 @@ when hasChronos:
     if not fut.finished():
       fut.cancelSoon()
 
-  proc cancelAndWaitPumped*(fut: FutureBase): Future[void] {.async.} =
-    ## Cancel `fut` and wait until it settles, keeping the event loop awake.
-    ##
-    ## chronos 4.4.x may park a cancellation retry until the next I/O or timer
-    ## event, so a bare `cancelAndWait` can stall with no other timer around.
-    ## A 1ms timer raced against `fut` keeps the loop awake. Never raises:
-    ## `fut`'s outcome is left unread, and its own cancellation is ignored so
-    ## close paths always observe completion.
-    if fut == nil or fut.finished():
-      return
-    fut.cancelSoon()
+  proc waitPumped(fut: FutureBase): Future[void] {.async.} =
+    ## Wait until `fut` settles without cancelling it; see `cancelAndWaitPumped`.
     while not fut.finished():
       var timer = sleepAsync(milliseconds(1))
       try:
@@ -66,6 +57,19 @@ when hasChronos:
         # escape, breaking "Never raises". `cancelTimer` cannot suspend.
         cancelTimer(timer)
 
+  proc cancelAndWaitPumped*(fut: FutureBase): Future[void] {.async.} =
+    ## Cancel `fut` and wait until it settles, keeping the event loop awake.
+    ##
+    ## chronos 4.4.x may park a cancellation retry until the next I/O or timer
+    ## event, so a bare `cancelAndWait` can stall with no other timer around.
+    ## A 1ms timer raced against `fut` keeps the loop awake. Never raises:
+    ## `fut`'s outcome is left unread, and its own cancellation is ignored so
+    ## close paths always observe completion.
+    if fut == nil or fut.finished():
+      return
+    fut.cancelSoon()
+    await waitPumped(fut)
+
   proc allFuturesCancelling*[T](futs: seq[Future[T]]): Future[void] {.async.} =
     ## `allFutures`, except that cancelling it cancels `futs` too: the
     ## `CancelledError` goes on only once every one of them has settled.
@@ -76,8 +80,10 @@ when hasChronos:
       for fut in futs:
         if not fut.finished():
           fut.cancelSoon()
+      # Waited on, not cancelled again: by now an input may be in its cleanup
+      # awaits (a connect's Terminate send), which a second cancel would abort.
       for fut in futs:
-        await cancelAndWaitPumped(fut)
+        await waitPumped(fut)
       raise e
 
   # chronos exposes raw-fd readiness registration only on selector-based
