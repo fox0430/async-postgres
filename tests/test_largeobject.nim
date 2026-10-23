@@ -491,76 +491,8 @@ suite "Large Object: convenience API":
 
     waitFor t()
 
-  # asyncdispatch only: the deadline fires reliably because asyncdispatch's
-  # `withTimeout` honors ms-level per-call timeouts even when the inner future
-  # completes synchronously. On chronos, fast successive `loRead` round-trips
-  # complete synchronously inside `wait(fut, dur)` (asyncfutures.nim
-  # wait/waitImpl), starving the timer; sub-deadline cancellation is therefore
-  # best-effort and not exercised here.
-  #
-  # Note: chronos coverage of the deadline-fire path is provided by the
-  # `withTransactionDeadline raises PgTimeoutError when body exceeds deadline`
-  # test in `test_e2e.nim`, which uses `SELECT pg_sleep(2)` to force the
-  # server-side response off the synchronous-completion path. The Large Object
-  # protocol exposes no equivalent server-side blocking primitive, so the
-  # cumulative-deadline behavior of `lo*Deadline` cannot be force-armed under
-  # chronos without an artificial setup. Functional success cases above still
-  # run on both backends.
-  # `loSizeDeadline`-specific deadline-fire test omitted: loSize is only 3
-  # round-trips against local Postgres (each ~0.1ms), so the per-call 1ms
-  # floor of `remainingDeadlineDuration` does not reliably exceed the per-call
-  # wait — the loop returns `size` before any timer arms. The deadline-fire
-  # path is the same `simpleExec(timeout=1ms)` -> `invalidateOnTimeout` chain
-  # exercised by `loReadAllDeadline raises PgTimeoutError when deadline expires
-  # mid-read` below (1MB / 1KB chunkSize ≈ 1000 round-trips makes a fire
-  # certain within 1ms). The SEEK_END-residue caveat in `loSizeDeadline`'s
-  # docstring is therefore documentation-only.
-
-  when not hasChronos:
-    test "loReadAllDeadline raises PgTimeoutError when deadline expires mid-read":
-      proc t() {.async.} =
-        # Setup on a dedicated connection: the deadline test below invalidates
-        # its own connection, so create/write must happen elsewhere.
-        let setupConn = await connect(plainConfig())
-        var oid: Oid
-        setupConn.withTransaction:
-          oid = await setupConn.loCreate()
-          let lo = await setupConn.loOpen(oid, INV_READWRITE)
-          var bigData = newSeq[byte](1_000_000)
-          for i in 0 ..< bigData.len:
-            bigData[i] = byte(i mod 256)
-          discard await lo.loWrite(bigData)
-          await lo.loClose()
-        await setupConn.close()
-
-        # Exercise on a separate connection. Avoid `withTransaction`: when the
-        # connection is invalidated on timeout, the macro's COMMIT/ROLLBACK
-        # cleanup would raise PgConnectionError on csClosed. Issue BEGIN by
-        # hand and let the server abandon the tx when the connection is dropped.
-        let conn = await connect(plainConfig())
-        discard await conn.simpleExec("BEGIN")
-        let lo = await conn.loOpen(oid, INV_READWRITE)
-        discard await lo.loSeek(0, SEEK_SET)
-
-        var raised = false
-        try:
-          # 1MB / 1KB chunkSize ≈ 1000 server round-trips. On asyncdispatch the
-          # first per-call wait past the 1ms deadline (which uses a 1ms floor)
-          # fires reliably, invalidating the connection.
-          discard await lo.loReadAllDeadline(milliseconds(1), chunkSize = 1024)
-        except PgTimeoutError:
-          raised = true
-
-        doAssert raised
-        doAssert conn.state == csClosed
-        await conn.close()
-
-        # Cleanup via a fresh connection.
-        let cleanupConn = await connect(plainConfig())
-        await cleanupConn.loUnlink(oid)
-        await cleanupConn.close()
-
-      waitFor t()
+  # The deadline-fire path is tested against a mock in test_largeobject_parse:
+  # a local server answers within the 1ms per-call floor, which never fires.
 
   test "loReadStreamDeadline streams chunks within deadline":
     proc t() {.async.} =

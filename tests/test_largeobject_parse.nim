@@ -232,6 +232,43 @@ suite "Large Object loRead: an answer without a value is not EOF":
     check err != nil
     check err of PgNullError
 
+suite "Large Object deadline":
+  test "loReadAllDeadline raises PgTimeoutError once its reads use up the deadline":
+    # Every read beats the deadline alone, but not ten in a row. Delayed by the
+    # mock: a local server answers within the 1ms floor, which never fires.
+    proc serveSlowChunks(ms: MockServer) {.async.} =
+      let client = await acceptAndReady(ms)
+      try:
+        for i in 0 .. 10:
+          await drainUntilSync(client)
+          await sleepAsync(milliseconds(30))
+          let value = if i < 10: "\\x41" else: "" # then an empty bytea: EOF
+          await sendBytes(client, buildLoReadReply(buildDataRowText([value])))
+      except CatchableError:
+        discard # the client hangs up once it times out
+      await closeClient(client)
+
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let serverFut = serveSlowChunks(ms)
+      let conn = await connect(mockConfig(ms.port))
+      let lo = LargeObject(conn: conn, fd: 0, oid: Oid(1))
+      var raised = false
+      try:
+        discard await lo.loReadAllDeadline(milliseconds(100))
+      except PgTimeoutError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csClosed
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await serverFut
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "Large Object precondition errors (no server)":
   test "loRead rejects negative length with ValueError":
     let lo = LargeObject(conn: nil, fd: 1, oid: Oid(1))
