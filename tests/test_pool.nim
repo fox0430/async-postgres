@@ -4974,12 +4974,12 @@ suite "isConnected":
       check not stillConnected
       check stateAtProbe == csReady
 
-suite "Connect refusals":
-  proc wrongPassword(): seq[byte] =
-    buildErrorResponse(
-      "28P01", "password authentication failed for user \"test\"", "FATAL"
-    )
+proc wrongPassword(): seq[byte] =
+  buildErrorResponse(
+    "28P01", "password authentication failed for user \"test\"", "FATAL"
+  )
 
+suite "Connect refusals":
   proc refuseLogins(
       ms: MockServer,
       accepted: ref int,
@@ -6258,7 +6258,7 @@ suite "Pool replenish capacity race":
   when hasChronos:
     test "close cancelling in-flight replenish settles the landed conn and cuts the dial under way":
       # chronos-only: one replenish connect lands before close() cancels the
-      # loop (settled via the except path); the other stays in flight.
+      # loop (settled on the cancel path); the other stays in flight.
       proc t() {.async.} =
         let ms = startMockServer()
 
@@ -6289,6 +6289,101 @@ suite "Pool replenish capacity race":
         await closeServer(ms)
         await closeClient(client1)
         await closeClient(client2)
+
+      waitFor t()
+
+    proc countConnectEnds(cfg: var ConnConfig): ref int =
+      ## Count the connects that have ended, landed or failed.
+      let ended = new int
+      let tracer = PgTracer()
+      tracer.onConnectEnd = proc(
+          ctx: TraceContext, data: TraceConnectEndData
+      ) {.gcsafe, raises: [].} =
+        inc ended[]
+      cfg.tracer = tracer
+      ended
+
+    proc waitConnectEnds(ended: ref int, n: int) {.async.} =
+      for _ in 0 ..< 2000:
+        if ended[] >= n:
+          return
+        await sleepAsync(milliseconds(1))
+      doAssert false, "connects did not end"
+
+    proc refuseLogin(client: MockClient) {.async.} =
+      await sendBytes(client, wrongPassword())
+      await closeClient(client)
+
+    test "close cancelling in-flight replenish counts the connect that failed before it":
+      # One replenish connect is refused before close() cancels the loop; the
+      # other is cut by the cancel, which is no failure of its own.
+      proc t() {.async.} =
+        let ms = startMockServer()
+
+        let pool = makePool(minSize = 2, maxSize = 2)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.connConfig.connectTimeout = seconds(5)
+        let ended = countConnectEnds(pool.config.connConfig)
+        pool.config.maintenanceInterval = milliseconds(10)
+        pool.maintenanceTask = maintenanceLoop(pool)
+
+        let client1 = await ms.accept()
+        await drainStartupMessage(client1)
+        let client2 = await ms.accept()
+        await drainStartupMessage(client2)
+
+        await refuseLogin(client1)
+        await waitConnectEnds(ended, 1)
+
+        await pool.close()
+        doAssert pool.active == 0
+        doAssert pool.metrics.connectFailureCount == 1
+        doAssert pool.metrics.refusalCount == 1
+        doAssert pool.connectRefusal() != nil
+        doAssert await closedByPeer(client2)
+
+        await closeServer(ms)
+        await closeClient(client2)
+
+      waitFor t()
+
+    test "close cancelling in-flight replenish clears a refusal a landed connect answered":
+      # As in an uncut round: a dial of the same round that went through clears
+      # the refusal. Loopback accepts in dial order, so the landed dial is
+      # likely the earlier one, which a settle in dial order got wrong.
+      proc t() {.async.} =
+        let ms = startMockServer()
+
+        let pool = makePool(minSize = 3, maxSize = 3)
+        pool.config.connConfig = mockConfig(ms.port)
+        pool.config.connConfig.connectTimeout = seconds(5)
+        let ended = countConnectEnds(pool.config.connConfig)
+        pool.config.maintenanceInterval = milliseconds(10)
+        pool.maintenanceTask = maintenanceLoop(pool)
+
+        let client1 = await ms.accept()
+        await drainStartupMessage(client1)
+        let client2 = await ms.accept()
+        await drainStartupMessage(client2)
+        let client3 = await ms.accept()
+        await drainStartupMessage(client3)
+
+        await sendFullHandshake(client1)
+        await refuseLogin(client2)
+        await waitConnectEnds(ended, 2)
+
+        await pool.close()
+        doAssert pool.active == 0
+        doAssert pool.metrics.createCount == 1
+        doAssert pool.metrics.connectFailureCount == 1
+        doAssert pool.metrics.refusalCount == 1
+        doAssert pool.connectRefusal() == nil
+        doAssert await closedByPeer(client1)
+        doAssert await closedByPeer(client3)
+
+        await closeServer(ms)
+        await closeClient(client1)
+        await closeClient(client3)
 
       waitFor t()
 

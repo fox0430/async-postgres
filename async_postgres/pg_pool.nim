@@ -122,7 +122,9 @@ type
     connectFailureCount*: int64
       ## Number of connect attempts that failed once `newPool` returned: a
       ## refusal, a config fault or a failure that may clear. A dial cut short
-      ## by an `acquire`'s budget counts in `timeoutCount` instead.
+      ## by an `acquire`'s budget counts in `timeoutCount` instead, and one a
+      ## chronos cancel cuts short (the caller's, or `close()`'s) counts nowhere;
+      ## asyncdispatch lets the dial end, and counts it.
     refusalCount*: int64
       ## Number of connect attempts the server refused; what tells a pool held
       ## below `minSize` by a refusal from an idle one.
@@ -865,17 +867,13 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       let connCfg = pool.boundedConnConfig()
       for i in 0 ..< needed:
         connectFuts.add(connect(connCfg))
+      var cancelled: ref CancelledError
       try:
         await allFuturesCancelling(connectFuts)
       except CancelledError as e:
         # close() cancels us mid-connect, and the connects with us, so none
-        # lands unowned: settle the ones that landed, release the rest.
-        for f in connectFuts:
-          if f.completed():
-            pool.settleReplenishConnect(f.read())
-          else:
-            pool.active.dec
-        raise e
+        # lands unowned: its connects settle as an uncut round's do, then it ends.
+        cancelled = e
       # Successes first: they clear what earlier rounds recorded, while this
       # round's transient failures still back off.
       var connected = false
@@ -887,15 +885,20 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       for f in connectFuts:
         if not f.completed():
           pool.active.dec
-          # Same downcast as `newPool`: `connect` only raises `CatchableError`.
-          let e = cast[ref CatchableError](f.error)
-          if pool.noteConnectFailure(e) == cfRefused:
-            refusal = e
+          # The connects close() cut short are no failures of their own.
+          if cancelled == nil or f.failed():
+            # Same downcast as `newPool`: `connect` only raises `CatchableError`.
+            let e = cast[ref CatchableError](f.error)
+            if pool.noteConnectFailure(e) == cfRefused:
+              refusal = e
       if connected and refusal != nil:
         # A dial of the same round went through: the server takes this config.
         pool.lastRefusal = nil
         refusal = nil
         pool.scheduleConnectRetry(pool.connectRetryDelay())
+      if cancelled != nil:
+        # close() fails the waiters itself, with the error its contract names.
+        raise cancelled
       pool.failStrandedWaiters(refusal)
 
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
