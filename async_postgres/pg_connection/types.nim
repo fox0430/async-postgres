@@ -580,9 +580,11 @@ type
     err*: ref CatchableError
 
   TracePoolAcquireStartData* = object ## Data passed to the pool acquire start hook.
-    idleCount*: int
+    idleCount*: int ## `PgPool.idleCount()` as this acquire starts
     activeCount*: int
-    maxSize*: int
+      ## `PgPool.activeCount()` as this acquire starts, so not counting it:
+      ## slots in use, not only borrowers
+    maxSize*: int ## `PoolConfig.maxSize`
 
   TracePoolAcquireEndData* = object ## Data passed to the pool acquire end hook.
     conn*: PgConnection

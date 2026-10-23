@@ -443,7 +443,8 @@ template withPipeline*(cluster: PgPoolCluster, pipeline, body: untyped) =
 proc close*(cluster: PgPoolCluster, timeout = ZeroDuration): Future[void] {.async.} =
   ## Close both primary and replica pools. Both closes run concurrently so
   ## their drain windows overlap and the total wait stays bounded by
-  ## `timeout` instead of doubling when both pools have active connections.
+  ## `timeout` instead of doubling when both pools have `activeCount()` to
+  ## drain.
   cluster.closed = true
   let
     primaryFut = cluster.primary.close(timeout)
