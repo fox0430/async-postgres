@@ -1475,10 +1475,9 @@ proc acquireImpl(pool: PgPool, queue = true): Future[AcquireResult] {.async.} =
           pool.dialsInFlight.dec
           # `perform()` aggregates per-host errors into `PgConnectionError`, so
           # the exception type alone can't tell an acquire timeout from a run of
-          # connect failures — the deadline is authoritative. The 1ms slack
-          # absorbs asyncdispatch's timer imprecision (it can fire hundreds of
-          # microseconds early).
-          let budgetSpent = hasDeadline and remainingBudget() <= milliseconds(1)
+          # connect failures — the deadline is authoritative (`wait(rem)` times
+          # out no earlier than it).
+          let budgetSpent = hasDeadline and remainingBudget() <= ZeroDuration
           let failure =
             if budgetSpent and connectFailureOf(e) == cfFailed:
               # Cut short by the caller's budget: nothing learned of the server.
@@ -3112,7 +3111,9 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## When `timeout > ZeroDuration`, `timeout` is a single deadline shared by
   ## both the drain of `activeCount()` and the background-task drain. Pending
   ## background closes still running when the deadline elapses are
-  ## cancelled so close() returns promptly. Without a timeout (or
+  ## cancelled so close() returns promptly. The idle connections, closed
+  ## between the two drains, are not cut short: closing one sends Terminate
+  ## and waits for no reply. Without a timeout (or
   ## `ZeroDuration`), close() does not wait for `activeCount()` and the
   ## background drain waits unbounded.
   ##
@@ -3152,14 +3153,19 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     failPendingOp(op, closeErr)
 
   # Wait for activeCount() to drain: borrows, and the dials and pings holding a
-  # slot (bounded by closeDeadline)
-  if hasDeadline and pool.active > 0:
-    while pool.active > 0 and Moment.now() < closeDeadline:
-      await sleepAsync(milliseconds(50))
+  # slot (bounded by closeDeadline; the last poll sleeps only to the deadline)
+  if hasDeadline:
+    while pool.active > 0:
+      let remaining = closeDeadline - Moment.now()
+      if remaining <= ZeroDuration:
+        break
+      await sleepAsync(min(remaining, milliseconds(50)))
 
   # Close all idle connections in parallel. `tracedClose` swallows its own
   # errors (routing them to the tracer), so a failure in one close does not
-  # short-circuit the rest or escape this proc.
+  # short-circuit the rest or escape this proc. Not bounded by closeDeadline:
+  # they start after the drain above, often at the deadline, so cutting them
+  # there would drop every Terminate; and an idle close waits for no reply.
   var closeFuts: seq[Future[void]]
   while pool.idle.len > 0:
     let pc = pool.idle.popFirst()

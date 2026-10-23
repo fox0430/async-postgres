@@ -77,6 +77,18 @@ suite "Duration":
       check $milliseconds(5) == "5ms"
       check $seconds(2) == "2s"
 
+suite "sleepAsync":
+  test "a sub-millisecond sleep lasts at least its duration":
+    # asyncdispatch truncated it to a zero-length timer, which an await resumes
+    # from on the next poll. Timed inside the proc: a bare `waitFor` of that
+    # timer blocks for poll's own 500ms timeout.
+    proc timedSleep(): Future[Duration] {.async.} =
+      let start = Moment.now()
+      await sleepAsync(nanoseconds(500_000))
+      return Moment.now() - start
+
+    check waitFor(timedSleep()) >= nanoseconds(500_000)
+
 suite "Moment":
   test "arithmetic and comparison":
     let m0 = Moment.now()
@@ -104,6 +116,18 @@ suite "wait":
   test "raises AsyncTimeoutError on timeout":
     expect AsyncTimeoutError:
       waitFor sleepAsync(milliseconds(30)).wait(milliseconds(1))
+
+  test "times out no earlier than its timeout":
+    # asyncdispatch truncated 1.5ms to a 1ms timer.
+    proc timedWait(): Future[Duration] {.async.} =
+      let start = Moment.now()
+      try:
+        await sleepAsync(milliseconds(30)).wait(nanoseconds(1_500_000))
+      except AsyncTimeoutError:
+        discard
+      return Moment.now() - start
+
+    check waitFor(timedWait()) >= nanoseconds(1_500_000)
 
   when hasAsyncDispatch:
     test "onOrphan fires when the orphan completes after the timeout":
