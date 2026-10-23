@@ -8,8 +8,10 @@ type
   PoolConfig* = object
     ## Configuration for the connection pool. Create via `initPoolConfig`.
     connConfig*: ConnConfig
-    minSize*: int ## Minimum idle connections (default 1)
-    maxSize*: int ## Maximum total connections (default 10)
+    minSize*: int
+      ## Minimum connections, idle or checked out, as `size()` counts them
+      ## (default 1)
+    maxSize*: int ## Maximum connections, as `size()` counts them (default 10)
     idleTimeout*: Duration
       ## Close idle connections after this duration (default 10min, ZeroDuration=disabled)
     maxLifetime*: Duration
@@ -284,7 +286,8 @@ proc initPoolConfig*(
     connectBackoffMax = seconds(60),
 ): PoolConfig =
   ## Create a pool configuration with sensible defaults.
-  ## `minSize` idle connections are maintained; up to `maxSize` total.
+  ## Maintenance replenishes `size()` toward `minSize`, checked-out
+  ## connections included; acquires dial up to `maxSize`.
   ## Set `resetQuery` to clean session state on release (e.g. "DISCARD ALL" for PgBouncer).
   ## Set `pipelined` to true to enable implicit query batching for `pool.exec`/`pool.query`.
   ## When the maintenance loop fails to open a connection, subsequent retries
@@ -328,11 +331,18 @@ proc idleCount*(pool: PgPool): int =
   pool.idle.len
 
 proc activeCount*(pool: PgPool): int =
-  ## Number of connections currently checked out from the pool.
+  ## Number of slots in use outside the idle set: connections checked out,
+  ## plus slots held by an `acquire` still running (granted, dialing or
+  ## checking a connection; under asyncdispatch, even after a caller's `wait()`
+  ## gave up on it), by a `minSize` replenish dial, and by the maintenance
+  ## sweep while it pings an idle connection. Not a count of borrowers: it can
+  ## be nonzero with none.
   pool.active
 
 proc size*(pool: PgPool): int =
-  ## Total number of connections (idle + active).
+  ## Number of slots counted against `maxSize`: `idleCount() + activeCount()`.
+  ## Connections the pool is closing, and under asyncdispatch a dial an
+  ## acquire timed out on, hold no slot and are not counted.
   pool.idle.len + pool.active
 
 proc pendingAcquires*(pool: PgPool): int =
@@ -3094,14 +3104,16 @@ macro withPipeline*(pool: PgPool, pipeline, body: untyped): untyped =
       `releaseBlock`
 
 proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
-  ## Close the pool: stop the maintenance loop, cancel all waiters, and close
-  ## all idle and active connections.
+  ## Close the pool: stop the maintenance loop, fail queued acquires and
+  ## pipelined operations with `pekClosed`, and close the idle connections. An
+  ## acquire already dialing or pinging fails once that dial or ping ends; a
+  ## checked-out connection is closed when released.
   ##
   ## When `timeout > ZeroDuration`, `timeout` is a single deadline shared by
-  ## both the active-connection drain and the background-task drain. Pending
+  ## both the drain of `activeCount()` and the background-task drain. Pending
   ## background closes still running when the deadline elapses are
   ## cancelled so close() returns promptly. Without a timeout (or
-  ## `ZeroDuration`), active connections are closed on release and the
+  ## `ZeroDuration`), close() does not wait for `activeCount()` and the
   ## background drain waits unbounded.
   ##
   ## asyncdispatch cannot cancel a future: there the maintenance loop, and
@@ -3121,7 +3133,7 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   if pool.maintenanceTask != nil and not pool.maintenanceTask.finished:
     await cancelAndWaitPumped(pool.maintenanceTask)
 
-  # Cancel all waiters. PgPoolError (not bare PgError) so a waiter failed
+  # Fail all waiters. PgPoolError (not bare PgError) so a waiter failed
   # by close() matches acquire()'s documented error contract. Skip waiters whose
   # future is already finished (e.g. a chronos timeout/cancel that hasn't yet run
   # `settleAbandonedWaiter`): `fail()` on a finished future is a no-op on chronos
@@ -3139,7 +3151,8 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
     let op = pool.pendingOps.popFirst()
     failPendingOp(op, closeErr)
 
-  # Wait for active connections to drain (bounded by closeDeadline)
+  # Wait for activeCount() to drain: borrows, and the dials and pings holding a
+  # slot (bounded by closeDeadline)
   if hasDeadline and pool.active > 0:
     while pool.active > 0 and Moment.now() < closeDeadline:
       await sleepAsync(milliseconds(50))
