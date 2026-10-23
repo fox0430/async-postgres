@@ -1989,6 +1989,23 @@ suite "Pool close":
     check pool.closed
     check pool.active == 1
 
+  test "close with timeout returns at its deadline":
+    # A drain poll that sleeps a full 50ms step overshoots a 5ms timeout by
+    # most of that step, every time. Best of three, so one slow scheduler
+    # wakeup on a loaded runner does not fail it.
+    var fastest = seconds(1)
+    for _ in 0 ..< 3:
+      let pool = makePool()
+      pool.active = 1
+
+      let start = Moment.now()
+      waitFor pool.close(timeout = milliseconds(5))
+      let elapsed = Moment.now() - start
+      check elapsed >= milliseconds(5)
+      check pool.active == 1
+      fastest = min(fastest, elapsed)
+    check fastest < milliseconds(45)
+
   test "release of broken conn tracks pending close":
     let pool = makePool()
     pool.active = 1

@@ -180,8 +180,18 @@ elif hasAsyncDispatch:
       $ns & "ns"
 
   proc toMilliseconds*(d: Duration): int =
-    ## Convert Duration to milliseconds (for asyncdispatch APIs).
+    ## Convert Duration to whole milliseconds, truncating. Round up instead for
+    ## an asyncdispatch timer, as `sleepAsync` and `wait` do: truncated, it
+    ## fires early.
     int(int64(d) div 1_000_000)
+
+  proc toTimerMilliseconds(d: Duration): int =
+    ## `toMilliseconds` rounded up, as chronos rounds its poll timeout:
+    ## truncated, a timer fires early and a sub-millisecond one is a bare
+    ## yield, so a loop sleeping to a deadline spins.
+    result = toMilliseconds(d)
+    if int64(d) mod 1_000_000 > 0:
+      inc result
 
   type Moment* = object ## Monotonic timestamp. API-compatible with chronos.Moment.
     ticks: int64 ## nanoseconds
@@ -242,7 +252,7 @@ elif hasAsyncDispatch:
     ##
     ## Under chronos the ``onOrphan`` argument is accepted but never called —
     ## futures are properly cancelled on timeout and no orphan remains.
-    let ms = toMilliseconds(timeout)
+    let ms = toTimerMilliseconds(timeout)
     let completed = await withTimeout(fut, ms)
     if not completed:
       fut.addCallback(
@@ -318,8 +328,8 @@ elif hasAsyncDispatch:
     allFutures(futs)
 
   proc sleepAsync*(d: Duration): Future[void] =
-    ## Sleep for the given Duration.
-    asyncdispatch.sleepAsync(toMilliseconds(d))
+    ## Sleep for the given Duration, rounded up to whole milliseconds.
+    asyncdispatch.sleepAsync(toTimerMilliseconds(d))
 
   proc sleepMsAsync*(ms: int): Future[void] =
     ## Sleep for `ms` milliseconds.
