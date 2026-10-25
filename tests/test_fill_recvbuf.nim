@@ -292,6 +292,31 @@ suite "fillRecvBuf invariants":
     check finalBufLen == preCallLen - preCallStart
     check finalBufStart == 0
 
+  test "a timeout just short of InfiniteDuration reads as none":
+    # chronos' `wait` overflowed adding it to the clock.
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      var serverClient: MockClient
+      proc serverHandler() {.async.} =
+        serverClient = await acceptAndReady(ms)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await serverFut
+      let reading = conn.fillRecvBuf(nanoseconds(int64.high - 1))
+      let reply = buildReadyForQuery('I')
+      await sendBytes(serverClient, reply)
+      await reading
+      doAssert conn.recvBuf.len - conn.recvBufStart == reply.len
+      await closeClient(serverClient)
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await closeServer(ms)
+
+    waitFor testBody()
+
   when hasChronos:
     test "fillRecvBufDetached refuses csClosed at entry (chronos)":
       ## Regression: an entrance guard must reject a fresh detached read on a

@@ -269,6 +269,35 @@ suite "Large Object deadline":
 
     waitFor t()
 
+  test "loReadAllDeadline reads to EOF under a full-range deadline":
+    # `Moment.now()` plus the longest `Duration` overflowed with a Defect.
+    # Capped instead, each read left a timer queued for good.
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let serverFut = serveReplies(
+        ms,
+        @[
+          buildLoReadReply(buildDataRowText(["A"])), # read as binary: the raw bytes
+          buildLoReadReply(buildDataRowText([""])), # an empty bytea: EOF
+        ],
+      )
+      let conn = await connect(mockConfig(ms.port))
+      let lo = LargeObject(conn: conn, fd: 0, oid: Oid(1))
+      let held = holdTimer()
+      let timers = timerCount()
+      let data = await lo.loReadAllDeadline(nanoseconds(int64.high))
+      doAssert timerCount() == timers
+      cancelTimer(held)
+      doAssert data == @[byte('A')], $data
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await serverFut
+      await closeServer(ms)
+
+    waitFor t()
+
 suite "Large Object precondition errors (no server)":
   test "loRead rejects negative length with ValueError":
     let lo = LargeObject(conn: nil, fd: 1, oid: Oid(1))

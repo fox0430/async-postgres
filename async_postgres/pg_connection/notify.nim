@@ -599,7 +599,7 @@ proc waitNotification*(
     try:
       if timeout > ZeroDuration:
         try:
-          await myWaiter.wait(timeout)
+          await myWaiter.wait(normalizeTimeout(timeout))
         except AsyncTimeoutError:
           raise newException(PgTimeoutError, "Wait for notification timed out")
       else:

@@ -263,7 +263,9 @@ proc cancelWithin(conn: PgConnection, timeout: Duration) {.async.} =
   let side = newPgConnection(conn.host, conn.port, config)
   let abandoned = new(bool)
   try:
-    await side.cancelRound(targets, sslHost, overTls, msg, abandoned).wait(timeout)
+    await side.cancelRound(targets, sslHost, overTls, msg, abandoned).wait(
+      normalizeTimeout(timeout)
+    )
   except AsyncTimeoutError as e:
     # asyncdispatch's `wait` leaves the round running: closing the socket ends
     # the I/O it is stuck in.
@@ -416,7 +418,7 @@ proc waitKeepingOutcome*[T](fut: Future[T], timeout: Duration): Future[T] =
         discard,
     )
   else:
-    fut.wait(timeout)
+    fut.wait(normalizeTimeout(timeout))
 
 template awaitOrInvalidate*(
     connExpr: PgConnection,
@@ -430,7 +432,7 @@ template awaitOrInvalidate*(
   ## re-raised.
   if timeout > ZeroDuration:
     try:
-      dest = await fut.wait(timeout)
+      dest = await fut.wait(normalizeTimeout(timeout))
     except AsyncTimeoutError:
       connExpr.invalidateOnTimeout(reason)
     except CancelledError as timedCancel:
@@ -450,7 +452,7 @@ template awaitVoidOrInvalidate*(
   ## (e.g. `close` on a prepared statement or cursor).
   if timeout > ZeroDuration:
     try:
-      await fut.wait(timeout)
+      await fut.wait(normalizeTimeout(timeout))
     except AsyncTimeoutError:
       connExpr.invalidateOnTimeout(reason)
     except CancelledError as timedCancel:
@@ -555,7 +557,7 @@ proc ping*(conn: PgConnection, timeout = ZeroDuration): Future[void] =
   if timeout > ZeroDuration:
     proc withTimeout(): Future[void] {.async.} =
       try:
-        await perform().wait(timeout)
+        await perform().wait(normalizeTimeout(timeout))
       except AsyncTimeoutError:
         conn.invalidateOnTimeout("Ping timed out")
 

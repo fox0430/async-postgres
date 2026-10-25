@@ -2875,4 +2875,36 @@ suite "close() during a LISTEN round trip":
     check pushErrors == 0
     check outcome == 1
 
+suite "waitNotification timeout":
+  test "one just short of InfiniteDuration reads as none":
+    # chronos' `wait` overflowed adding it to the clock.
+    proc testBody(): Future[string] {.async.} =
+      let ms = startMockServer()
+      let waiting = newFuture[void]("waiting")
+
+      proc serverHandler(): Future[MockClient] {.async.} =
+        let sc = await acceptAndReady(ms)
+        discard await drainFrontendMessage(sc) # LISTEN "x"
+        await sendBytes(sc, buildCommandComplete("LISTEN") & buildReadyForQuery('I'))
+        # Only once the waiter is parked: a queued one returns without a wait.
+        await waiting
+        await sendBytes(sc, buildNotificationResponse(42'i32, "x", "hello"))
+        return sc
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      await conn.listen("x")
+      let notifFut = conn.waitNotification(nanoseconds(int64.high - 1))
+      waiting.complete()
+      result = (await notifFut.wait(seconds(10))).payload
+      let sc = await serverFut
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await closeClient(sc)
+      await closeServer(ms)
+
+    check waitFor(testBody()) == "hello"
+
 listenBackoffUnitMs = savedBackoffUnitMs

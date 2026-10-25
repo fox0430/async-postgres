@@ -1081,8 +1081,9 @@ proc replFillRecvBuf(
   ## timed wake, or ``nil`` once it has been consumed. The caller threads the
   ## returned value back in on the next call.
   ##
-  ## With ``statusInterval == ZeroDuration`` (the default) this blocks until data
-  ## arrives, exactly like a bare ``fillRecvBuf``.
+  ## With ``statusInterval == ZeroDuration`` (the default), or one that
+  ## ``isUnbounded``, which never comes due, this blocks until data arrives,
+  ## exactly like a bare ``fillRecvBuf``.
   ##
   ## With a positive ``statusInterval`` under **chronos**, a single background read
   ## is raced against a timer sized to the time left until the next status update
@@ -1098,7 +1099,7 @@ proc replFillRecvBuf(
   ## The caller still emits status updates opportunistically after each received
   ## message, which covers a busy stream (where WAL actually accumulates); a fully
   ## idle asyncdispatch stream sends nothing until the next message arrives.
-  if statusInterval <= ZeroDuration:
+  if statusInterval <= ZeroDuration or statusInterval.isUnbounded:
     await conn.fillRecvBuf()
     return nil
   when hasChronos:

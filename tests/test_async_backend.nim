@@ -1,4 +1,4 @@
-import std/unittest
+import std/[heapqueue, unittest]
 
 when defined(posix):
   from std/posix import pipe, write, close
@@ -435,3 +435,71 @@ suite "remainingDeadlineDuration":
     let rem = remainingDeadlineDuration(deadline)
     check rem > ZeroDuration
     check rem <= milliseconds(50)
+
+proc timerCount(): int =
+  ## Timers queued on the event loop, including chronos' cleared ones: those
+  ## stay queued until they come due.
+  when hasChronos:
+    getThreadDispatcher().timers.len
+  else:
+    getGlobalDispatcher().timers.len
+
+suite "isUnbounded":
+  test "holds from about 146 years":
+    check not isUnbounded(ZeroDuration)
+    check not isUnbounded(nanoseconds(int64.high div 2 - 1))
+    check isUnbounded(nanoseconds(int64.high div 2))
+    check isUnbounded(InfiniteDuration)
+
+suite "normalizeTimeout":
+  test "keeps a duration shorter than about 146 years":
+    check normalizeTimeout(seconds(5)) == seconds(5)
+    check normalizeTimeout(ZeroDuration) == ZeroDuration
+    let justUnder = nanoseconds(int64.high div 2 - 1)
+    check normalizeTimeout(justUnder) == justUnder
+
+  test "reads a longer one as InfiniteDuration":
+    check normalizeTimeout(nanoseconds(int64.high div 2)) == InfiniteDuration
+    check normalizeTimeout(InfiniteDuration) == InfiniteDuration
+
+suite "deadlineAfter":
+  test "adds a bounded duration":
+    let start = Moment.now()
+    check start.deadlineAfter(milliseconds(50)) - start == milliseconds(50)
+
+  test "leaves an unbounded one with InfiniteDuration remaining":
+    # `Moment.now()` plus the longest `Duration` overflowed.
+    let deadline = Moment.now().deadlineAfter(nanoseconds(int64.high))
+    check remainingDeadlineDuration(deadline) == InfiniteDuration
+
+suite "unbounded timeouts":
+  test "wait arms no timer for InfiniteDuration or one just short of it":
+    # One that far out would stay queued for good, one per call. The held
+    # timer keeps a cleared chronos one queued, as a running server does.
+    proc later(): Future[int] {.async.} =
+      await sleepAsync(milliseconds(1))
+      return 1
+
+    let held = sleepAsync(seconds(60))
+    let before = timerCount()
+    waitFor sleepAsync(milliseconds(1)).wait(InfiniteDuration)
+    check timerCount() == before
+    # chronos arms a timer for anything but `InfiniteDuration`: adding this
+    # one to the clock overflowed.
+    let value = waitFor later().wait(
+      nanoseconds(int64.high - 1),
+      proc(fut: Future[int]) {.gcsafe.} =
+        discard,
+    )
+    check value == 1
+    check timerCount() == before
+    cancelTimer(held)
+
+  when hasAsyncDispatch:
+    test "sleepAsync never ends for an unbounded duration, arming no timer":
+      # chronos' own `sleepAsync` overflows on one.
+      let before = timerCount()
+      let fut = sleepAsync(InfiniteDuration)
+      check timerCount() == before
+      waitFor sleepAsync(milliseconds(1))
+      check not fut.finished

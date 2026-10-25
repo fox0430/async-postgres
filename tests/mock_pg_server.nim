@@ -10,7 +10,23 @@
 ## The chronos and asyncdispatch branches expose identical `MockServer` /
 ## `MockClient` types and procs so tests can be backend-agnostic.
 
+import std/heapqueue
+
 import ../async_postgres/[async_backend, pg_protocol]
+
+proc timerCount*(): int =
+  ## Timers queued on the event loop, including chronos' cleared ones: those
+  ## stay queued until they come due.
+  when hasChronos:
+    getThreadDispatcher().timers.len
+  else:
+    getGlobalDispatcher().timers.len
+
+proc holdTimer*(): Future[void] =
+  ## A timer pending for a minute, as a running server always has one. chronos
+  ## drops a cleared timer only from the head of the queue, so one due later
+  ## stays queued behind this; without it, `timerCount` misses that leak.
+  sleepAsync(seconds(60))
 
 when hasAsyncDispatch:
   import std/asyncnet
