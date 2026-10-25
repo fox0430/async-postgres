@@ -135,6 +135,7 @@ async_postgres.nim	export pg_types
 async_postgres/async_backend.nim	AsyncTimeoutError
 async_postgres/async_backend.nim	CancelledError
 async_postgres/async_backend.nim	Duration
+async_postgres/async_backend.nim	InfiniteDuration
 async_postgres/async_backend.nim	Moment
 async_postgres/async_backend.nim	ZeroDuration
 async_postgres/async_backend.nim	`$`
@@ -158,6 +159,7 @@ async_postgres/async_backend.nim	cancelAndWaitPumped#2
 async_postgres/async_backend.nim	cancelTimer
 async_postgres/async_backend.nim	cancelTimer#2
 async_postgres/async_backend.nim	completed
+async_postgres/async_backend.nim	deadlineAfter
 async_postgres/async_backend.nim	declareAsyncCallback
 async_postgres/async_backend.nim	export asyncdispatch
 async_postgres/async_backend.nim	export chronos
@@ -165,6 +167,7 @@ async_postgres/async_backend.nim	hasAsyncDispatch
 async_postgres/async_backend.nim	hasChronos
 async_postgres/async_backend.nim	hasTls
 async_postgres/async_backend.nim	hours
+async_postgres/async_backend.nim	isUnbounded
 async_postgres/async_backend.nim	makeAsyncSeqByteCallback
 async_postgres/async_backend.nim	makeAsyncSinkByteCallback
 async_postgres/async_backend.nim	milliseconds
@@ -172,6 +175,7 @@ async_postgres/async_backend.nim	minutes
 async_postgres/async_backend.nim	nanoseconds
 async_postgres/async_backend.nim	nanoseconds#2
 async_postgres/async_backend.nim	noCancel
+async_postgres/async_backend.nim	normalizeTimeout
 async_postgres/async_backend.nim	now
 async_postgres/async_backend.nim	registerFdReader
 async_postgres/async_backend.nim	registerFdReader#2

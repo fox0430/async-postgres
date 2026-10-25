@@ -90,6 +90,24 @@ suite "Dial":
 
     check not waitFor testBody()
 
+  test "cancel under a connectTimeout just short of InfiniteDuration":
+    # The cancel waits at least `connectTimeout`; chronos' `wait` overflowed
+    # adding this one to the clock.
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      let accepted = ms.accept()
+      var config = mockConfig(ms.port)
+      config.connectTimeout = nanoseconds(int64.high - 1)
+      let conn = newPgConnection("127.0.0.1", ms.port, config)
+      let cancelling = conn.cancel()
+      let cancelClient = await accepted
+      discard await readN(cancelClient, 16)
+      await closeClient(cancelClient)
+      await cancelling
+      await closeServer(ms)
+
+    waitFor testBody()
+
   test "cancel gives up on a server that never hangs up, releasing its socket":
     proc testBody(): Future[(bool, bool)] {.async.} =
       let ms = startMockServer()

@@ -21,7 +21,10 @@ type
       ## closes it rather than parking it or handing it to a waiter. A borrow
       ## already in flight is not interrupted, and a conn a `connect` has just
       ## produced is handed out once, however long the dial took.
-    maintenanceInterval*: Duration ## Maintenance loop interval (default 30s)
+    maintenanceInterval*: Duration
+      ## Maintenance loop interval (default 30s). One that `isUnbounded`, such
+      ## as `InfiniteDuration`, never runs the loop, and with it the idle
+      ## sweep and the `minSize` refill.
     healthCheckTimeout*: Duration
       ## Ping idle connections older than this before returning (default 5s, ZeroDuration=disabled).
       ## Applies to plaintext connections. For TLS connections, see `tlsHealthCheckTimeout`.
@@ -39,10 +42,11 @@ type
     pingTimeout*: Duration
       ## Max time to wait for a health check ping response (default 5s, ZeroDuration=no timeout)
     acquireTimeout*: Duration
-      ## Deadline for the entire `acquire` call (default 30s, ZeroDuration=no
-      ## timeout). Idle health-check pings, a caller-driven connect, and the
-      ## wait for a released connection all draw from this one budget, so
-      ## acquire latency is bounded by ~`acquireTimeout` rather than
+      ## Deadline for the entire `acquire` call (default 30s, ZeroDuration or
+      ## about 146 years or more=no timeout). Idle health-check pings, a
+      ## caller-driven connect, and the wait for a released connection all
+      ## draw from this one budget, so acquire latency is bounded by
+      ## ~`acquireTimeout` rather than
       ## `pingTimeout*N + connectTimeout + acquireTimeout`.
     maxWaiters*: int = -1
       ## Max queued acquire waiters, and when `pipelined` is true also the max
@@ -513,7 +517,9 @@ proc computeConnectBackoff(initial, maxDelay: Duration, failures: int): Duration
     return ZeroDuration
   result = initial
   for _ in 1 ..< failures:
-    if result >= maxDelay:
+    # `2 * result >= maxDelay`, without the doubling overflowing on a huge
+    # `maxDelay`.
+    if result >= maxDelay - result:
       return maxDelay
     result = result + result
   if result > maxDelay:
@@ -554,7 +560,7 @@ proc scheduleConnectRetry(pool: PgPool, delay: Duration) =
   ## Set the earliest moment a connect may be attempted again. A zero delay
   ## clears the deadline, so a pool with backoff disabled falls back to the
   ## maintenance interval.
-  pool.nextConnectRetryAt = Moment.now() + delay
+  pool.nextConnectRetryAt = Moment.now().deadlineAfter(delay)
 
 proc connectRetryDelay(pool: PgPool): Duration =
   ## The wait after `consecutiveConnectFailures` failed connects.
@@ -967,7 +973,10 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     await noCancel allFutures(closeFuts)
     raise e
 
-  pool.maintenanceTask = maintenanceLoop(pool)
+  # An unbounded interval never runs the loop, and chronos' `sleepAsync`
+  # overflows on one.
+  if not pool.config.maintenanceInterval.isUnbounded:
+    pool.maintenanceTask = maintenanceLoop(pool)
   return pool
 
 proc releaseCore(
@@ -1231,9 +1240,12 @@ proc acquireImpl(pool: PgPool, queue = true): Future[AcquireResult] {.async.} =
   # `acquireTimeout` is a deadline for the whole acquire: idle health-check
   # pings, a caller-driven connect, and the final waiter wait all draw from
   # this one budget. Without it, acquire latency could reach
-  # pingTimeout*N + connectTimeout + acquireTimeout.
-  let hasDeadline = pool.config.acquireTimeout > ZeroDuration
-  let deadline = acquireStart + pool.config.acquireTimeout
+  # pingTimeout*N + connectTimeout + acquireTimeout. One that `isUnbounded`
+  # is no timeout, as zero is.
+  let hasDeadline =
+    pool.config.acquireTimeout > ZeroDuration and
+    not pool.config.acquireTimeout.isUnbounded
+  let deadline = acquireStart.deadlineAfter(pool.config.acquireTimeout)
     # only meaningful when hasDeadline
 
   template remainingBudget(): Duration =
@@ -2103,7 +2115,7 @@ proc awaitPendingOp[T](
   ## `ZeroDuration` stays unlimited (bounded only by `maxWaiters` when set).
   if op.timeout > ZeroDuration:
     try:
-      return await fut.wait(op.timeout)
+      return await fut.wait(normalizeTimeout(op.timeout))
     except AsyncTimeoutError:
       let err = newException(PgTimeoutError, "Pool pipelined operation timed out")
       pool.settleAbandonedPendingOp(op, err)
@@ -2767,6 +2779,8 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"waitKeepingOutcome"
   let remainingSym = bindSym"remainingDeadlineDuration"
+  let normalizeTimeoutSym = bindSym"normalizeTimeout"
+  let deadlineAfterSym = bindSym"deadlineAfter"
   let graceSym = bindSym"rollbackGrace"
   let retireSym = bindSym"retireOnTimeout"
   let bodyCleanup = buildRollbackCleanup(connIdent, graceSym)
@@ -2776,8 +2790,8 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   # set on release, success or failure, as the old try/finally did.
   result = quote:
     let `poolSym` = `poolExpr`
-    let `totalDurSym` = `deadline`
-    let `deadlineMomentSym` = Moment.now() + `totalDurSym`
+    let `totalDurSym` = `normalizeTimeoutSym`(`deadline`)
+    let `deadlineMomentSym` = `deadlineAfterSym`(Moment.now(), `totalDurSym`)
     var `stateSym`: `stateTypeSym`
     new(`stateSym`)
     proc `bodyFnSym`(
@@ -2956,6 +2970,8 @@ macro withTransactionRetryDeadline*(
   let releaseReclaimedSym = bindSym"releaseReclaimed"
   let invalidateCancelSym = bindSym"invalidateOnCancel"
   let remainingSym = bindSym"remainingDeadlineDuration"
+  let normalizeTimeoutSym = bindSym"normalizeTimeout"
+  let deadlineAfterSym = bindSym"deadlineAfter"
   let graceSym = bindSym"rollbackGrace"
   let retireSym = bindSym"retireOnTimeout"
   # The pool variant acquires a fresh connection per attempt, so its cleanup
@@ -2994,8 +3010,8 @@ macro withTransactionRetryDeadline*(
   result = quote:
     let `poolSym` = `poolExpr`
     let `retryOptsSym` = `retryOpts`
-    let `totalDurSym` = `deadline`
-    let `deadlineMomentSym` = Moment.now() + `totalDurSym`
+    let `totalDurSym` = `normalizeTimeoutSym`(`deadline`)
+    let `deadlineMomentSym` = `deadlineAfterSym`(Moment.now(), `totalDurSym`)
     var `stateSym`: `stateTypeSym`
     new(`stateSym`)
     proc `bodyFnSym`(
@@ -3109,11 +3125,12 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## checked-out connection is closed when released.
   ##
   ## When `timeout > ZeroDuration`, `timeout` is a single deadline shared by
-  ## both the drain of `activeCount()` and the background-task drain. Pending
-  ## background closes still running when the deadline elapses are
-  ## cancelled so close() returns promptly. The idle connections, closed
-  ## between the two drains, are not cut short: closing one sends Terminate
-  ## and waits for no reply. Without a timeout (or
+  ## both the drain of `activeCount()` and the background-task drain; one
+  ## that `isUnbounded`, such as `InfiniteDuration`, waits for both with no
+  ## deadline. Pending background closes still running when the deadline
+  ## elapses are cancelled so close() returns promptly. The idle connections,
+  ## closed between the two drains, are not cut short: closing one sends
+  ## Terminate and waits for no reply. Without a timeout (or
   ## `ZeroDuration`), close() does not wait for `activeCount()` and the
   ## background drain waits unbounded.
   ##
@@ -3126,7 +3143,7 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   let hasDeadline = timeout > ZeroDuration
   let closeDeadline =
     if hasDeadline:
-      Moment.now() + timeout
+      Moment.now().deadlineAfter(timeout)
     else:
       Moment.now()
 
@@ -3200,7 +3217,7 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
       let remaining = closeDeadline - Moment.now()
       if remaining > ZeroDuration:
         try:
-          await allFutures(pending).wait(remaining)
+          await allFutures(pending).wait(normalizeTimeout(remaining))
         except AsyncTimeoutError:
           discard
       for f in pending:

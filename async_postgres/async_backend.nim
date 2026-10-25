@@ -22,18 +22,6 @@ when hasChronos:
   import chronos
   export chronos
 
-  proc wait*[T](
-      fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.}
-  ): Future[T] {.async.} =
-    ## Wait for a future with a timeout. Raises AsyncTimeoutError on timeout.
-    ##
-    ## ``onOrphan`` is never called under chronos — the inner future is properly
-    ## cancelled on timeout, so no orphan can exist. Accepted for API parity with
-    ## the asyncdispatch backend, where the hook handles futures that keep running
-    ## after ``wait()`` fires.
-    let _ = onOrphan
-    return await chronos.wait(fut, timeout)
-
   proc sleepMsAsync*(ms: int): Future[void] =
     ## Sleep for `ms` milliseconds. Wrapper around chronos Duration-based API.
     sleepAsync(milliseconds(ms))
@@ -160,6 +148,9 @@ elif hasAsyncDispatch:
     Duration(int64(h) * 3_600_000_000_000)
 
   const ZeroDuration* = Duration(0) ## A zero-length duration.
+  const InfiniteDuration* = Duration(int64.high)
+    ## A timeout that never expires: `wait` arms no timer for it.
+    ## API-compatible with chronos.InfiniteDuration.
 
   proc `==`*(a, b: Duration): bool {.borrow.}
   proc `<`*(a, b: Duration): bool {.borrow.}
@@ -229,45 +220,6 @@ elif hasAsyncDispatch:
       else:
         discard fut.read()
 
-  proc wait*[T](
-      fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.} = nil
-  ): Future[T] {.async.} =
-    ## Wait for a future with a timeout. Raises AsyncTimeoutError on timeout.
-    ## API-compatible with chronos Future.wait().
-    ##
-    ## ``onOrphan`` cleanup hook
-    ## asyncdispatch has **no cancellation**. When a timeout fires, the inner
-    ## future keeps running in the background until its I/O completes. This
-    ## ``onOrphan`` callback is registered on the inner future and called once
-    ## that orphan eventually completes. Use it to close a live connection or
-    ## release other resources the orphan holds. When ``onOrphan`` is omitted
-    ## the default handler drains the orphan's outcome (clears a late failure)
-    ## but does **not** release other resources. Pass an explicit ``onOrphan``
-    ## when the orphan owns a connection or other live resource. The default
-    ## clears the error on ``fut`` itself, so anything else that awaits ``fut``
-    ## after the timeout reads a late failure as a default-valued success; pass
-    ## an explicit ``onOrphan`` (a no-op will do) in that case too. That
-    ## includes the caller's own timeout handler checking ``fut.completed()``:
-    ## a failure landing on the timer's tick is cleared before the handler runs.
-    ##
-    ## Under chronos the ``onOrphan`` argument is accepted but never called —
-    ## futures are properly cancelled on timeout and no orphan remains.
-    let ms = toTimerMilliseconds(timeout)
-    let completed = await withTimeout(fut, ms)
-    if not completed:
-      fut.addCallback(
-        proc() =
-          if not onOrphan.isNil:
-            onOrphan(fut)
-          else:
-            drainOrphan(fut)
-      )
-      raise newException(AsyncTimeoutError, "Timeout")
-    when T is void:
-      fut.read()
-    else:
-      return fut.read()
-
   proc cancelAndWait*(fut: Future[void]): Future[void] {.async.} =
     ## Cancel a future and wait for completion.
     ##
@@ -326,10 +278,6 @@ elif hasAsyncDispatch:
   proc allFuturesCancelling*[T](futs: seq[Future[T]]): Future[void] =
     ## `allFutures`: asyncdispatch has no cancellation to pass on to `futs`.
     allFutures(futs)
-
-  proc sleepAsync*(d: Duration): Future[void] =
-    ## Sleep for the given Duration, rounded up to whole milliseconds.
-    asyncdispatch.sleepAsync(toTimerMilliseconds(d))
 
   proc sleepMsAsync*(ms: int): Future[void] =
     ## Sleep for `ms` milliseconds.
@@ -426,6 +374,38 @@ template makeAsyncSeqByteCallback*(cbType: typedesc, body: untyped): untyped =
         body
     )
 
+const maxDeadline = nanoseconds(int64.high div 2)
+  ## Half the longest `Duration`, about 146 years. See `isUnbounded`.
+
+# Later than any clock reading. See `deadlineAfter`.
+const noDeadline =
+  when hasChronos:
+    Moment.init(int64.high, Nanosecond)
+  else:
+    Moment(ticks: int64.high)
+
+proc isUnbounded*(d: Duration): bool =
+  ## Whether `d` is about 146 years or more, which this library reads as no
+  ## timeout. A timer that far out never fires in the process's life, yet both
+  ## backends queue it until it would; near the top of the range, adding `d`
+  ## to the clock overflows. chronos' `sleepAsync`, re-exported unchanged,
+  ## still overflows on one, unlike the asyncdispatch backend's: check this
+  ## before sleeping on a caller's duration.
+  d >= maxDeadline
+
+proc normalizeTimeout*(d: Duration): Duration =
+  ## `d`, or `InfiniteDuration` when it `isUnbounded`: `wait` arms no timer
+  ## for that.
+  if d.isUnbounded: InfiniteDuration else: d
+
+proc deadlineAfter*(start: Moment, d: Duration): Moment =
+  ## `start + d`, or, for a `d` that `isUnbounded`, a moment no clock reaches,
+  ## with `InfiniteDuration` remaining.
+  if d.isUnbounded:
+    noDeadline
+  else:
+    start + d
+
 proc remainingDeadlineDuration*(deadline: Moment): Duration =
   ## Compute the remaining Duration until `deadline`. When the deadline has
   ## passed, returns 1 millisecond so the next `wait()` / `simpleExec(timeout)`
@@ -441,8 +421,84 @@ proc remainingDeadlineDuration*(deadline: Moment): Duration =
   ## meaningfully enforced — the floor will kick in on the first call and
   ## subsequent ms-level waits still need an event-loop tick to fire. Useful
   ## deadlines for the `*Deadline` helpers start in the tens of milliseconds.
+  ##
+  ## A deadline `deadlineAfter` left unbounded has `InfiniteDuration` left.
   let now = Moment.now()
   if deadline <= now:
     milliseconds(1)
   else:
-    deadline - now
+    normalizeTimeout(deadline - now)
+
+# The timer wrappers follow `isUnbounded`, which needs either backend's
+# `Duration`.
+when hasChronos:
+  proc wait*[T](
+      fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.}
+  ): Future[T] {.async.} =
+    ## Wait for a future with a timeout. Raises AsyncTimeoutError on timeout.
+    ##
+    ## ``onOrphan`` is never called under chronos — the inner future is properly
+    ## cancelled on timeout, so no orphan can exist. Accepted for API parity with
+    ## the asyncdispatch backend, where the hook handles futures that keep running
+    ## after ``wait()`` fires.
+    let _ = onOrphan
+    # chronos arms a timer for anything but `InfiniteDuration`, and adding one
+    # this long to the clock overflows.
+    return await chronos.wait(fut, normalizeTimeout(timeout))
+
+else:
+  proc wait*[T](
+      fut: Future[T], timeout: Duration, onOrphan: proc(fut: Future[T]) {.gcsafe.} = nil
+  ): Future[T] {.async.} =
+    ## Wait for a future with a timeout. Raises AsyncTimeoutError on timeout.
+    ## API-compatible with chronos Future.wait(). A `timeout` that
+    ## `isUnbounded` arms no timer, as chronos arms none for
+    ## `InfiniteDuration`: asyncdispatch would queue one until it fired.
+    ##
+    ## ``onOrphan`` cleanup hook
+    ## asyncdispatch has **no cancellation**. When a timeout fires, the inner
+    ## future keeps running in the background until its I/O completes. This
+    ## ``onOrphan`` callback is registered on the inner future and called once
+    ## that orphan eventually completes. Use it to close a live connection or
+    ## release other resources the orphan holds. When ``onOrphan`` is omitted
+    ## the default handler drains the orphan's outcome (clears a late failure)
+    ## but does **not** release other resources. Pass an explicit ``onOrphan``
+    ## when the orphan owns a connection or other live resource. The default
+    ## clears the error on ``fut`` itself, so anything else that awaits ``fut``
+    ## after the timeout reads a late failure as a default-valued success; pass
+    ## an explicit ``onOrphan`` (a no-op will do) in that case too. That
+    ## includes the caller's own timeout handler checking ``fut.completed()``:
+    ## a failure landing on the timer's tick is cleared before the handler runs.
+    ##
+    ## Under chronos the ``onOrphan`` argument is accepted but never called —
+    ## futures are properly cancelled on timeout and no orphan remains.
+    if timeout.isUnbounded:
+      when T is void:
+        await fut
+        return
+      else:
+        return await fut
+    let ms = toTimerMilliseconds(timeout)
+    let completed = await withTimeout(fut, ms)
+    if not completed:
+      fut.addCallback(
+        proc() =
+          if not onOrphan.isNil:
+            onOrphan(fut)
+          else:
+            drainOrphan(fut)
+      )
+      raise newException(AsyncTimeoutError, "Timeout")
+    when T is void:
+      fut.read()
+    else:
+      return fut.read()
+
+  proc sleepAsync*(d: Duration): Future[void] =
+    ## Sleep for the given Duration, rounded up to whole milliseconds. One that
+    ## `isUnbounded` never ends and arms no timer: with nothing else pending,
+    ## `poll` raises `ValueError` instead of waiting.
+    if d.isUnbounded:
+      newFuture[void]("sleepAsync(InfiniteDuration)")
+    else:
+      asyncdispatch.sleepAsync(toTimerMilliseconds(d))

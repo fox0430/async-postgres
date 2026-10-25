@@ -493,7 +493,7 @@ proc loReadAllDeadline*(
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
   if chunkSize <= 0:
     raise newException(ValueError, "loReadAllDeadline: chunkSize must be positive")
-  let deadlineMoment = Moment.now() + deadline
+  let deadlineMoment = Moment.now().deadlineAfter(deadline)
   result = @[]
   while true:
     let chunk = await lo.loRead(chunkSize, remainingDeadlineDuration(deadlineMoment))
@@ -513,7 +513,7 @@ proc loWriteAllDeadline*(
     raise newException(
       ValueError, "loWriteAllDeadline: chunkSize must be in (0, int32.high]"
     )
-  let deadlineMoment = Moment.now() + deadline
+  let deadlineMoment = Moment.now().deadlineAfter(deadline)
   var offset = 0
   while offset < data.len:
     let endIdx = min(offset + chunkSize, data.len)
@@ -538,7 +538,7 @@ proc loSizeDeadline*(lo: LargeObject, deadline: Duration): Future[int64] {.async
   ## via the same `LargeObject` handle will therefore return no data until
   ## the caller reseeks. The connection is also invalidated on timeout, so
   ## in practice the handle is unusable anyway.
-  let deadlineMoment = Moment.now() + deadline
+  let deadlineMoment = Moment.now().deadlineAfter(deadline)
   let savedPos = await lo.loTell(remainingDeadlineDuration(deadlineMoment))
   result = await lo.loSeek(0, SEEK_END, remainingDeadlineDuration(deadlineMoment))
   discard await lo.loSeek(savedPos, SEEK_SET, remainingDeadlineDuration(deadlineMoment))
@@ -554,7 +554,7 @@ proc loReadStreamDeadline*(
   ## See the "Best-effort" note at the top of the Deadline-bounded API section.
   if chunkSize <= 0:
     raise newException(ValueError, "loReadStreamDeadline: chunkSize must be positive")
-  let deadlineMoment = Moment.now() + deadline
+  let deadlineMoment = Moment.now().deadlineAfter(deadline)
   while true:
     let chunk = await lo.loRead(chunkSize, remainingDeadlineDuration(deadlineMoment))
     if chunk.len == 0:
@@ -574,7 +574,7 @@ proc loWriteStreamDeadline*(
     raise newException(
       ValueError, "loWriteStreamDeadline: chunkSize must be in (0, int32.high]"
     )
-  let deadlineMoment = Moment.now() + deadline
+  let deadlineMoment = Moment.now().deadlineAfter(deadline)
   while true:
     let data = await callback()
     if data.len == 0:

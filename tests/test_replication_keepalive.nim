@@ -519,6 +519,36 @@ suite "Replication: proactive status interval":
     check observedFlushLsn == testStartLsn
     check observedApplyLsn == testStartLsn
 
+  test "logical: an unbounded statusInterval reads as off":
+    # chronos' `sleepAsync` overflowed on the time left until it came due.
+    observedReplyMsgType = '\0'
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        let ssu = await runAutoKeepaliveServer(
+          st, testStartLsn, testXLogWalEnd, testKeepaliveWalEnd, testWalData
+        )
+        observedReplyMsgType = ssu.msgType
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeReplicationCallback:
+        discard msg
+
+      await conn.startReplication(
+        "test_slot", statusInterval = nanoseconds(int64.high - 1), callback = cb
+      )
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check observedReplyMsgType == 'd'
+
 var poisonRaised: bool
 var poisonFinalState: PgConnState
 

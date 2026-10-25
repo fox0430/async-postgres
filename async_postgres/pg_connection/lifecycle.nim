@@ -851,7 +851,7 @@ proc attemptHostTimed(
         )
       else:
         return await attemptHost(config, entry, attrs, target, reached).wait(
-          config.connectTimeout
+          normalizeTimeout(config.connectTimeout)
         )
     except CancelledError as e:
       raise e

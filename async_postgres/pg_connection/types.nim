@@ -2315,7 +2315,7 @@ proc fillRecvBuf*(
           await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize)
         else:
           await conn.reader.readOnce(addr conn.recvBuf[oldLen], RecvBufSize).wait(
-            timeout
+            normalizeTimeout(timeout)
           )
     except AsyncTimeoutError as e:
       conn.recvBuf.setLen(oldLen)

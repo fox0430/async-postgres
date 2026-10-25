@@ -330,6 +330,23 @@ suite "initPoolConfig":
     check maintenanceInterval == seconds(30)
     check maxSizeAfterEdit == 3
 
+  test "an unbounded maintenanceInterval runs no maintenance loop":
+    # chronos' `sleepAsync` overflowed on it.
+    proc testBody() {.async.} =
+      let pool = await newPool(
+        initPoolConfig(
+          ConnConfig(host: "127.0.0.1", port: 1),
+          minSize = 0,
+          maintenanceInterval = InfiniteDuration,
+        )
+      )
+      try:
+        doAssert pool.maintenanceTask == nil
+      finally:
+        await pool.close()
+
+    waitFor testBody()
+
 suite "computeConnectBackoff":
   test "zero failures returns ZeroDuration":
     check computeConnectBackoff(seconds(1), seconds(60), 0) == ZeroDuration
@@ -357,6 +374,12 @@ suite "computeConnectBackoff":
 
   test "initial already exceeds max returns max":
     check computeConnectBackoff(seconds(120), seconds(60), 1) == seconds(60)
+
+  test "a full-range maxDelay caps without overflowing the doubling":
+    # The 35th failure doubled 2^33 seconds past the longest `Duration`.
+    let longest = nanoseconds(int64.high)
+    check computeConnectBackoff(seconds(1), longest, 34) == seconds(1 shl 33)
+    check computeConnectBackoff(seconds(1), longest, 35) == longest
 
 suite "batchTimeout":
   proc op(timeout: Duration): PendingPoolOp =
@@ -1487,6 +1510,55 @@ suite "Pool transaction and pipeline macros":
 
     waitFor t()
 
+  test "withTransactionDeadline commits under a full-range deadline":
+    # `Moment.now()` plus the longest `Duration` overflowed with a Defect.
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[simpleOk("BEGIN", 'T'), simpleOk("UPDATE 1", 'T'), simpleOk("COMMIT", 'I')],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      proc run() {.async.} =
+        pool.withTransactionDeadline(txConn, nanoseconds(int64.high)):
+          discard await txConn.simpleExec("UPDATE t SET v = 1")
+
+      await run().wait(seconds(5))
+      doAssert log[] == @["BEGIN", "UPDATE t SET v = 1", "COMMIT"], $log[]
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline commits under a full-range deadline":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = new seq[string]
+      let serverFut = serveScript(
+        ms,
+        @[simpleOk("BEGIN", 'T'), simpleOk("UPDATE 1", 'T'), simpleOk("COMMIT", 'I')],
+        log,
+      )
+      let pool = await scriptedPool(ms)
+      proc run() {.async.} =
+        pool.withTransactionRetryDeadline(
+          RetryOptions(maxAttempts: 3), txConn, nanoseconds(int64.high)
+        ):
+          discard await txConn.simpleExec("UPDATE t SET v = 1")
+
+      await run().wait(seconds(5))
+      doAssert log[] == @["BEGIN", "UPDATE t SET v = 1", "COMMIT"], $log[]
+
+      await pool.close()
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+    waitFor t()
+
   test "withTransactionDeadline rolls back a raising body and re-raises it":
     proc t() {.async.} =
       let ms = startMockServer()
@@ -1989,6 +2061,21 @@ suite "Pool close":
     check pool.closed
     check pool.active == 1
 
+  test "close with a full-range timeout waits for active connections":
+    # `Moment.now()` plus the longest `Duration` overflowed with a Defect.
+    let pool = makePool()
+    pool.active = 1
+
+    proc releaseAfter(pool: PgPool) {.async.} =
+      await sleepAsync(milliseconds(20))
+      pool.active.dec
+
+    let releaseFut = releaseAfter(pool)
+    waitFor pool.close(timeout = nanoseconds(int64.high))
+    waitFor releaseFut
+    check pool.closed
+    check pool.active == 0
+
   test "close with timeout returns at its deadline":
     # A drain poll that sleeps a full 50ms step overshoots a 5ms timeout by
     # most of that step, every time. Best of three, so one slow scheduler
@@ -2137,6 +2224,18 @@ suite "Pool close":
       discard waitFor pool.exec("SELECT 1", timeout = milliseconds(30))
     check pool.pendingOps.len == 0
     pool.dispatchScheduled = false
+
+  test "pipelined timeout just short of InfiniteDuration reads as none":
+    # chronos' `wait` overflowed adding it to the clock.
+    let pool = makePool()
+    let op = PendingPoolOp(
+      kind: popExec,
+      execFut: newFuture[CommandResult]("op"),
+      timeout: nanoseconds(int64.high - 1),
+    )
+    let waiting = pool.awaitPendingOp(op, op.execFut)
+    op.execFut.complete(CommandResult(commandTag: "SELECT 1"))
+    check (waitFor waiting).commandTag == "SELECT 1"
 
   test "settleAbandonedPendingOp removes only the abandoned op":
     let pool = makePool()
@@ -3268,6 +3367,30 @@ suite "Acquire timeout":
 
       let acquired = await acquireFut
       doAssert acquired == conn
+
+    waitFor t()
+
+  test "acquire under a full-range acquireTimeout waits for a released connection":
+    # The deadline is computed with or without a timeout: `Moment.now()` plus
+    # the longest `Duration` failed every acquire with a Defect. Capped
+    # instead, the wait left a timer queued for good.
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.config.acquireTimeout = nanoseconds(int64.high)
+      pool.active = 1
+
+      let held = holdTimer()
+      let timers = timerCount()
+      let acquireFut = pool.acquire()
+      doAssert not acquireFut.finished
+      doAssert pool.waiters.len == 1
+
+      let conn = mockConn()
+      pool.release(conn)
+
+      doAssert (await acquireFut) == conn
+      doAssert timerCount() == timers
+      cancelTimer(held)
 
     waitFor t()
 
@@ -5079,6 +5202,19 @@ suite "Connect refusals":
     pool.config.connectBackoffInitial = ZeroDuration
     doAssert pool.noteConnectFailure(refusal) == cfRefused
     doAssert pool.canAttemptConnect()
+
+    waitFor pool.close()
+
+  test "a refusal under a full-range connectBackoffMax holds without overflowing":
+    # A refusal backs off straight to the cap: `Moment.now()` plus the longest
+    # `Duration` overflowed with a Defect.
+    let pool = makePool(minSize = 1, maxSize = 1)
+    pool.config.connectBackoffInitial = milliseconds(10)
+    pool.config.connectBackoffMax = nanoseconds(int64.high)
+
+    pool.recordRefusal()
+    doAssert not pool.canAttemptConnect()
+    doAssert pool.nextConnectRetryAt - Moment.now() > hours(24 * 365 * 100)
 
     waitFor pool.close()
 

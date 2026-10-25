@@ -148,6 +148,81 @@ suite "transaction: mock round trip":
 
     waitFor t()
 
+# `Moment.now()` plus the longest `Duration` overflowed with a Defect before
+# the body ran. Capped instead, each statement left a timer queued for good.
+suite "transaction: a full-range deadline":
+  proc serveOk(ms: MockServer, n: int, queries: ref seq[string]) {.async.} =
+    ## Answer `n` simple queries, in a transaction until COMMIT.
+    let client = await acceptAndReady(ms)
+    for _ in 0 ..< n:
+      queries[].add(await readSimpleQuery(client))
+      let tx = if queries[^1] == "COMMIT": 'I' else: 'T'
+      await client.sendBytes(buildCommandComplete(queries[^1]) & buildReadyForQuery(tx))
+    discard await drainFrontendMessage(client)
+    await closeClient(client)
+
+  let longest = nanoseconds(int64.high)
+
+  test "withTransactionDeadline commits":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let queries = new seq[string]
+      let serverFut = serveOk(ms, 3, queries)
+      let conn = await connect(mockConfig(ms.port))
+      let held = holdTimer()
+      let timers = timerCount()
+      conn.withTransactionDeadline(longest):
+        discard await conn.simpleExec("SELECT 1")
+      doAssert timerCount() == timers
+      cancelTimer(held)
+      doAssert queries[] == @["BEGIN", "SELECT 1", "COMMIT"], $queries[]
+      await conn.close()
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "withTransactionRetryDeadline commits":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let queries = new seq[string]
+      let serverFut = serveOk(ms, 3, queries)
+      let conn = await connect(mockConfig(ms.port))
+      let held = holdTimer()
+      let timers = timerCount()
+      conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), longest):
+        discard await conn.simpleExec("SELECT 1")
+      doAssert timerCount() == timers
+      cancelTimer(held)
+      doAssert queries[] == @["BEGIN", "SELECT 1", "COMMIT"], $queries[]
+      await conn.close()
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "withSavepointDeadline releases":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let queries = new seq[string]
+      let serverFut = serveOk(ms, 5, queries)
+      let conn = await connect(mockConfig(ms.port))
+      let held = holdTimer()
+      let timers = timerCount()
+      conn.withTransaction:
+        conn.withSavepointDeadline("sp1", longest):
+          discard await conn.simpleExec("SELECT 1")
+      doAssert timerCount() == timers
+      cancelTimer(held)
+      doAssert queries[1].startsWith("SAVEPOINT"), $queries[]
+      doAssert queries[3].startsWith("RELEASE"), $queries[]
+      doAssert queries[4] == "COMMIT", $queries[]
+      await conn.close()
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
+
 when hasAsyncDispatch:
   from std/os import sleep
 

@@ -861,6 +861,8 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   let bodyFnSym = macroSym(nskProc, "txBodyDeadline")
   let dSym = macroSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
+  let normalizeTimeoutSym = bindSym"normalizeTimeout"
+  let deadlineAfterSym = bindSym"deadlineAfter"
   let graceSym = bindSym"rollbackGrace"
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
   let commitSym = bindSym"commitTx"
@@ -870,8 +872,8 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   result = quote:
     let `connSym` = `connExpr`
     `connSym`.checkTxIdle()
-    let `totalDurSym` = `deadline`
-    let `deadlineMomentSym` = Moment.now() + `totalDurSym`
+    let `totalDurSym` = `normalizeTimeoutSym`(`deadline`)
+    let `deadlineMomentSym` = `deadlineAfterSym`(Moment.now(), `totalDurSym`)
     proc `bodyFnSym`(): Future[void] {.async.} =
       try:
         discard await `connSym`.simpleExec(
@@ -949,6 +951,8 @@ macro withTransactionRetryDeadline*(
   let bodyFnSym = macroSym(nskProc, "txBodyRetryDeadline")
   let dSym = macroSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
+  let normalizeTimeoutSym = bindSym"normalizeTimeout"
+  let deadlineAfterSym = bindSym"deadlineAfter"
   let graceSym = bindSym"rollbackGrace"
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
   let commitSym = bindSym"commitTx"
@@ -976,8 +980,8 @@ macro withTransactionRetryDeadline*(
     let `connSym` = `connExpr`
     `connSym`.checkTxIdle()
     let `retryOptsSym` = `retryOpts`
-    let `totalDurSym` = `deadline`
-    let `deadlineMomentSym` = Moment.now() + `totalDurSym`
+    let `totalDurSym` = `normalizeTimeoutSym`(`deadline`)
+    let `deadlineMomentSym` = `deadlineAfterSym`(Moment.now(), `totalDurSym`)
     proc `bodyFnSym`(): Future[void] {.async.} =
       try:
         discard await `connSym`.simpleExec(
@@ -1049,6 +1053,8 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   let bodyFnSym = macroSym(nskProc, "spBodyDeadline")
   let dSym = macroSym(nskLet, "d")
   let remainingSym = bindSym"remainingDeadlineDuration"
+  let normalizeTimeoutSym = bindSym"normalizeTimeout"
+  let deadlineAfterSym = bindSym"deadlineAfter"
   let graceSym = bindSym"rollbackGrace"
   let quoteIdentSym = bindSym"quoteIdentifier"
 
@@ -1061,8 +1067,8 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   result = quote:
     let `connSym` = `connExpr`
     let `spNameSym` = `quoteIdentSym`(`nameExpr`)
-    let `totalDurSym` = `deadline`
-    let `deadlineMomentSym` = Moment.now() + `totalDurSym`
+    let `totalDurSym` = `normalizeTimeoutSym`(`deadline`)
+    let `deadlineMomentSym` = `deadlineAfterSym`(Moment.now(), `totalDurSym`)
     proc `bodyFnSym`(): Future[void] {.async.} =
       try:
         discard await `connSym`.simpleExec(

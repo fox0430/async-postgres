@@ -131,3 +131,35 @@ suite "simple_query: mock round trip":
       await ms.closeServer()
 
     waitFor t()
+
+  test "a timeout just short of InfiniteDuration reads as none":
+    # chronos' `wait` arms a timer for anything but `InfiniteDuration`: adding
+    # this one to the clock overflowed.
+    let nearlyInfinite = nanoseconds(int64.high - 1)
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        discard await drainFrontendMessage(client)
+        await client.sendBytes(
+          buildCommandComplete("SELECT 1") & buildReadyForQuery('I')
+        )
+        discard await drainFrontendMessage(client) # ping
+        await client.sendBytes(buildEmptyQueryResponse() & buildReadyForQuery('I'))
+        discard await drainFrontendMessage(client) # Terminate
+        await closeClient(client)
+
+      let serverFut = serve()
+      var config = mockConfig(ms.port)
+      config.connectTimeout = nearlyInfinite
+      let conn = await connect(config)
+      let tag = await conn.simpleExec("SELECT 1", timeout = nearlyInfinite)
+      doAssert tag.commandTag == "SELECT 1"
+      await conn.ping(nearlyInfinite)
+      await sleepAsync(milliseconds(1)).waitKeepingOutcome(nearlyInfinite)
+      doAssert conn.state == csReady
+      await conn.close()
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
