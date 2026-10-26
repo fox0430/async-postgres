@@ -14,18 +14,30 @@ import std/heapqueue
 
 import ../async_postgres/[async_backend, pg_protocol]
 
-proc timerCount*(): int =
-  ## Timers queued on the event loop, including chronos' cleared ones: those
-  ## stay queued until they come due.
+when hasAsyncDispatch:
+  from std/monotimes import getMonoTime, ticks
+
+proc farTimerCount*(): int =
+  ## Timers queued on the event loop and due over a day out, including
+  ## chronos' cleared ones: those stay queued until they come due. Nearer ones
+  ## earlier tests left can come due mid-test.
   when hasChronos:
-    getThreadDispatcher().timers.len
+    let horizon = Moment.now() + hours(24)
+    let loop = getThreadDispatcher()
+    for i in 0 ..< loop.timers.len:
+      if loop.timers[i].finishAt > horizon:
+        inc result
   else:
-    getGlobalDispatcher().timers.len
+    let horizon = getMonoTime().ticks + int64(hours(24))
+    let loop = getGlobalDispatcher()
+    for i in 0 ..< loop.timers.len:
+      if loop.timers[i].finishAt.ticks > horizon:
+        inc result
 
 proc holdTimer*(): Future[void] =
   ## A timer pending for a minute, as a running server always has one. chronos
   ## drops a cleared timer only from the head of the queue, so one due later
-  ## stays queued behind this; without it, `timerCount` misses that leak.
+  ## stays queued behind this; without it, `farTimerCount` misses that leak.
   sleepAsync(seconds(60))
 
 when hasAsyncDispatch:

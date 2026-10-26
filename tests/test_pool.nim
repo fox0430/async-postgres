@@ -3389,7 +3389,7 @@ suite "Acquire timeout":
       pool.active = 1
 
       let held = holdTimer()
-      let timers = timerCount()
+      let timers = farTimerCount()
       let acquireFut = pool.acquire()
       doAssert not acquireFut.finished
       doAssert pool.waiters.len == 1
@@ -3398,7 +3398,7 @@ suite "Acquire timeout":
       pool.release(conn)
 
       doAssert (await acquireFut) == conn
-      doAssert timerCount() == timers
+      doAssert farTimerCount() == timers
       cancelTimer(held)
 
     waitFor t()
