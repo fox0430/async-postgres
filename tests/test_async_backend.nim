@@ -7,6 +7,7 @@ import ../async_postgres/async_backend
 
 when hasAsyncDispatch:
   import std/strutils
+  from std/monotimes import getMonoTime, ticks
 
 # Regression tests for makeAsyncSeqByteCallback. The asyncdispatch branch used
 # to construct the Future manually, so an early `return <expr>` inside `body`
@@ -453,13 +454,22 @@ suite "remainingDeadlineDuration":
     check rem > ZeroDuration
     check rem <= milliseconds(50)
 
-proc timerCount(): int =
-  ## Timers queued on the event loop, including chronos' cleared ones: those
-  ## stay queued until they come due.
+proc farTimerCount(): int =
+  ## Timers queued on the event loop and due over a day out, including
+  ## chronos' cleared ones: those stay queued until they come due. Nearer ones
+  ## earlier tests left can come due mid-test.
   when hasChronos:
-    getThreadDispatcher().timers.len
+    let horizon = Moment.now() + hours(24)
+    let loop = getThreadDispatcher()
+    for i in 0 ..< loop.timers.len:
+      if loop.timers[i].finishAt > horizon:
+        inc result
   else:
-    getGlobalDispatcher().timers.len
+    let horizon = getMonoTime().ticks + int64(hours(24))
+    let loop = getGlobalDispatcher()
+    for i in 0 ..< loop.timers.len:
+      if loop.timers[i].finishAt.ticks > horizon:
+        inc result
 
 suite "isUnbounded":
   test "holds from about 146 years":
@@ -498,9 +508,9 @@ suite "unbounded timeouts":
       return 1
 
     let held = sleepAsync(seconds(60))
-    let before = timerCount()
+    let before = farTimerCount()
     waitFor sleepAsync(milliseconds(1)).wait(InfiniteDuration)
-    check timerCount() == before
+    check farTimerCount() == before
     # chronos arms a timer for anything but `InfiniteDuration`: adding this
     # one to the clock overflowed.
     let value = waitFor later().wait(
@@ -509,14 +519,14 @@ suite "unbounded timeouts":
         discard,
     )
     check value == 1
-    check timerCount() == before
+    check farTimerCount() == before
     cancelTimer(held)
 
   when hasAsyncDispatch:
     test "sleepAsync never ends for an unbounded duration, arming no timer":
       # chronos' own `sleepAsync` overflows on one.
-      let before = timerCount()
+      let before = farTimerCount()
       let fut = sleepAsync(InfiniteDuration)
-      check timerCount() == before
+      check farTimerCount() == before
       waitFor sleepAsync(milliseconds(1))
       check not fut.finished
