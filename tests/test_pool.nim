@@ -8331,7 +8331,9 @@ suite "Acquire and maintenance close/cancel races":
 
         let fut = pool.acquire()
         doAssert (await drainFrontendMessage(st)).msgType == 'Q'
-        await cancelAndWait(fut)
+        # On Windows the ping's send can still be settling here; a bare
+        # cancelAndWait then parks its retry where no event wakes the loop.
+        await cancelAndWaitPumped(fut)
         doAssert fut.cancelled()
         doAssert pool.active == 0
         doAssert pool.idle.len == 0
