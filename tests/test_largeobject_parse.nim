@@ -312,9 +312,9 @@ suite "Large Object deadline":
       let conn = await connect(mockConfig(ms.port))
       let lo = LargeObject(conn: conn, fd: 0, oid: Oid(1))
       let held = holdTimer()
-      let timers = timerCount()
+      let timers = farTimerCount()
       let data = await lo.loReadAllDeadline(nanoseconds(int64.high))
-      doAssert timerCount() == timers
+      doAssert farTimerCount() == timers
       cancelTimer(held)
       doAssert data == @[byte('A')], $data
       try:

@@ -170,10 +170,10 @@ suite "transaction: a full-range deadline":
       let serverFut = serveOk(ms, 3, queries)
       let conn = await connect(mockConfig(ms.port))
       let held = holdTimer()
-      let timers = timerCount()
+      let timers = farTimerCount()
       conn.withTransactionDeadline(longest):
         discard await conn.simpleExec("SELECT 1")
-      doAssert timerCount() == timers
+      doAssert farTimerCount() == timers
       cancelTimer(held)
       doAssert queries[] == @["BEGIN", "SELECT 1", "COMMIT"], $queries[]
       await conn.close()
@@ -189,10 +189,10 @@ suite "transaction: a full-range deadline":
       let serverFut = serveOk(ms, 3, queries)
       let conn = await connect(mockConfig(ms.port))
       let held = holdTimer()
-      let timers = timerCount()
+      let timers = farTimerCount()
       conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), longest):
         discard await conn.simpleExec("SELECT 1")
-      doAssert timerCount() == timers
+      doAssert farTimerCount() == timers
       cancelTimer(held)
       doAssert queries[] == @["BEGIN", "SELECT 1", "COMMIT"], $queries[]
       await conn.close()
@@ -208,11 +208,11 @@ suite "transaction: a full-range deadline":
       let serverFut = serveOk(ms, 5, queries)
       let conn = await connect(mockConfig(ms.port))
       let held = holdTimer()
-      let timers = timerCount()
+      let timers = farTimerCount()
       conn.withTransaction:
         conn.withSavepointDeadline("sp1", longest):
           discard await conn.simpleExec("SELECT 1")
-      doAssert timerCount() == timers
+      doAssert farTimerCount() == timers
       cancelTimer(held)
       doAssert queries[1].startsWith("SAVEPOINT"), $queries[]
       doAssert queries[3].startsWith("RELEASE"), $queries[]
