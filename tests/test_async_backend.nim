@@ -5,6 +5,9 @@ when defined(posix):
 
 import ../async_postgres/async_backend
 
+when hasAsyncDispatch:
+  import std/strutils
+
 # Regression tests for makeAsyncSeqByteCallback. The asyncdispatch branch used
 # to construct the Future manually, so an early `return <expr>` inside `body`
 # skipped the fut.complete call — chronos's {.async.} rewrote `return` but
@@ -286,6 +289,20 @@ suite "asyncSpawn":
     asyncSpawn(setFlag())
     waitFor sleepMsAsync(10)
     check ran
+
+  when hasAsyncDispatch:
+    test "a failed future surfaces as an AssertionDefect":
+      proc boom() {.async.} =
+        await sleepMsAsync(1)
+        raise newException(ValueError, "boom")
+
+      var msg = ""
+      try:
+        asyncSpawn(boom())
+        waitFor sleepMsAsync(20)
+      except AssertionDefect as e:
+        msg = e.msg
+      check "Async procedure failed: boom" in msg
 
 suite "allFutures":
   test "empty list completes immediately":

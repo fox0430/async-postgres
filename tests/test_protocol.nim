@@ -1588,6 +1588,42 @@ suite "Utility":
     let fields: seq[ErrorField] = @[]
     check getErrorField(fields, 'S') == ""
 
+  test "typeByte matches the protocol's type byte for every kind":
+    # An enum-indexed literal: a new kind fails to compile until listed here.
+    const wire: array[BackendMessageKind, char] = [
+      bmkAuthenticationOk: 'R',
+      bmkAuthenticationCleartextPassword: 'R',
+      bmkAuthenticationMD5Password: 'R',
+      bmkAuthenticationSASL: 'R',
+      bmkAuthenticationSASLContinue: 'R',
+      bmkAuthenticationSASLFinal: 'R',
+      bmkBackendKeyData: 'K',
+      bmkBindComplete: '2',
+      bmkCloseComplete: '3',
+      bmkCommandComplete: 'C',
+      bmkCopyInResponse: 'G',
+      bmkCopyOutResponse: 'H',
+      bmkCopyBothResponse: 'W',
+      bmkCopyData: 'd',
+      bmkCopyDone: 'c',
+      bmkDataRow: 'D',
+      bmkEmptyQueryResponse: 'I',
+      bmkErrorResponse: 'E',
+      bmkNegotiateProtocolVersion: 'v',
+      bmkNoData: 'n',
+      bmkNoticeResponse: 'N',
+      bmkNotificationResponse: 'A',
+      bmkParameterDescription: 't',
+      bmkParameterStatus: 'S',
+      bmkParseComplete: '1',
+      bmkPortalSuspended: 's',
+      bmkReadyForQuery: 'Z',
+      bmkRowDescription: 'T',
+    ]
+    for kind in BackendMessageKind:
+      checkpoint($kind)
+      check typeByte(kind) == wire[kind]
+
 suite "Backend decoding - edge cases":
   proc buildMsg(msgType: char, body: seq[byte]): seq[byte] =
     result = @[byte(msgType)]
@@ -2606,6 +2642,18 @@ suite "waitNotification defensive branch":
       doAssert conn.notifyWaiter == nil
 
     waitFor t()
+
+  test "registerNotifyWaiter rejects a second waiter and keeps the first":
+    var conn = mockNotifyConn()
+    let first = newFuture[void]("first")
+    let second = newFuture[void]("second")
+    conn.registerNotifyWaiter(first)
+    expect PgStateError:
+      conn.registerNotifyWaiter(second)
+    check conn.notifyWaiter == first
+    check not conn.unregisterNotifyWaiter(second)
+    check conn.unregisterNotifyWaiter(first)
+    check conn.notifyWaiter == nil
 
   test "a waiter's notification survives a queue overflow":
     # Regression: parking the waiter's notification at the head of the shared

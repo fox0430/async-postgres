@@ -969,6 +969,33 @@ suite "E2E: Convenience Query Methods":
 
     waitFor t()
 
+  test "typed, Opt, and OrDefault queryValue reject zero-column rows":
+    # A row is there, so none of the no-rows/NULL fallbacks may answer for it.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let sql = "SELECT FROM generate_series(1, 1)"
+
+      template expectNoColumns(call: untyped) =
+        block:
+          var raised = false
+          try:
+            discard await call
+          except PgTypeError:
+            raised = true
+          doAssert raised, astToStr(call)
+
+      expectNoColumns(conn.queryValue(int32, sql))
+      expectNoColumns(conn.queryValueOpt(sql))
+      expectNoColumns(conn.queryValueOpt(int32, sql))
+      expectNoColumns(conn.queryValueOrDefault(sql, default = "d"))
+      expectNoColumns(conn.queryValueOrDefault(int32, sql, default = 0'i32))
+      expectNoColumns(conn.queryValueOrDefault(sql, default = 0'i32))
+      doAssert conn.state == csReady
+
+      await conn.close()
+
+    waitFor t()
+
   test "prepared statement: zero-column rows":
     # Execute gets no RowDescription either, so the RowData comes from prepare.
     proc t() {.async.} =
@@ -1228,6 +1255,36 @@ suite "E2E: Convenience Query Methods":
 
       discard await conn.exec("SELECT 1")
       doAssert conn.stmtCache.len == 0
+
+      await conn.close()
+
+    waitFor t()
+
+  test "stmt cache: queryDirect and execDirect with capacity=0":
+    # The uncached path parses the unnamed statement and needs Describe(Portal)
+    # for the row metadata a cache hit or miss would have supplied.
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      conn.stmtCacheCapacity = 0
+
+      for _ in 0 .. 1:
+        let qr = await conn.queryDirect(
+          "SELECT $1::int4 + 1 AS n, $2::text AS s", 41'i32, "direct"
+        )
+        doAssert conn.stmtCache.len == 0
+        doAssert qr.fields.len == 2
+        doAssert qr.fields[0].name == "n"
+        doAssert qr.fields[0].typeOid == OidInt4
+        doAssert qr.rows.len == 1
+        doAssert qr.rows[0].getInt(0) == 42
+        doAssert qr.rows[0].getStr(1) == "direct"
+
+        let tag = await conn.execDirect("SELECT $1::int4", 1'i32)
+        doAssert tag == "SELECT 1"
+        doAssert conn.stmtCache.len == 0
+
+      let named = await conn.query("SELECT count(*)::int4 FROM pg_prepared_statements")
+      doAssert named.rows[0].getInt(0) == 0
 
       await conn.close()
 

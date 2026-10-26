@@ -41,6 +41,12 @@ suite "core: buildBeginSql":
     check buildBeginSql(opts) ==
       "BEGIN ISOLATION LEVEL READ COMMITTED READ WRITE NOT DEFERRABLE"
 
+  test "remaining isolation levels":
+    check buildBeginSql(TransactionOptions(isolation: ilRepeatableRead)) ==
+      "BEGIN ISOLATION LEVEL REPEATABLE READ"
+    check buildBeginSql(TransactionOptions(isolation: ilReadUncommitted)) ==
+      "BEGIN ISOLATION LEVEL READ UNCOMMITTED"
+
 suite "core: isRetryableTxError":
   test "matching SQLSTATE retries":
     let e = (ref PgQueryError)(sqlState: "40001", msg: "serialization")

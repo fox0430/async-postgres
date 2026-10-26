@@ -79,3 +79,78 @@ suite "lookupTypeOids: hostile OID text":
       await closeServer(ms)
 
     waitFor t()
+
+suite "lookupTypeOids: NULL and empty catalog replies":
+  test "rows with a NULL name or OID are skipped, a NULL typarray reads as 0":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st)
+        var resp: seq[byte]
+        resp.add(oidRowDescription())
+        resp.add(buildDataRowOpt(["", "23", "1007"], [true, false, false]))
+        resp.add(buildDataRowOpt(["missing", "", ""], [false, true, true]))
+        resp.add(buildDataRowOpt(["no_array", "42", ""], [false, false, true]))
+        resp.add(buildCommandComplete("SELECT 3"))
+        resp.add(buildReadyForQuery('I'))
+        await sendBytes(st, resp)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let oids = await conn.lookupTypeOids(@["int4", "missing", "no_array"])
+      doAssert oids.len == 1, "expected 1 row, got " & $oids.len
+      doAssert oids["no_array"] == (oid: 42'i32, arrayOid: 0'i32)
+
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a reply without a result set yields an empty table":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        discard await drainFrontendMessage(st)
+        await sendBytes(st, buildReadyForQuery('I'))
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let oids = await conn.lookupTypeOids(@["int4"])
+      doAssert oids.len == 0
+      doAssert conn.state == csReady
+
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "an empty name is rejected before contacting the server":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await acceptAndReady(ms)
+        let (msgType, _) = await drainFrontendMessage(st)
+        doAssert msgType == 'X', "expected only the Terminate, got " & msgType
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      var raised = false
+      try:
+        discard await conn.lookupTypeOids(@["int4", ""])
+      except PgTypeError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady
+
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor t()

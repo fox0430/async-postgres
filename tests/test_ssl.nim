@@ -28,7 +28,7 @@ when hasChronos:
   import ../async_postgres/pg_bearssl {.all.}
   import chronos/streams/tlsstream
   import bearssl/abi/bearssl_ssl as bssl
-  import bearssl/x509
+  import bearssl/[ec, x509]
 
 proc testCaCert(): string =
   doAssert ensureTestCerts(),
@@ -3094,6 +3094,21 @@ when hasChronos:
         let truncated = key[0 ..< key.find("-----END")]
         check "Invalid PEM encoding" in loadKeyError(truncated)
 
+    test "key DER that ends before its algorithm or curve is left to BearSSL":
+      # Each stops the pre-check at a different missing field; reading on would
+      # index past the DER.
+      let version = @[0x02'u8, 0x01, 0x01]
+      for (label, der) in [
+        ("PRIVATE KEY", @[0x30'u8]), # SEQUENCE tag without a length
+        ("PRIVATE KEY", derTlv(0x30, newSeq[byte]())), # no version
+        ("PRIVATE KEY", derTlv(0x30, @[0x02'u8, 0x01, 0x00])), # no algorithm
+        ("EC PRIVATE KEY", @[0x04'u8, 0x00]), # not a SEQUENCE
+        ("EC PRIVATE KEY", derTlv(0x30, version)), # no privateKey
+        ("EC PRIVATE KEY", derTlv(0x30, version & @[0x04'u8, 0x01, 0x01])), # no [0]
+      ]:
+        # BearSSL's errors carry its code; the pre-check's do not.
+        check "(code: " in loadKeyError(derPem(label, der))
+
     test "a 4-byte DER length at the sign bit is rejected, not wrapped":
       # 0x80000000 wraps negative in a 32-bit int and passed the bounds check.
       # On the OID, an unchecked length would index past the data.
@@ -3190,6 +3205,97 @@ when hasChronos:
         "-----BEGIN CERTIFICATE-----\n" & "QUFBQQ==\n" & "-----END CERTIFICATE-----\n"
       expect PgError:
         discard parseTrustAnchors(pem)
+
+    # `openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256` and
+    # `-newkey ed25519`, keys discarded.
+    const
+      ecCaCert =
+        "-----BEGIN CERTIFICATE-----\n" &
+        "MIIBgDCCASegAwIBAgIUH6ykHUZ6VL3URAUId84kZOgw1QswCgYIKoZIzj0EAwIw\n" &
+        "FTETMBEGA1UEAwwKRUMgVGVzdCBDQTAgFw0yNjEwMjYxMDM4MjFaGA8yMTI2MTAw\n" &
+        "MjEwMzgyMVowFTETMBEGA1UEAwwKRUMgVGVzdCBDQTBZMBMGByqGSM49AgEGCCqG\n" &
+        "SM49AwEHA0IABKhoQVoTOvNooQtw1V2Ii3KmKZR/bsCWnD0bZ8n1qr8h9orzohA8\n" &
+        "3JIc+cNn3g+57KP4oCP/grVC1XCVD6KhVw2jUzBRMB0GA1UdDgQWBBSMziPgfhTb\n" &
+        "Trxpvv8ZVxqtOeGeZjAfBgNVHSMEGDAWgBSMziPgfhTbTrxpvv8ZVxqtOeGeZjAP\n" &
+        "BgNVHRMBAf8EBTADAQH/MAoGCCqGSM49BAMCA0cAMEQCIHwyb8+bAOHGk/FMjB/e\n" &
+        "zXgLdb0AZPG7k4ekP2if5USjAiA2X/XoMBNyux2sAryrMT2xvK8CHsOUlaHMqVq3\n" &
+        "dWLBnA==\n" & "-----END CERTIFICATE-----\n"
+      ed25519CaCert =
+        "-----BEGIN CERTIFICATE-----\n" &
+        "MIIBSjCB/aADAgECAhQwCVBsntEtqbSEEuz1FA1v0SfqEjAFBgMrZXAwGjEYMBYG\n" &
+        "A1UEAwwPRWQyNTUxOSBUZXN0IENBMCAXDTI2MTAyNjEwNDAyOFoYDzIxMjYxMDAy\n" &
+        "MTA0MDI4WjAaMRgwFgYDVQQDDA9FZDI1NTE5IFRlc3QgQ0EwKjAFBgMrZXADIQB9\n" &
+        "xJ88bOfZNqI9zSpjs+vt1bLwVEPb9sFKYtzgIunst6NTMFEwHQYDVR0OBBYEFAQ6\n" &
+        "xdjDmoH+DueK3OKkQncqHvmkMB8GA1UdIwQYMBaAFAQ6xdjDmoH+DueK3OKkQncq\n" &
+        "HvmkMA8GA1UdEwEB/wQFMAMBAf8wBQYDK2VwA0EA+iB5St8tBY/v/O130hRv7g09\n" &
+        "2HmlG1jRhwuVzZ1Ulx51qtNW6EPykGjGnG6+tsdODXMlRM4y7Pz9HdAbXij5Bw==\n" &
+        "-----END CERTIFICATE-----\n"
+      # ecCaCert with an empty EC point, and with an RSA key of modulus 0. The
+      # stale signatures don't matter: anchor decoding does not check them.
+      emptyEcPointCert =
+        "-----BEGIN CERTIFICATE-----\n" &
+        "MIIBPjCB5qADAgECAhQfrKQdRnpUvdREBQh3ziRk6DDVCzAKBggqhkjOPQQDAjAV\n" &
+        "MRMwEQYDVQQDDApFQyBUZXN0IENBMCAXDTI2MTAyNjEwMzgyMVoYDzIxMjYxMDAy\n" &
+        "MTAzODIxWjAVMRMwEQYDVQQDDApFQyBUZXN0IENBMBgwEwYHKoZIzj0CAQYIKoZI\n" &
+        "zj0DAQcDAQCjUzBRMB0GA1UdDgQWBBSMziPgfhTbTrxpvv8ZVxqtOeGeZjAfBgNV\n" &
+        "HSMEGDAWgBSMziPgfhTbTrxpvv8ZVxqtOeGeZjAPBgNVHRMBAf8EBTADAQH/MAoG\n" &
+        "CCqGSM49BAMCA0cAMEQCIHwyb8+bAOHGk/FMjB/ezXgLdb0AZPG7k4ekP2if5USj\n" &
+        "AiA2X/XoMBNyux2sAryrMT2xvK8CHsOUlaHMqVq3dWLBnA==\n" &
+        "-----END CERTIFICATE-----\n"
+      zeroRsaModulusCert =
+        "-----BEGIN CERTIFICATE-----\n" &
+        "MIIBQjCB6qADAgECAhQfrKQdRnpUvdREBQh3ziRk6DDVCzAKBggqhkjOPQQDAjAV\n" &
+        "MRMwEQYDVQQDDApFQyBUZXN0IENBMCAXDTI2MTAyNjEwMzgyMVoYDzIxMjYxMDAy\n" &
+        "MTAzODIxWjAVMRMwEQYDVQQDDApFQyBUZXN0IENBMBwwDQYJKoZIhvcNAQEBBQAD\n" &
+        "CwAwCAIBAAIDAQABo1MwUTAdBgNVHQ4EFgQUjM4j4H4U2068ab7/GVcarTnhnmYw\n" &
+        "HwYDVR0jBBgwFoAUjM4j4H4U2068ab7/GVcarTnhnmYwDwYDVR0TAQH/BAUwAwEB\n" &
+        "/zAKBggqhkjOPQQDAgNHADBEAiB8Mm/PmwDhxpPxTIwf3s14C3W9AGTxu5OHpD9o\n" &
+        "n+VEowIgNl/16DATcrsdrAK8qzE9sbyvAh7DlJWhzKlat3ViwZw=\n" &
+        "-----END CERTIFICATE-----\n"
+
+    test "an EC CA certificate becomes an EC trust anchor":
+      privateAccess(TrustAnchorStore)
+      var parsed = parseTrustAnchors(ecCaCert) # var: `addr` of its backing
+      check parsed.store.anchors.len == 1
+      let anchor = parsed.store.anchors[0]
+      check anchor.pkey.keyType == byte(KEYTYPE_EC)
+      check anchor.pkey.key.ec.curve == EC_secp256r1
+      check anchor.pkey.key.ec.qlen == 65 # uncompressed P-256 point
+      check anchor.flags == cuint(X509_TA_CA)
+      # BearSSL keeps these pointers; they must not point into the decoder.
+      check anchor.dn.data == addr parsed.backing[^2][0]
+      check anchor.pkey.key.ec.q == addr parsed.backing[^1][0]
+      let mixed = parseTrustAnchors(testCaCert() & ecCaCert)
+      check mixed.store.anchors.len == 2
+      check mixed.store.anchors[0].pkey.keyType == byte(KEYTYPE_RSA)
+      check mixed.store.anchors[1].pkey.keyType == byte(KEYTYPE_EC)
+
+    test "a certificate BearSSL cannot decode does not drop the rest of the bundle":
+      privateAccess(TrustAnchorStore)
+      expect PgConfigError:
+        discard parseTrustAnchors(ed25519CaCert)
+      let mixed = parseTrustAnchors(ed25519CaCert & testCaCert())
+      check mixed.store.anchors.len == 1
+      check mixed.store.anchors[0].pkey.keyType == byte(KEYTYPE_RSA)
+
+    test "a certificate whose public key decodes empty is skipped, not copied from":
+      # BearSSL decodes both; copying their key would index an empty buffer.
+      privateAccess(TrustAnchorStore)
+      for pem in [emptyEcPointCert, zeroRsaModulusCert]:
+        expect PgConfigError:
+          discard parseTrustAnchors(pem)
+        let mixed = parseTrustAnchors(pem & testCaCert())
+        check mixed.store.anchors.len == 1
+        check mixed.store.anchors[0].pkey.key.rsa.nlen > 0
+
+    test "a certificate without CA basic constraints is pinned, not an issuer":
+      # BearSSL lets only X509_TA_CA anchors sign other certificates.
+      privateAccess(TrustAnchorStore)
+      # gen_certs.sh gives server.crt a SAN extension only.
+      let leaf = parseTrustAnchors(readCertFile("server.crt"))
+      check leaf.store.anchors.len == 1
+      check leaf.store.anchors[0].flags == 0
+      check parseTrustAnchors(testCaCert()).store.anchors[0].flags == cuint(X509_TA_CA)
 
   suite "cdecl callback len guards":
     test "appendDnCallback appends normal-size chunks":

@@ -682,6 +682,52 @@ suite "Close":
     check cluster.replica.closed
     check cluster.replica.idle.len == 0
 
+  when hasChronos:
+    # A cancellation is the only error a pool's close() raises. Each pool's
+    # unreleased borrow holds its close() in the drain, so the one awaited when
+    # the cancel lands is cut short there, before its idle sweep.
+    test "a cancelled close still finishes the replica's close, then raises":
+      proc t() {.async.} =
+        let cluster = makeCluster()
+        cluster.primary.active = 1
+        cluster.replica.active = 1
+        cluster.primary.idle.addLast(
+          PooledConn(conn: mockConn(csClosed), lastUsedAt: Moment.now())
+        )
+        cluster.replica.idle.addLast(
+          PooledConn(conn: mockConn(csClosed), lastUsedAt: Moment.now())
+        )
+
+        let closeFut = cluster.close(milliseconds(200))
+        await cancelAndWait(closeFut)
+        doAssert closeFut.cancelled()
+        doAssert cluster.primary.idle.len == 1
+        doAssert cluster.replica.idle.len == 0
+
+      waitFor t()
+
+    test "a close cancelled while awaiting the replica raises the cancellation":
+      proc t() {.async.} =
+        let cluster = makeCluster()
+        cluster.replica.active = 1
+        cluster.primary.idle.addLast(
+          PooledConn(conn: mockConn(csClosed), lastUsedAt: Moment.now())
+        )
+        cluster.replica.idle.addLast(
+          PooledConn(conn: mockConn(csClosed), lastUsedAt: Moment.now())
+        )
+
+        let closeFut = cluster.close(seconds(5))
+        # The primary has nothing to drain, so its close ends within the call.
+        doAssert cluster.primary.idle.len == 0
+        let start = Moment.now()
+        await cancelAndWait(closeFut)
+        doAssert closeFut.cancelled()
+        doAssert Moment.now() - start < seconds(2)
+        doAssert cluster.replica.idle.len == 1
+
+      waitFor t()
+
 suite "Write routing":
   test "writeConnection routes to primary":
     let cluster = makeCluster()
@@ -878,6 +924,52 @@ suite "newPoolCluster concurrent warmup":
     waitFor t()
     check raised
     check replicaTerminated
+
+  test "closes successfully-warmed primary when replica connect fails":
+    # The mirror of the case above: the replica's error is the one raised.
+    var deadPort = 0
+    var primaryTerminated = false
+
+    proc t(): Future[ref CatchableError] {.async.} =
+      let deadMs = startMockServer()
+      deadPort = deadMs.port
+      await closeServer(deadMs)
+
+      let primaryMs = startMockServer()
+      proc primaryHandler() {.async.} =
+        var c: MockClient
+        try:
+          c = await primaryMs.accept()
+          await drainStartupMessage(c)
+          await sendFullHandshake(c, params = primaryHandshakeParams)
+          let msg = await drainFrontendMessage(c)
+          if msg.msgType == 'X':
+            primaryTerminated = true
+        except CatchableError:
+          discard
+        if c != nil:
+          try:
+            await closeClient(c)
+          except CatchableError:
+            discard
+
+      let serverFut = primaryHandler()
+      var pCfg =
+        initPoolConfig(clusterMockConfig(primaryMs.port), minSize = 1, maxSize = 1)
+      var rCfg = initPoolConfig(clusterMockConfig(deadPort), minSize = 1, maxSize = 1)
+      pCfg.connConfig.connectTimeout = seconds(2)
+      rCfg.connConfig.connectTimeout = milliseconds(300)
+      try:
+        discard await newPoolCluster(pCfg, rCfg)
+      except CatchableError as e:
+        result = e
+      await serverFut
+      await closeServer(primaryMs)
+
+    let err = waitFor t()
+    check err of PgConnectionError
+    check (":" & $deadPort & ":") in err.msg
+    check primaryTerminated
 
   when hasChronos:
     test "a cancelled newPoolCluster closes the pool that came up and the dial under way":

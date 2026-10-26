@@ -175,6 +175,34 @@ suite "Large Object parsers: hostile server text via the public API":
 
     waitFor t()
 
+  test "loWriteAll and loWriteAllDeadline reject a short lowrite count":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let serverFut = serveScalarResults(ms, @["3", "1", "1"])
+      let conn = await connect(mockConfig(ms.port))
+      let lo = await conn.loOpen(Oid(1), INV_WRITE)
+      let payload = @[byte 0x68, byte 0x69]
+      var msg = ""
+      try:
+        await lo.loWriteAll(payload)
+      except PgError as e:
+        msg = e.msg
+      doAssert "loWriteAll: partial write (1/2 bytes)" in msg, msg
+      msg = ""
+      try:
+        await lo.loWriteAllDeadline(payload, seconds(5))
+      except PgError as e:
+        msg = e.msg
+      doAssert "loWriteAllDeadline: partial write (1/2 bytes)" in msg, msg
+      try:
+        await conn.close()
+      except CatchableError:
+        discard
+      await serverFut
+      await closeServer(ms)
+
+    waitFor t()
+
   test "loCreate surfaces an out-of-range OID text as PgTypeError":
     proc t() {.async.} =
       let ms = startMockServer()
