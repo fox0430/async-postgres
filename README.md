@@ -36,6 +36,7 @@ Async PostgreSQL client in Nim.
 
 ### Types
 - Typed parameters (`pgParams` / `toPgParam`) and row accessors (`getStr`, `getInt`, ...)
+- Row-to-object mapping by column name (`row.to(User)`, `qr.to(seq[User])`)
 - UUID type (`PgUuid`)
 - Numeric type (`PgNumeric` — arbitrary-precision decimal)
 - JSON/JSONB (`JsonNode`)

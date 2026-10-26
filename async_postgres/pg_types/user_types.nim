@@ -415,40 +415,6 @@ proc compositeDateTimeToText(dt: DateTime): string =
   checkPgDateTime(dt, " in composite field")
   pgUtcText(dt.toTime(), "MM-dd HH:mm:ss'.'ffffffzzz")
 
-macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
-  ## Generate ``toPgParam`` for a Nim object as a PostgreSQL composite type.
-  ## Each field is sent as text inside the composite text format.
-  ## Fields map by position, in both directions: the object's field order must
-  ## match the composite's attribute order. Neither wire format carries names,
-  ## so a swap of same-typed fields is not detected.
-  ## When OID is 0 (default), PostgreSQL infers the type from context.
-  ## The generated overload lives in the calling module, where the ``sql``
-  ## macro and ``pgParams`` resolve it alongside the built-in ones.
-  ## ``queryDirect`` / ``execDirect`` take their parameters as
-  ## separate arguments and cannot encode these types.
-  let tImpl = T.getType[1]
-  let tSym = tImpl
-  result = newStmtList()
-  result.add quote do:
-    proc toPgParam*(v: `tSym`): PgParam =
-      var fields: seq[Option[string]]
-      for _, val in v.fieldPairs:
-        when typeof(val) is Option:
-          if val.isSome:
-            when typeof(val.get) is DateTime:
-              fields.add(some(compositeDateTimeToText(val.get)))
-            else:
-              fields.add(some($val.get))
-          else:
-            fields.add(none(string))
-        elif typeof(val) is DateTime:
-          fields.add(some(compositeDateTimeToText(val)))
-        else:
-          fields.add(some($val))
-      PgParam(
-        oid: `oid`, format: 0'i16, value: some(toBytes(encodeCompositeText(fields)))
-      )
-
 proc compositeFieldFromText[T](s: string): T =
   ## Parse a single composite text field to the target type.
   when T is string:
@@ -608,6 +574,46 @@ proc getCompositeOpt*[T: object](row: Row, col: int): Option[T] =
     none(T)
   else:
     some(getComposite[T](row, col))
+
+macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
+  ## Generate ``toPgParam`` and ``get`` for a Nim object as a PostgreSQL
+  ## composite type. Each field is sent as text inside the composite text
+  ## format; ``get`` reads with ``getComposite``, so ``row.get(col, T)``,
+  ## ``queryValue`` and ``to`` read ``T``.
+  ## Fields map by position, in both directions: the object's field order must
+  ## match the composite's attribute order. Neither wire format carries names,
+  ## so a swap of same-typed fields is not detected.
+  ## When OID is 0 (default), PostgreSQL infers the type from context.
+  ## The generated overloads live in the calling module, where the ``sql``
+  ## macro and ``pgParams`` resolve them alongside the built-in ones; ``to``
+  ## reads ``T`` only where that module is imported.
+  ## ``queryDirect`` / ``execDirect`` take their parameters as
+  ## separate arguments and cannot encode these types.
+  let tImpl = T.getType[1]
+  let tSym = tImpl
+  result = newStmtList()
+  result.add quote do:
+    proc toPgParam*(v: `tSym`): PgParam =
+      var fields: seq[Option[string]]
+      for _, val in v.fieldPairs:
+        when typeof(val) is Option:
+          if val.isSome:
+            when typeof(val.get) is DateTime:
+              fields.add(some(compositeDateTimeToText(val.get)))
+            else:
+              fields.add(some($val.get))
+          else:
+            fields.add(none(string))
+        elif typeof(val) is DateTime:
+          fields.add(some(compositeDateTimeToText(val)))
+        else:
+          fields.add(some($val))
+      PgParam(
+        oid: `oid`, format: 0'i16, value: some(toBytes(encodeCompositeText(fields)))
+      )
+
+    proc get*(row: Row, col: int, _: typedesc[`tSym`]): `tSym` =
+      getComposite[`tSym`](row, col)
 
 # User-defined domain type support
 

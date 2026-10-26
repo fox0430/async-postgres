@@ -433,6 +433,11 @@ suite "User-defined composite":
     check abs(pt.x - 3.14) < 1e-10
     check abs(pt.y - 2.72) < 1e-10
 
+  test "pgComposite declares get in the registering module":
+    let row: Row = @[some(toBytes("(3.14,2.72)")), none(seq[byte])]
+    check row.get(0, PointRecord) == getComposite[PointRecord](row, 0)
+    check row.get(1, Option[PointRecord]).isNone
+
   test "getComposite text format with string":
     let row: Row = @[some(toBytes("(Bob,25,88.5)"))]
     let p = getComposite[PersonRecord](row, 0)

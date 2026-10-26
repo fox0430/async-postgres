@@ -453,6 +453,7 @@ async_postgres/pg_sql_lexer.nim	sqlParseLoop
 async_postgres/pg_types/accessors.nim	cellInfo
 async_postgres/pg_types/accessors.nim	checkArrayElemOid
 async_postgres/pg_types/accessors.nim	checkScalarColOid
+async_postgres/pg_types/accessors.nim	colTypeOid
 async_postgres/pg_types/accessors.nim	nameAccessor
 async_postgres/pg_types/accessors.nim	optAccessor
 async_postgres/pg_types/accessors.nim	wireOidIsDynamic
@@ -539,3 +540,5 @@ async_postgres/pg_types/encoding.nim	pgTimestampText
 async_postgres/pg_types/encoding.nim	pgTimestampTzText
 async_postgres/pg_types/encoding.nim	pgUtcText
 async_postgres/pg_types/encoding.nim	writePointAt
+async_postgres/pg_types/row_mapping.nim	mapRow
+async_postgres/pg_types/row_mapping.nim	resolveRowColumns

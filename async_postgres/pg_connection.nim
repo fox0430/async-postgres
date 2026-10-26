@@ -158,6 +158,7 @@ export simple_query.len
 export simple_query.columnIndex
 export simple_query.rows
 export simple_query.items
+export simple_query.to
 export simple_query.quoteIdentifier
 export simple_query.quoteLiteral
 export simple_query.cancel

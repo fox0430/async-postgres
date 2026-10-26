@@ -1,7 +1,8 @@
 import std/[json, macros, options, times]
 
 import pg_protocol
-import pg_types/[core, array, encoding, decoding, accessors, user_types, ranges]
+import
+  pg_types/[core, array, encoding, decoding, accessors, user_types, ranges, row_mapping]
 
 # `core` — promised type-conversion API. Grammar helpers stay `*` for sibling
 # decoders; list enum values too (`except PgIntParse` still leaves `pipOk`).
@@ -77,14 +78,20 @@ export decoding.parseTextArray
 
 # `accessors` — typed row accessors and query-result helpers. The codegen
 # templates are sibling-only (expanded from this file and `ranges.nim`), as are
-# the raw cell / wire-OID helpers `ranges.nim` and `user_types.nim` build on.
+# the raw cell / wire-OID helpers `ranges.nim`, `user_types.nim` and
+# `row_mapping.nim` build on.
 export accessors except
   nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid,
-  wireOidIsDynamic
+  wireOidIsDynamic, colTypeOid
 
 # `ranges` — range/multirange construction and typed parameters; the raw
 # binary decoders were privatised in the module itself.
 export ranges
+
+# `row_mapping` — `to(row, T)` and its field pragmas. `mapRow` and
+# `resolveRowColumns` (the column cache behind `to(QueryResult, seq[T])`) are
+# sibling-only.
+export row_mapping except mapRow, resolveRowColumns
 
 # Name-based accessors bound here so both accessors.nim (non-range getters)
 # and ranges.nim (Range/Multirange getters) are visible when `nameAccessor`

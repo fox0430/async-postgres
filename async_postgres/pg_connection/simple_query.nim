@@ -5,9 +5,10 @@
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[options, strutils, tables]
+import std/[options, strutils, tables, typetraits]
 
 import ../[async_backend, pg_errors, pg_gensym, pg_protocol, pg_types]
+import ../pg_types/row_mapping
 import types, buffer_io, ssl
 
 when hasAsyncDispatch:
@@ -28,8 +29,6 @@ proc rows*(qr: QueryResult): seq[Row] =
   ## Return all rows as lightweight Row views into the flat buffer.
   if qr.data == nil:
     return @[]
-  if qr.fields.len > 0 and qr.data.fields.len == 0:
-    qr.data.fields = qr.fields
   result = newSeq[Row](qr.rowCount)
   for i in 0 ..< qr.rowCount:
     result[i] = initRow(qr.data, i)
@@ -37,10 +36,30 @@ proc rows*(qr: QueryResult): seq[Row] =
 iterator items*(qr: QueryResult): Row =
   ## Iterate over all rows in the query result.
   if qr.data != nil:
-    if qr.fields.len > 0 and qr.data.fields.len == 0:
-      qr.data.fields = qr.fields
     for i in 0 ..< qr.rowCount:
       yield initRow(qr.data, i)
+
+proc to*[T: object | tuple | ref object](qr: QueryResult, _: typedesc[seq[T]]): seq[T] =
+  ## Read every row into a ``T`` as ``to(Row, T)`` does, matching the columns
+  ## once for the whole result — including one with no rows, which still
+  ## reports a field that has no column or a tuple of the wrong length. A
+  ## statement that returns no columns, such as an ``UPDATE`` without
+  ## ``RETURNING`` or ``SELECT FROM t``, raises ``PgTypeError``.
+  ##
+  ## .. code-block:: nim
+  ##   let users = (await conn.query("SELECT id, name FROM users")).to(seq[User])
+  # Nil data means no RowDescription; `SELECT FROM t` sends one with no fields.
+  if qr.data == nil or qr.data.numCols == 0:
+    raise newException(
+      PgTypeError,
+      name(T) &
+        ": the statement returns no columns (an INSERT, UPDATE or DELETE needs RETURNING)",
+    )
+  var cols: seq[int]
+  resolveRowColumns(qr.data, T, cols)
+  result = newSeqOfCap[T](qr.rowCount)
+  for i in 0 ..< qr.rowCount:
+    result.add(mapRow(initRow(qr.data, i), T, cols))
 
 # State assertion
 
@@ -134,6 +153,7 @@ proc simpleQueryImpl(
     of bmkRowDescription:
       current =
         QueryResult(fields: pumpMsg.fields, data: newRowData(int16(pumpMsg.fields.len)))
+      current.data.fields = current.fields
     of bmkCommandComplete:
       current.commandTag = pumpMsg.commandTag
       results.add(current)

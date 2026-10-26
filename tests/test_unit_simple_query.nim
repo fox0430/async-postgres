@@ -4,8 +4,9 @@
 ## `simpleExec` / `simpleQuery` / `ping`.
 
 import std/[unittest, strutils, importutils]
+from std/times import DateTime, Month, dateTime, utc, `==`
 
-import ../async_postgres/[async_backend, pg_connection, pg_protocol]
+import ../async_postgres/[async_backend, pg_connection, pg_protocol, pg_types]
 import ../async_postgres/pg_connection/simple_query {.all.}
 import ../async_postgres/pg_connection/types {.all.}
 
@@ -96,6 +97,32 @@ suite "simple_query: mock round trip":
       doAssert qrs[0].len == 1
       await conn.ping()
       doAssert conn.state == csReady
+      await conn.close()
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "simpleQuery rows carry their column names and types":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      proc serve() {.async.} =
+        let client = await acceptAndReady(ms)
+        discard await drainFrontendMessage(client)
+        await client.sendBytes(
+          buildRowDescriptionFields(@[("day", OidDate, 4'i16)]) &
+            buildDataRowText(["2024-01-15"]) & buildCommandComplete("SELECT 1") &
+            buildReadyForQuery('I')
+        )
+        discard await drainFrontendMessage(client) # Terminate
+        await closeClient(client)
+
+      let serverFut = serve()
+      let conn = await connect(mockConfig(ms.port))
+      let qr = (await conn.simpleQuery("SELECT current_date AS day"))[0]
+      # By name and by the date type, from the row alone.
+      doAssert qr.rows[0].to(tuple[day: DateTime]).day ==
+        dateTime(2024, mJan, 15, zone = utc())
       await conn.close()
       await serverFut
       await ms.closeServer()
