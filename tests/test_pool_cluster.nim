@@ -959,6 +959,9 @@ suite "newPoolCluster concurrent warmup":
       var rCfg = initPoolConfig(clusterMockConfig(deadPort), minSize = 1, maxSize = 1)
       pCfg.connConfig.connectTimeout = seconds(2)
       rCfg.connConfig.connectTimeout = milliseconds(300)
+      when defined(windows):
+        # Windows retries a refused SYN for about 2s before failing the dial.
+        rCfg.connConfig.connectTimeout = seconds(3)
       try:
         discard await newPoolCluster(pCfg, rCfg)
       except CatchableError as e:
