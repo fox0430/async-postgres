@@ -17,6 +17,7 @@ import ../async_postgres/[async_backend, pg_protocol, pg_types]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_client
 import ../async_postgres/pg_client/core
+from ../async_postgres/pg_connection/types import recvBufLen
 
 import ./mock_pg_server
 
@@ -297,6 +298,124 @@ suite "COPY IN final-phase race (stray CopyDone after server abort)":
       except PgQueryError as e:
         raised = true
         doAssert e.sqlState == "23505"
+      connState = conn.state
+      let res = await conn.simpleQuery("SELECT 42")
+      doAssert res[0].rows[0][0].get().toString() == "42"
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check connState == csReady
+
+  test "copyInStream callback error after a server abort skips CopyFail":
+    var raised = false
+    var connState: PgConnState
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      let tail =
+        buildErrorResponse("23505", "duplicate key value") & buildReadyForQuery('I')
+      var watching = false
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        await drainStartupMessage(st)
+        await sendFullHandshake(st)
+        let q = await drainFrontendMessage(st)
+        doAssert q.msgType == 'Q'
+        await sendBytes(st, buildCopyInResponse())
+        # Apart from CopyInResponse, so it lands on the background read.
+        while not watching:
+          await sleepAsync(milliseconds(5))
+        await sendBytes(st, tail)
+        # The backend left copy-in mode: a CopyFail here would be stray.
+        let q2 = await drainFrontendMessage(st)
+        doAssert q2.msgType == 'Q', "got " & q2.msgType
+        doAssert "SELECT 42" in queryText(q2.body)
+        var resp: seq[byte]
+        resp.add(buildRowDescription("?column?"))
+        resp.add(buildDataRowText(["42"]))
+        resp.add(buildCommandComplete("SELECT 1"))
+        resp.add(buildReadyForQuery('I'))
+        await sendBytes(st, resp)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      let cb = makeCopyInCallback:
+        watching = true # the read is armed before the first callback
+        # It has settled once the buffer holds exactly the abort.
+        while conn.recvBufLen() != tail.len:
+          await sleepAsync(milliseconds(5))
+        raise newException(CatchableError, "callback failed")
+      try:
+        discard await conn.copyInStream("COPY t FROM STDIN", cb)
+      except PgQueryError as e:
+        raised = true
+        doAssert e.sqlState == "23505" # the server's error, not the callback's
+      connState = conn.state
+      let res = await conn.simpleQuery("SELECT 42")
+      doAssert res[0].rows[0][0].get().toString() == "42"
+      await conn.close()
+      await serverFut
+      await closeServer(ms)
+
+    waitFor testBody()
+    check raised
+    check connState == csReady
+
+  test "copyIn drains a violation reply whose bytes arrive split":
+    var raised = false
+    var connState: PgConnState
+
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      proc serverHandler() {.async.} =
+        let st = await ms.accept()
+        await drainStartupMessage(st)
+        await sendFullHandshake(st)
+        let q = await drainFrontendMessage(st)
+        doAssert q.msgType == 'Q'
+        await sendBytes(st, buildCopyInResponse())
+        let d = await drainFrontendMessage(st)
+        doAssert d.msgType == 'd'
+        let c = await drainFrontendMessage(st)
+        doAssert c.msgType == 'c'
+        var violation: seq[byte]
+        violation.add(
+          buildErrorResponse(
+            "08P01", "unexpected message type 0x63 during COPY from stdin"
+          )
+        )
+        violation.add(buildReadyForQuery('I'))
+        # Only a partial violation message follows the abort's ReadyForQuery,
+        # so the drain has to read the rest from the socket.
+        var tail: seq[byte]
+        tail.add(buildErrorResponse("22P02", "invalid input syntax"))
+        tail.add(buildReadyForQuery('I'))
+        tail.add(violation[0 ..< 3])
+        await sendBytes(st, tail)
+        await sleepAsync(milliseconds(50))
+        await sendBytes(st, violation[3 .. ^1])
+        let q2 = await drainFrontendMessage(st)
+        doAssert q2.msgType == 'Q'
+        doAssert "SELECT 42" in queryText(q2.body)
+        var resp: seq[byte]
+        resp.add(buildRowDescription("?column?"))
+        resp.add(buildDataRowText(["42"]))
+        resp.add(buildCommandComplete("SELECT 1"))
+        resp.add(buildReadyForQuery('I'))
+        await sendBytes(st, resp)
+        await closeClient(st)
+
+      let serverFut = serverHandler()
+      let conn = await connect(mockConfig(ms.port))
+      try:
+        discard await conn.copyIn("COPY t FROM STDIN", @["abc\n".toBytes()])
+      except PgQueryError as e:
+        raised = true
+        doAssert e.sqlState == "22P02"
       connState = conn.state
       let res = await conn.simpleQuery("SELECT 42")
       doAssert res[0].rows[0][0].get().toString() == "42"

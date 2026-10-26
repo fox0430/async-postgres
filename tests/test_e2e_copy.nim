@@ -649,6 +649,37 @@ suite "E2E: COPY IN Stream":
 
     waitFor t()
 
+  test "copyInStream with COPY TO STDOUT raises without pulling callback":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS test_copyin_stream_wrongdir")
+      discard await conn.exec("CREATE TABLE test_copyin_stream_wrongdir (id int)")
+      discard await conn.exec("INSERT INTO test_copyin_stream_wrongdir VALUES (1), (2)")
+
+      var callCount = 0
+      let cb = makeCopyInCallback:
+        inc callCount
+        "3\n".toBytes()
+
+      var msg = ""
+      try:
+        discard
+          await conn.copyInStream("COPY test_copyin_stream_wrongdir TO STDOUT", cb)
+      except PgQueryError as e:
+        msg = e.msg
+      doAssert "copyOutStream" in msg, msg
+      doAssert callCount == 0
+      doAssert conn.state == csReady
+
+      # The streamed-out rows were drained, so the next query reads its own reply.
+      let res = await conn.query("SELECT count(*) FROM test_copyin_stream_wrongdir")
+      doAssert res.rows[0].getStr(0) == "2"
+
+      discard await conn.exec("DROP TABLE test_copyin_stream_wrongdir")
+      await conn.close()
+
+    waitFor t()
+
   test "copyInStream large data (10000 rows)":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

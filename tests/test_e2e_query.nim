@@ -260,6 +260,50 @@ suite "E2E: Prepared Statement Edge Cases":
 
     waitFor t()
 
+  test "execute widens binary parameters to the types prepare inferred":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let stmt = await conn.prepare(
+        "coerce_widen", "SELECT $1::int8, $2::int8, $3::int4, $4::float8, $5::int8"
+      )
+      let res = await stmt.execute(
+        @[
+          toPgParam(42'i32),
+          toPgParam(-7'i16),
+          toPgParam(300'i16),
+          toPgParam(1.5'f32),
+          toPgParam(none(int32)),
+        ]
+      )
+      doAssert res.rows[0].getInt64(0) == 42
+      doAssert res.rows[0].getInt64(1) == -7
+      doAssert res.rows[0].getInt(2) == 300
+      doAssert res.rows[0].getFloat(3) == 1.5
+      doAssert res.rows[0].isNull(4)
+      await stmt.close()
+      await conn.close()
+
+    waitFor t()
+
+  test "execute rejects a binary parameter it cannot coerce before sending":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let stmt = await conn.prepare("coerce_reject", "SELECT $1")
+      doAssert stmt.paramOids == @[25'i32] # untyped $1 resolves to text
+      var msg = ""
+      try:
+        discard await stmt.execute(@[toPgParam(42'i32)])
+      except PgTypeError as e:
+        msg = e.msg
+      doAssert "client sent OID 23" in msg, msg
+      doAssert "server expects OID 25" in msg, msg
+      doAssert conn.state == csReady
+      doAssert (await stmt.execute(@[toPgParam("ok")])).rows[0].getStr(0) == "ok"
+      await stmt.close()
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: encode-time exception leaves connection usable":
   ## The NUL rejection is a `PgError` on every path, direct and pipelined
   ## alike: the encoder's own check is what both reach, so the caller has one

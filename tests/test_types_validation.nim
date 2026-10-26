@@ -2093,3 +2093,205 @@ suite "scalar payload errors carry the column number":
       "Column 0 is NULL"
     check msgOf(mkRow(@[none(seq[byte])], @[mkField(90123'i32, 0'i16)]).getHstore(0)) ==
       "Column 0 is NULL"
+
+suite "accessor NULL and shape guards":
+  template msgOf(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
+  proc binBytes(oid: int32, data: seq[byte]): Row =
+    mkRow(@[some(data)], @[mkField(oid, 1'i16)])
+
+  proc txtRow(oid: int32, s: string): Row =
+    mkRow(@[some(toBytes(s))], @[mkField(oid, 0'i16)])
+
+  test "every scalar getter reports a NULL cell on both formats":
+    let conv = initPgMoneyConventions()
+    template expectNull(oid: int32, getter: untyped) =
+      for format in [0'i16, 1'i16]:
+        let it {.inject.} = mkRow(@[none(seq[byte])], @[mkField(oid, format)])
+        checkpoint("OID " & $oid & ", format " & $format)
+        check msgOf(getter) == "Column 0 is NULL"
+
+    expectNull(OidText):
+      it.getStr(0)
+    expectNull(OidInt4):
+      it.getInt(0)
+    expectNull(OidInt2):
+      it.getInt16(0)
+    expectNull(OidInt8):
+      it.getInt64(0)
+    expectNull(OidFloat8):
+      it.getFloat(0)
+    expectNull(OidFloat4):
+      it.getFloat32(0)
+    expectNull(OidNumeric):
+      it.getNumeric(0)
+    expectNull(OidMoney):
+      it.getMoney(0)
+    expectNull(OidMoney):
+      it.getMoney(0, conv)
+    expectNull(OidUuid):
+      it.getUuid(0)
+    expectNull(OidBool):
+      it.getBool(0)
+    expectNull(OidBytea):
+      it.getBytes(0)
+    expectNull(OidTimestamp):
+      it.getTimestamp(0)
+    expectNull(OidDate):
+      it.getDate(0)
+    expectNull(OidTimestampTz):
+      it.getTimestampTz(0)
+    expectNull(OidTime):
+      it.getTime(0)
+    expectNull(OidTimeTz):
+      it.getTimeTz(0)
+    expectNull(OidJsonb):
+      it.getJson(0)
+    expectNull(OidInterval):
+      it.getInterval(0)
+    expectNull(OidInet):
+      it.getInet(0)
+    expectNull(OidCidr):
+      it.getCidr(0)
+    expectNull(OidMacAddr):
+      it.getMacAddr(0)
+    expectNull(OidMacAddr8):
+      it.getMacAddr8(0)
+    expectNull(OidBit):
+      it.getBit(0)
+    expectNull(OidTsVector):
+      it.getTsVector(0)
+    expectNull(OidTsQuery):
+      it.getTsQuery(0)
+    expectNull(OidXml):
+      it.getXml(0)
+    # hstore has only a dynamic OID.
+    expectNull(90123'i32):
+      it.getHstore(0)
+    expectNull(OidPoint):
+      it.getPoint(0)
+    expectNull(OidLine):
+      it.getLine(0)
+    expectNull(OidLseg):
+      it.getLseg(0)
+    expectNull(OidBox):
+      it.getBox(0)
+    expectNull(OidPath):
+      it.getPath(0)
+    expectNull(OidPolygon):
+      it.getPolygon(0)
+    expectNull(OidCircle):
+      it.getCircle(0)
+
+  test "binary cells of the wrong length are rejected":
+    let conv = initPgMoneyConventions()
+    template expectLen(oid: int32, n: int, typeName: string, getter: untyped) =
+      block:
+        let it {.inject.} = binBytes(oid, newSeq[byte](n))
+        check msgOf(getter) ==
+          "Column 0: unexpected binary length " & $n & " for " & typeName
+
+    expectLen(OidBool, 2, "bool"):
+      it.getStr(0)
+    expectLen(OidInt2, 4, "int2"):
+      it.getStr(0)
+    expectLen(OidInt8, 4, "int8"):
+      it.getStr(0)
+    expectLen(OidFloat4, 8, "float4"):
+      it.getStr(0)
+    expectLen(OidFloat8, 4, "float8"):
+      it.getStr(0)
+    expectLen(OidInt2, 4, "int16"):
+      it.getInt16(0)
+    expectLen(OidMoney, 4, "money"):
+      it.getMoney(0)
+    expectLen(OidMoney, 4, "money"):
+      it.getMoney(0, conv)
+    expectLen(OidTimestamp, 4, "timestamp"):
+      it.getTimestamp(0)
+    expectLen(OidDate, 8, "date"):
+      it.getDate(0)
+    expectLen(OidTimestampTz, 4, "timestamptz"):
+      it.getTimestampTz(0)
+
+  test "getStr renders a binary bool as t/f":
+    check binBytes(OidBool, @[1'u8]).getStr(0) == "t"
+    check binBytes(OidBool, @[0'u8]).getStr(0) == "f"
+
+  test "text geometry literals of the wrong shape are rejected":
+    check msgOf(txtRow(OidLine, "1,2,3").getLine(0)) == "Column 0: Invalid line (len=5)"
+    check msgOf(txtRow(OidLine, "{1,2}").getLine(0)) == "Column 0: Invalid line (len=5)"
+    check msgOf(txtRow(OidLseg, "[(1,2)]").getLseg(0)) ==
+      "Column 0: Invalid lseg (len=7)"
+    check msgOf(txtRow(OidBox, "(1,2)").getBox(0)) == "Column 0: Invalid box (len=5)"
+    check msgOf(txtRow(OidPath, "(").getPath(0)) == "Column 0: Invalid path (len=1)"
+    check msgOf(txtRow(OidCircle, "(1,2),3").getCircle(0)) ==
+      "Column 0: Invalid circle (len=7)"
+    check msgOf(txtRow(OidCircle, "<(1,2)>").getCircle(0)) ==
+      "Column 0: Invalid circle (len=7)"
+
+  test "binary path and polygon reject a negative point count":
+    let negCount = @[0xFF'u8, 0xFF, 0xFF, 0xFF]
+    check msgOf(binBytes(OidPath, @[1'u8] & negCount).getPath(0)) ==
+      "Column 0: binary path has negative point count -1"
+    check msgOf(binBytes(OidPolygon, negCount).getPolygon(0)) ==
+      "Column 0: binary polygon has negative point count -1"
+
+  test "binary array elements of the wrong length are rejected":
+    proc binArray(arrOid, elemOid: int32, elem: seq[byte]): Row =
+      binBytes(arrOid, encodeBinaryArray(elemOid, @[elem]))
+
+    check "bit array element too short" in
+      msgOf(binArray(OidBitArray, OidBit, newSeq[byte](2)).getBitArray(0))
+    check "line array element: bad length 8" in
+      msgOf(binArray(OidLineArray, OidLine, newSeq[byte](8)).getLineArray(0))
+    check "path array element too short: 4" in
+      msgOf(binArray(OidPathArray, OidPath, newSeq[byte](4)).getPathArray(0))
+    check "polygon array element too short: 2" in
+      msgOf(binArray(OidPolygonArray, OidPolygon, newSeq[byte](2)).getPolygonArray(0))
+    check "circle array element: bad length 8" in
+      msgOf(binArray(OidCircleArray, OidCircle, newSeq[byte](8)).getCircleArray(0))
+
+  test "text array elements of the wrong shape are rejected":
+    check "Invalid line (len=5)" in
+      msgOf(txtRow(OidLineArray, "{\"{1,2}\"}").getLineArray(0))
+    check "Invalid lseg (len=7)" in
+      msgOf(txtRow(OidLsegArray, "{\"[(1,2)]\"}").getLsegArray(0))
+    check "Invalid box (len=5)" in msgOf(txtRow(OidBoxArray, "{(1,2)}").getBoxArray(0))
+    check "Invalid circle (len=7)" in
+      msgOf(txtRow(OidCircleArray, "{\"<(1,2)>\"}").getCircleArray(0))
+    check "odd-length hex in bytea array element (len=5)" in
+      msgOf(txtRow(OidByteaArray, "{\"\\\\xabc\"}").getBytesArray(0))
+
+  test "NULL elements in money and box arrays are rejected":
+    let conv = initPgMoneyConventions()
+    let nullElem = @[none(seq[byte])]
+    let binMoney = binBytes(OidMoneyArray, encodeBinaryArray(OidMoney, nullElem))
+    check msgOf(binMoney.getMoneyArray(0)) == "Column 0: NULL element in money array"
+    check msgOf(binMoney.getMoneyArray(0, conv)) ==
+      "Column 0: NULL element in money array"
+    check msgOf(txtRow(OidMoneyArray, "{NULL}").getMoneyArray(0)) ==
+      "Column 0: NULL element in money array"
+    check msgOf(
+      binBytes(OidBoxArray, encodeBinaryArray(OidBox, nullElem)).getBoxArray(0)
+    ) == "Column 0: NULL element in box array"
+
+  test "getMoneyArray with conventions decodes binary elements":
+    let conv = initPgMoneyConventions(fracDigits = 0)
+    let elem = @(toBE64(1234'i64))
+    let row = binBytes(OidMoneyArray, encodeBinaryArray(OidMoney, @[elem]))
+    let got = row.getMoneyArray(0, conv)
+    check got.len == 1
+    check got[0] == initPgMoney(1234'i64, 0)
+
+  test "getMoneyArrayNDOpt reads a NULL cell as none":
+    let row = mkRow(@[none(seq[byte])], @[mkField(OidMoneyArray, 1'i16)])
+    check row.getMoneyArrayNDOpt(0).isNone
+    check row.getMoneyArrayNDOpt(0, initPgMoneyConventions()).isNone

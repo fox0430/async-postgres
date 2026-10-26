@@ -243,6 +243,15 @@ suite "initPoolConfig":
       discard initPoolConfig(
         ConnConfig(host: "localhost", port: 5432), acquireTimeout = milliseconds(-1)
       )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432),
+        connectBackoffInitial = milliseconds(-1),
+      )
+    expect(ValueError):
+      discard initPoolConfig(
+        ConnConfig(host: "localhost", port: 5432), healthCheckTimeout = milliseconds(-1)
+      )
 
   test "validation: maxPipelineSize < 0":
     expect(ValueError):
@@ -4379,6 +4388,30 @@ suite "FIFO fairness":
     check pool.idle.len == 0
     check pool.dialsInFlight == 0
 
+  test "abandoned waiter granted an idle conn after close closes it":
+    # close() swept `idle` before the abandon, so a conn put back there would
+    # outlive the pool.
+    let pool = makePool(maxSize = 1)
+    # csClosed: the scheduled close touches no socket.
+    let idleConn = mockConn(csClosed)
+    pool.idle.addLast(toPooled(idleConn))
+    let w = Waiter(fut: newFuture[PgConnection]("w"), cancelled: false)
+    pool.waiters.addLast(w)
+    pool.waiterCount = 1
+    pool.grantSlots()
+    check w.fut.completed()
+    check w.grant.conn == idleConn
+
+    pool.closed = true
+    let closesBefore = pool.metrics.closeCount
+    pool.settleAbandonedWaiter(w)
+    check pool.metrics.closeCount - closesBefore == 1
+    check pool.pendingBackgroundTasks.len == 1
+    check pool.idle.len == 0
+    check pool.active == 0
+    check pool.waiterCount == 0
+    waitFor pool.close()
+
   test "waiter failed on same tick does not double-decrement waiterCount":
     # The fail-path sibling of the handoff race: `failStrandedWaiters` (a refused
     # or config-faulted dial) or `close` pops the waiter, decrements
@@ -8123,3 +8156,225 @@ suite "Cursor handle fields are read-only":
     check not compiles(c.exhausted = true)
     check not compiles(c.conn = nil)
     check not compiles(c.fields = newSeq[FieldDescription](0))
+
+suite "Acquire and maintenance close/cancel races":
+  proc connectToMock(ms: MockServer): Future[(PgConnection, MockClient)] {.async.} =
+    let connFut = connect(mockConfig(ms.port))
+    let client = await acceptAndReady(ms)
+    return (await connFut, client)
+
+  proc mockPool(ms: MockServer, maxSize: int): PgPool =
+    result = makePool(maxSize = maxSize)
+    result.config.connConfig = mockConfig(ms.port)
+    # Only `addStale` ages a conn past it.
+    result.config.healthCheckTimeout = seconds(60)
+
+  proc addStale(pool: PgPool, conn: PgConnection) =
+    ## Idle long enough to be pinged.
+    conn.ownerPool = pool
+    pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: Moment.now() - minutes(2)))
+
+  proc awaitPoolError(fut: Future[PgConnection]): Future[ref PgPoolError] {.async.} =
+    try:
+      discard await fut.wait(seconds(5))
+    except PgPoolError as e:
+      return e
+
+  test "a health-check ping with no pingTimeout is bounded by the acquire budget":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = mockPool(ms, maxSize = 1)
+      pool.config.acquireTimeout = milliseconds(150)
+      let (conn, st) = await connectToMock(ms)
+      pool.addStale(conn)
+
+      let start = Moment.now()
+      let fut = pool.acquire()
+      # Never answered: only the acquire budget ends the ping.
+      doAssert (await drainFrontendMessage(st)).msgType == 'Q'
+      let err = await awaitPoolError(fut)
+      doAssert err != nil and err.kind == pekAcquireTimeout
+      doAssert Moment.now() - start < seconds(2)
+      doAssert conn.state == csClosed
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 0
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a slot holder whose ping spent the budget times out without queueing":
+    # A config fault leaves the holder no dial, so it goes back to queue; with
+    # the budget gone it must fail there instead of parking a waiter.
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = mockPool(ms, maxSize = 2)
+      pool.config.acquireTimeout = milliseconds(150)
+      pool.configFault = newException(PgConfigError, "bad config")
+      pool.active = 1 # a borrower, so the fault alone fails no acquire
+      let (conn, st) = await connectToMock(ms)
+      pool.addStale(conn)
+
+      let fut = pool.acquire()
+      doAssert (await drainFrontendMessage(st)).msgType == 'Q'
+      let err = await awaitPoolError(fut)
+      doAssert err != nil and err.kind == pekAcquireTimeout
+      doAssert pool.waiters.len == 0
+      doAssert pool.waiterCount == 0
+      doAssert pool.active == 1
+      doAssert conn.state == csClosed
+
+      pool.active = 0
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a waiter granted an idle conn closes it when the pool closed first":
+    # The grant pops the conn off `idle`, so close()'s sweep misses it; the
+    # waiter resumes after close() and must not hand it out.
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = mockPool(ms, maxSize = 1)
+      pool.active = 1 # a borrower at maxSize
+      let (conn, st) = await connectToMock(ms)
+      conn.ownerPool = pool
+
+      let fut = pool.acquire()
+      doAssert pool.waiterCount == 1
+      pool.idle.addLast(toPooled(conn))
+      # The borrower drops a broken conn: its slot goes to the waiter, with the
+      # idle conn.
+      pool.release(mockConn(csClosed))
+      doAssert pool.waiters.len == 0
+      doAssert pool.idle.len == 0
+
+      await pool.close()
+      let err = await awaitPoolError(fut)
+      doAssert err != nil and err.kind == pekClosed
+      doAssert conn.state == csClosed
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 0
+
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a waiter granted an empty slot does not dial once the pool closed":
+    proc t() {.async.} =
+      let pool = makePool(maxSize = 1)
+      pool.active = 1 # a borrower at maxSize
+
+      let fut = pool.acquire()
+      pool.release(mockConn(csClosed))
+      doAssert pool.dialsInFlight == 1 # granted an empty slot
+
+      await pool.close()
+      let err = await awaitPoolError(fut)
+      doAssert err != nil and err.kind == pekClosed
+      # A dial would have counted either way: as a created conn or a failure.
+      doAssert pool.metrics.createCount == 0
+      doAssert pool.metrics.connectFailureCount == 0
+      doAssert pool.dialsInFlight == 0
+      doAssert pool.active == 0
+
+    waitFor t()
+
+  when hasAsyncDispatch:
+    test "a waiter granted an idle conn on the tick its acquire times out, then closed, closes it":
+      # The grant and close() land after `wait` saw the timeout but before it
+      # resumed, so the abandon path finds a completed grant on a closed pool.
+      proc t() {.async.} =
+        let pool = makePool(maxSize = 1)
+        pool.config.acquireTimeout = milliseconds(30)
+        pool.active = 1
+        # csClosed: the scheduled close touches no socket.
+        let idleConn = mockConn(csClosed)
+
+        let acquireFut = pool.acquire()
+        doAssert pool.waiterCount == 1
+        let waiter = pool.waiters.peekFirst()
+        proc grantThenClose() {.async.} =
+          await sleepMsAsync(30) # due after the acquire's timer
+          pool.idle.addLast(toPooled(idleConn))
+          pool.releaseSlot()
+          await pool.close()
+
+        let closesBefore = pool.metrics.closeCount
+        let closeFut = grantThenClose()
+        blockPast(Moment.now() + milliseconds(30))
+        let err = await awaitPoolError(acquireFut)
+        doAssert err != nil and err.kind == pekAcquireTimeout,
+          (if err == nil: "no error" else: err.msg)
+        await closeFut
+        doAssert waiter.fut.completed()
+        doAssert pool.metrics.closeCount - closesBefore == 1
+        doAssert pool.idle.len == 0
+        doAssert pool.active == 0
+        doAssert pool.waiterCount == 0
+
+      waitFor t()
+
+  when hasChronos:
+    test "cancelling an acquire mid health-check ping closes the pinged conn":
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let pool = mockPool(ms, maxSize = 1)
+        pool.config.pingTimeout = seconds(5)
+        let (conn, st) = await connectToMock(ms)
+        pool.addStale(conn)
+
+        let fut = pool.acquire()
+        doAssert (await drainFrontendMessage(st)).msgType == 'Q'
+        # On Windows the ping's send can still be settling here; a bare
+        # cancelAndWait then parks its retry where no event wakes the loop.
+        await cancelAndWaitPumped(fut)
+        doAssert fut.cancelled()
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 0
+        doAssert pool.metrics.closeCount == 1
+
+        await pool.close()
+        doAssert conn.state == csClosed
+        await closeClient(st)
+        await closeServer(ms)
+
+      waitFor t()
+
+  # chronos on Windows reads the bytes off the socket first, so the probe that
+  # triggers the sweep's ping cannot see them.
+  when hasChronos and not defined(windows):
+    test "close cancelling a maintenance sweep mid-ping closes the pinged conn":
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let pool = mockPool(ms, maxSize = 2)
+        pool.config.maintenanceInterval = milliseconds(10)
+        pool.config.pingTimeout = seconds(5)
+        let (conn, st) = await connectToMock(ms)
+        conn.ownerPool = pool
+        pool.idle.addLast(toPooled(conn))
+        # Bytes reaching a parked conn make the sweep ping it.
+        await sendBytes(st, buildNotificationResponse(4321, "ch", "payload"))
+        let deadline = Moment.now() + seconds(5)
+        while not conn.socketHasPendingData() and Moment.now() < deadline:
+          await sleepAsync(milliseconds(1))
+
+        pool.maintenanceTask = maintenanceLoop(pool)
+        doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'Q'
+        doAssert pool.active == 1 # the ping's reservation
+        await pool.close()
+        doAssert pool.maintenanceTask.finished
+        doAssert pool.active == 0
+        doAssert pool.idle.len == 0
+        doAssert pool.metrics.closeCount == 1
+        doAssert conn.state == csClosed
+
+        await closeClient(st)
+        await closeServer(ms)
+
+      waitFor t()

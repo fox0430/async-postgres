@@ -1298,6 +1298,18 @@ suite "PgArray[T] construction and validation":
     check a.isEmpty
     check a.ndim == 0
 
+  test "pgArray 1D empty from Option elements":
+    let a = pgArray(newSeq[Option[int32]]())
+    check a.dims.len == 0
+    check a.lowerBounds.len == 0
+    check a.isEmpty
+
+  test "$ shows dims, lower bounds, and NULL elements":
+    let a = pgArray(@[2'i32], @[0'i32], @[some(1'i32), none(int32)])
+    check $a == "PgArray(dims=@[2], lowerBounds=@[0], elements=@[some(1), none(int32)])"
+    check $pgArray(newSeq[string]()) ==
+      "PgArray(dims=@[], lowerBounds=@[], elements=@[])"
+
   test "pgArray 2D rectangular":
     let a = pgArray(@[2'i32, 3], @[1'i32, 2, 3, 4, 5, 6])
     check a.dims == @[2'i32, 3]

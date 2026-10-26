@@ -1,4 +1,4 @@
-import std/[unittest, importutils, deques]
+import std/[unittest, importutils, deques, strutils]
 
 import ../async_postgres/pg_pool {.all.}
 import ../async_postgres/[async_backend, pg_connection, pg_client, pg_advisory_lock]
@@ -166,6 +166,25 @@ suite "Advisory Lock: transaction-level (int64)":
 
     waitFor t()
 
+  test "xact shared tryLock: refused by an exclusive holder, then held to commit":
+    proc t() {.async.} =
+      let conn1 = await connect(plainConfig())
+      let conn2 = await connect(plainConfig())
+      defer:
+        await conn1.close()
+        await conn2.close()
+      await conn2.advisoryLock(40004'i64)
+      conn1.withTransaction:
+        doAssert not (await conn1.advisoryTryLockXactShared(40004'i64))
+      doAssert await conn2.advisoryUnlock(40004'i64)
+      conn1.withTransaction:
+        doAssert await conn1.advisoryTryLockXactShared(40004'i64)
+        doAssert not (await conn2.advisoryTryLock(40004'i64))
+      doAssert await conn2.advisoryTryLock(40004'i64)
+      discard await conn2.advisoryUnlock(40004'i64)
+
+    waitFor t()
+
   test "xact lock outside transaction raises PgStateError":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
@@ -264,6 +283,25 @@ suite "Advisory Lock: two-key (int32, int32)":
         let acquired = await conn2.advisoryTryLockShared(9'i32, 10'i32)
         doAssert acquired
         discard await conn2.advisoryUnlockShared(9'i32, 10'i32)
+
+    waitFor t()
+
+  test "xact shared tryLock two-key: refused by an exclusive holder, then held":
+    proc t() {.async.} =
+      let conn1 = await connect(plainConfig())
+      let conn2 = await connect(plainConfig())
+      defer:
+        await conn1.close()
+        await conn2.close()
+      await conn2.advisoryLock(15'i32, 16'i32)
+      conn1.withTransaction:
+        doAssert not (await conn1.advisoryTryLockXactShared(15'i32, 16'i32))
+      doAssert await conn2.advisoryUnlock(15'i32, 16'i32)
+      conn1.withTransaction:
+        doAssert await conn1.advisoryTryLockXactShared(15'i32, 16'i32)
+        doAssert not (await conn2.advisoryTryLock(15'i32, 16'i32))
+      doAssert await conn2.advisoryTryLock(15'i32, 16'i32)
+      discard await conn2.advisoryUnlock(15'i32, 16'i32)
 
     waitFor t()
 
@@ -1380,5 +1418,71 @@ suite "Advisory Lock: onAdvisoryUnlockFailed tracer hook":
       doAssert log.data[0].shared == true
       doAssert log.data[0].twoKey == true
       doAssert log.data[0].err == nil
+
+    waitFor t()
+
+  # A Defect from the unlock's own frame (here a tracer hook) is not a
+  # CatchableError; the scope must neither swallow it nor let it mask the body's.
+  # The hook fires before the unlock's first await: past one, chronos raises the
+  # Defect out of poll() instead of into the scope.
+  type UnlockDefectSwitch = ref object
+    armed: bool
+
+  proc buildUnlockDefectTracer(log: UnlockFailLog, sw: UnlockDefectSwitch): PgTracer =
+    let tracer = buildUnlockFailTracer(log)
+    tracer.onQueryStart = proc(
+        conn: PgConnection, data: TraceQueryStartData
+    ): TraceContext {.gcsafe, raises: [].} =
+      if sw.armed and "pg_advisory_unlock(" in data.sql:
+        raise newException(AssertionDefect, "unlock defect")
+    tracer
+
+  test "withAdvisoryLock surfaces an unlock Defect when the body succeeded":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      let sw = UnlockDefectSwitch()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockDefectTracer(log, sw)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var defectMsg = ""
+      try:
+        conn.withAdvisoryLock(50015'i64):
+          sw.armed = true
+      except Defect as e:
+        defectMsg = e.msg
+      doAssert "unlock defect" in defectMsg, defectMsg
+      doAssert log.data.len == 0
+      # The unlock never reached the server, so the lock is still held.
+      sw.armed = false
+      doAssert await conn.advisoryUnlock(50015'i64)
+
+    waitFor t()
+
+  test "withAdvisoryLock reports an unlock Defect behind the body error":
+    proc t() {.async.} =
+      let log = UnlockFailLog()
+      let sw = UnlockDefectSwitch()
+      var cfg = plainConfig()
+      cfg.tracer = buildUnlockDefectTracer(log, sw)
+      let conn = await connect(cfg)
+      defer:
+        await conn.close()
+      var bodyMsg = ""
+      try:
+        conn.withAdvisoryLock(50016'i64):
+          sw.armed = true
+          raise newException(CatchableError, "original body error")
+      except CatchableError as e:
+        bodyMsg = e.msg
+      doAssert bodyMsg == "original body error"
+      doAssert log.data.len == 1
+      doAssert log.data[0].key == 50016'i64
+      doAssert log.data[0].err of PgError
+      doAssert "unlock defect" in log.data[0].err.msg, log.data[0].err.msg
+      doAssert log.data[0].err.parent of AssertionDefect
+      sw.armed = false
+      doAssert await conn.advisoryUnlock(50016'i64)
 
     waitFor t()
