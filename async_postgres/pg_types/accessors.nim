@@ -137,10 +137,16 @@ proc isBinaryCol*(row: Row, col: int): bool {.inline.} =
   col >= 0 and row.data != nil and row.data.colFormats.len > col and
     row.data.colFormats[col] == 1'i16
 
-proc colTypeOid(row: Row, col: int): int32 {.inline.} =
-  ## Get the type OID for a column, or 0 if not available.
-  if col >= 0 and row.data != nil and row.data.colTypeOids.len > col:
+proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
+  ## Get the type OID for a column, or 0 if not available: the wire metadata,
+  ## else the column's field. A statement Describe, a text cursor and a simple
+  ## query fill in only the latter; a binary column always has the former.
+  if col < 0 or row.data == nil:
+    0'i32
+  elif row.data.colTypeOids.len > col:
     row.data.colTypeOids[col]
+  elif row.data.fields.len > col:
+    row.data.fields[col].typeOid
   else:
     0'i32
 

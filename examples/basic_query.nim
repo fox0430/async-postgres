@@ -1,7 +1,8 @@
 ## Basic query example.
 ##
 ## Demonstrates connecting to PostgreSQL, creating a table, inserting rows,
-## and querying data using the extended query protocol.
+## querying data using the extended query protocol, and mapping rows to
+## objects.
 ##
 ## Usage:
 ##   nim c -r examples/basic_query.nim
@@ -9,6 +10,11 @@
 import pkg/async_postgres
 
 const Dsn = "postgresql://test:test@127.0.0.1:15432/test?sslmode=disable"
+
+type User = object
+  id: int32
+  name: string
+  age: int32
 
 proc main() {.async.} =
   let conn = await connect(Dsn)
@@ -40,6 +46,11 @@ proc main() {.async.} =
   for row in res.rows:
     echo "  id=",
       row.getInt("id"), " name=", row.getStr("name"), " age=", row.getInt("age")
+
+  # Map the same rows to objects by column name
+  echo "\nAs objects:"
+  for user in res.to(seq[User]):
+    echo "  ", user
 
   # Query with a parameter
   let minAge = 28'i32

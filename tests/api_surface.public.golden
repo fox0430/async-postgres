@@ -434,6 +434,7 @@ async_postgres/pg_connection.nim	export simple_query.quoteLiteral
 async_postgres/pg_connection.nim	export simple_query.rows
 async_postgres/pg_connection.nim	export simple_query.simpleExec
 async_postgres/pg_connection.nim	export simple_query.simpleQuery
+async_postgres/pg_connection.nim	export simple_query.to
 async_postgres/pg_connection.nim	export type_lookup.TypeOidInfo
 async_postgres/pg_connection.nim	export type_lookup.lookupTypeOids
 async_postgres/pg_connection.nim	export types.AuthMethod
@@ -555,6 +556,7 @@ async_postgres/pg_connection/simple_query.nim	quoteLiteral
 async_postgres/pg_connection/simple_query.nim	rows
 async_postgres/pg_connection/simple_query.nim	simpleExec
 async_postgres/pg_connection/simple_query.nim	simpleQuery
+async_postgres/pg_connection/simple_query.nim	to
 async_postgres/pg_connection/type_lookup.nim	TypeOidInfo
 async_postgres/pg_connection/type_lookup.nim	lookupTypeOids
 async_postgres/pg_connection/types.nim	AuthMethod
@@ -1413,7 +1415,7 @@ async_postgres/pg_sql.nim	queryValueOrDefault#5
 async_postgres/pg_sql.nim	queryValueOrDefault#6
 async_postgres/pg_sql.nim	sql
 async_postgres/pg_sql.nim	sqlParams
-async_postgres/pg_types.nim	export accessors except nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid, wireOidIsDynamic
+async_postgres/pg_types.nim	export accessors except nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid, wireOidIsDynamic, colTypeOid
 async_postgres/pg_types.nim	export array
 async_postgres/pg_types.nim	export core except PgIntParse, pipOk, pipInvalid, pipOverflow, checkPgTimeFields, checkPgTimeTzOffset, isPgHexText, isPgIntText, isPgUIntText, pgParseBiggestInt, pgParseBiggestIntView, pgParseFloat, pgParseFloat32, pgParseHexInt, pgParseHexUInt32, pgParseInt, pgParseInt16, pgParseInt32, pgParseIntView, pgParseUIntField, parsePgBoolText, pgTypeErrorOnValueError, withColumnContext
 async_postgres/pg_types.nim	export decoding.fromPgText
@@ -1452,6 +1454,7 @@ async_postgres/pg_types.nim	export encoding.writeParamFormat
 async_postgres/pg_types.nim	export encoding.writeParamOid
 async_postgres/pg_types.nim	export encoding.writeParamValue
 async_postgres/pg_types.nim	export ranges
+async_postgres/pg_types.nim	export row_mapping except mapRow, resolveRowColumns
 async_postgres/pg_types.nim	export user_types
 async_postgres/pg_types.nim	get
 async_postgres/pg_types.nim	pgParams
@@ -2131,6 +2134,9 @@ async_postgres/pg_types/ranges.nim	toPgTsTzMultirangeParam
 async_postgres/pg_types/ranges.nim	toPgTsTzRangeArrayParam
 async_postgres/pg_types/ranges.nim	toPgTsTzRangeParam
 async_postgres/pg_types/ranges.nim	unboundedRange
+async_postgres/pg_types/row_mapping.nim	pgColumn
+async_postgres/pg_types/row_mapping.nim	pgSkip
+async_postgres/pg_types/row_mapping.nim	to
 async_postgres/pg_types/user_types.nim	encodeBinaryComposite
 async_postgres/pg_types/user_types.nim	encodeCompositeText
 async_postgres/pg_types/user_types.nim	encodeEnumTextArray

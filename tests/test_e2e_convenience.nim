@@ -1,4 +1,5 @@
-import std/[unittest, options, tables, importutils, net]
+import std/[unittest, options, strutils, tables, importutils, net]
+from std/times import DateTime, Month, dateTime, utc, `==`
 
 import
   ../async_postgres/
@@ -6,12 +7,62 @@ import
 import ../async_postgres/pg_client/core
 import ../async_postgres/pg_connection/types
 
-when hasAsyncDispatch:
-  import std/strutils
-
 import e2e_common
 
 privateAccess(PgConnection)
+
+type
+  MapMood = enum
+    mmHappy = "happy"
+    mmSad = "sad"
+
+  MapPair = object
+    n: int32
+    label: string
+
+  MapRow = object
+    id: int64
+    userName: string
+    nick: Option[string]
+    createdAt: DateTime
+    birthday: DateTime
+    seenAt: DateTime
+    mood: MapMood
+    pair: MapPair
+    tags: seq[string]
+    score {.pgColumn: "Score".}: float64
+
+pgComposite(MapPair)
+
+const mapRowSql =
+  "SELECT 1::int8 AS id, 'ann'::text AS user_name, NULL::text AS nick," &
+  " '2024-01-15 10:30:00+00'::timestamptz AS created_at," &
+  " '2000-02-29'::date AS birthday, '2024-01-15 10:30:00'::timestamp AS seen_at," &
+  " 'sad'::test_e2e_map_mood AS mood, ROW(3, 'a b')::test_e2e_map_pair AS pair," &
+  " ARRAY['x', 'y'] AS tags, 1.5::float8 AS \"Score\""
+
+proc checkMapRow(r: MapRow) =
+  doAssert r.id == 1
+  doAssert r.userName == "ann"
+  doAssert r.nick.isNone
+  doAssert r.createdAt == dateTime(2024, mJan, 15, 10, 30, 0, zone = utc())
+  doAssert r.birthday == dateTime(2000, mFeb, 29, zone = utc())
+  doAssert r.seenAt == dateTime(2024, mJan, 15, 10, 30, 0, zone = utc())
+  doAssert r.mood == mmSad
+  doAssert r.pair == MapPair(n: 3, label: "a b")
+  doAssert r.tags == @["x", "y"]
+  doAssert r.score == 1.5
+
+proc createMapTypes(conn: PgConnection) {.async.} =
+  discard await conn.simpleQuery(
+    "DROP TYPE IF EXISTS test_e2e_map_mood; DROP TYPE IF EXISTS test_e2e_map_pair;" &
+      " CREATE TYPE test_e2e_map_mood AS ENUM ('happy', 'sad');" &
+      " CREATE TYPE test_e2e_map_pair AS (n int4, label text)"
+  )
+
+proc dropMapTypes(conn: PgConnection) {.async.} =
+  discard
+    await conn.simpleQuery("DROP TYPE test_e2e_map_mood; DROP TYPE test_e2e_map_pair")
 
 suite "E2E: Column Name Access":
   test "columnIndex on QueryResult":
@@ -167,6 +218,71 @@ suite "E2E: Column Name Access":
       except PgTypeError:
         raised = true
       doAssert raised
+
+    waitFor t()
+
+suite "E2E: Row Mapping":
+  test "to reads the same object from text and binary columns":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      await createMapTypes(conn)
+      # rfAuto reads text on the first run and binary-safe columns in binary
+      # once the statement is cached.
+      let first = await conn.query(mapRowSql)
+      let cached = await conn.query(mapRowSql)
+      let binary = await conn.query(mapRowSql, resultFormat = rfBinary)
+      doAssert not first.rows[0].isBinaryCol(0)
+      doAssert cached.rows[0].isBinaryCol(0)
+      for qr in [first, cached, binary]:
+        let rows = qr.to(seq[MapRow])
+        doAssert rows.len == 1
+        checkMapRow(rows[0])
+        checkMapRow(qr.rows[0].to(MapRow))
+      await dropMapTypes(conn)
+      await conn.close()
+
+    waitFor t()
+
+  test "to maps simple-query rows by their field types":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      await createMapTypes(conn)
+      let results = await conn.simpleQuery(mapRowSql)
+      checkMapRow(results[0].to(seq[MapRow])[0])
+      await dropMapTypes(conn)
+      await conn.close()
+
+    waitFor t()
+
+  test "to maps every row and reports a NULL by field":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let qr = await conn.query(
+        "SELECT g AS id, CASE WHEN g = 2 THEN NULL ELSE 'n' || g END AS name" &
+          " FROM generate_series(1, 3) g"
+      )
+      let opt = qr.to(seq[tuple[id: int, name: Option[string]]])
+      doAssert opt ==
+        @[
+          (id: 1, name: some("n1")),
+          (id: 2, name: none(string)),
+          (id: 3, name: some("n3")),
+        ]
+      try:
+        discard qr.to(seq[tuple[id: int, name: string]])
+        doAssert false
+      except PgTypeError as e:
+        doAssert e.msg.startsWith("tuple[id: int, name: string].name: ")
+      await conn.close()
+
+    waitFor t()
+
+  test "queryRow result maps by position":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      let row = await conn.queryRow("SELECT 5::int4, 'five'::text")
+      doAssert row.to((int32, string)) == (5'i32, "five")
+      await conn.close()
 
     waitFor t()
 

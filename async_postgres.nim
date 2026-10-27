@@ -108,6 +108,24 @@
 ##
 ##   waitFor main()
 ##
+## Mapping rows to objects
+## =======================
+## ``row.to(T)`` reads a row into an object, a ``ref object`` or a tuple, and
+## ``qr.to(seq[T])`` reads every row. Each field reads the column its name
+## matches, ignoring case and ``_``; ``{.pgColumn: "name".}`` and
+## ``{.pgSkip.}`` override that per field. See ``to`` in
+## `pg_types <async_postgres/pg_types.html>`_ for the field types it reads.
+##
+## .. code-block:: nim
+##   type User = object
+##     id: int32
+##     name: string
+##     createdAt: DateTime
+##     email: Option[string]
+##
+##   let users = (await conn.query(
+##     "SELECT id, name, created_at, email FROM users")).to(seq[User])
+##
 ## Choosing a query API
 ## ====================
 ## Four parameterised entry points are provided. They differ in how parameters

@@ -449,8 +449,10 @@ proc collectStarNames(path: string): seq[StarName] =
         continue
       if not fromParam(name):
         emit name
-      codegenIndent = line.indentation
-      codegenAwaitEquals = not headerHasBodyEquals(body)
+      # A custom pragma (`template x*() {.pragma.}`) has no body to skip.
+      if not stripped.endsWith("{.pragma.}"):
+        codegenIndent = line.indentation
+        codegenAwaitEquals = not headerHasBodyEquals(body)
       continue
     let name = exportedName(line)
     if name.len == 0 or fromParam(name):
