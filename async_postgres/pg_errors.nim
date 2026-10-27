@@ -197,6 +197,11 @@ type
     pekConnectFailed
       ## A connect attempt failed during acquire (underlying error in `parent`);
       ## retrying may succeed. A refusal surfaces as `pekRefused` instead.
+    pekAfterConnectFailed
+      ## `PoolConfig.afterConnect` failed on the connection an acquire or
+      ## `newPool` opened, which was closed: it raised (preserved as `parent`), or left the
+      ## connection not ready or inside a transaction. Retrying may succeed:
+      ## whatever the hook raised, the pool keeps dialing.
     pekRefused
       ## A server refused the session for a cause that recurs for the same
       ## config (preserved as `parent`): a wrong password, a database that does
@@ -212,10 +217,11 @@ type
       ## cross an async boundary; preserved as `parent`.
 
   PgPoolError* = object of PgError
-    ## Pool-level acquire failure (closed, acquire timeout, queue
-    ## full, connect failed, refused, config fault, unservable batch, or a
-    ## wrapped user-code ``Defect``; the underlying error is preserved as
-    ## ``parent``). Operation timeouts are not ``PgPoolError``: a pipelined
+    ## Pool-level acquire failure (closed, acquire timeout, queue full,
+    ## connect failed, ``afterConnect`` failed, refused, config fault,
+    ## unservable batch, or a wrapped user-code ``Defect``; the underlying
+    ## error is preserved as ``parent``). Operation timeouts are not
+    ## ``PgPoolError``: a pipelined
     ## ``pool.exec`` / ``pool.query`` wait and the pool
     ## ``withTransactionDeadline`` / ``withTransactionRetryDeadline`` deadline
     ## raise ``PgTimeoutError`` instead, so ``except PgPoolError`` alone misses
@@ -404,6 +410,10 @@ func verdict(e: ref CatchableError): Verdict {.raises: [], gcsafe.} =
       vRetry
     of pekConnectFailed, pekBatchFailed:
       verdict(e.catchableParent)
+    of pekAfterConnectFailed:
+      # The hook's error says nothing of the config or the server's answer to
+      # it: never a stop.
+      if verdict(e.catchableParent) == vRetry: vRetry else: vUnclear
     else:
       # `pekUnknown`, `pekDefectWrapped`: nothing established either way.
       vUnclear

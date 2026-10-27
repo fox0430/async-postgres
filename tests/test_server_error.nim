@@ -1353,6 +1353,18 @@ suite "isTransientError":
       newPoolError(pekConnectFailed, "c", (ref AsyncTimeoutError)(msg: "timeout"))
     )
     check not isTransientError(newPoolError(pekConnectFailed, "c", refused))
+    # A failed `afterConnect` never stops a loop, whatever the hook raised.
+    check isTransientError(newPoolError(pekAfterConnectFailed, "h", lost))
+    for raised in [
+      (ref CatchableError)(msg: "hook"),
+      (ref PgConfigError)(msg: "cert"),
+      startupAnswer("28P01"),
+      newPoolError(pekClosed, "c"),
+    ]:
+      check retryAdvice(newPoolError(pekAfterConnectFailed, "h", raised)) == raUnclear
+    check not isLastingRefusal(
+      newPoolError(pekAfterConnectFailed, "h", startupAnswer("28P01"))
+    )
     check isTransientError(
       newPoolError(pekBatchFailed, "b", newPoolError(pekAcquireTimeout, "t"))
     )

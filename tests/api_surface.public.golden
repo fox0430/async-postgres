@@ -3,6 +3,7 @@ async_postgres.nim	export pg_advisory_lock
 async_postgres.nim	export pg_client
 async_postgres.nim	export pg_connection
 async_postgres.nim	export pg_largeobject
+async_postgres.nim	export pg_pool.AfterConnectHook
 async_postgres.nim	export pg_pool.PgPool
 async_postgres.nim	export pg_pool.PoolConfig
 async_postgres.nim	export pg_pool.PoolMetrics
@@ -17,6 +18,7 @@ async_postgres.nim	export pg_pool.execInTransaction
 async_postgres.nim	export pg_pool.idleCount
 async_postgres.nim	export pg_pool.initPoolConfig
 async_postgres.nim	export pg_pool.isClosed
+async_postgres.nim	export pg_pool.makeAfterConnectHook
 async_postgres.nim	export pg_pool.metrics
 async_postgres.nim	export pg_pool.newPool
 async_postgres.nim	export pg_pool.notify
@@ -845,6 +847,7 @@ async_postgres/pg_errors.nim	PgTypeError
 async_postgres/pg_errors.nim	PgUnavailableError
 async_postgres/pg_errors.nim	PoolErrorKind
 async_postgres/pg_errors.nim	PoolErrorKind.pekAcquireTimeout
+async_postgres/pg_errors.nim	PoolErrorKind.pekAfterConnectFailed
 async_postgres/pg_errors.nim	PoolErrorKind.pekBatchFailed
 async_postgres/pg_errors.nim	PoolErrorKind.pekClosed
 async_postgres/pg_errors.nim	PoolErrorKind.pekConfigFault
@@ -949,6 +952,7 @@ async_postgres/pg_largeobject.nim	withLargeObject
 async_postgres/pg_pool.nim	PgPool
 async_postgres/pg_pool.nim	PoolConfig
 async_postgres/pg_pool.nim	PoolConfig.acquireTimeout
+async_postgres/pg_pool.nim	PoolConfig.afterConnect
 async_postgres/pg_pool.nim	PoolConfig.connConfig
 async_postgres/pg_pool.nim	PoolConfig.connectBackoffInitial
 async_postgres/pg_pool.nim	PoolConfig.connectBackoffMax
@@ -989,6 +993,7 @@ async_postgres/pg_pool.nim	execInTransaction#2
 async_postgres/pg_pool.nim	idleCount
 async_postgres/pg_pool.nim	initPoolConfig
 async_postgres/pg_pool.nim	isClosed
+async_postgres/pg_pool.nim	makeAfterConnectHook
 async_postgres/pg_pool.nim	metrics
 async_postgres/pg_pool.nim	newPool
 async_postgres/pg_pool.nim	notify
