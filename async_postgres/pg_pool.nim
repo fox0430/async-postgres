@@ -4,6 +4,33 @@ import async_backend, pg_gensym, pg_protocol, pg_types, pg_client
 import pg_connection/[types, buffer_io, simple_query, lifecycle]
 import pg_client/[transaction, pipeline]
 
+declareAsyncCallback(
+  AfterConnectHook, proc(conn: PgConnection): Future[void],
+  "Callback run on each connection the pool opens; see `PoolConfig.afterConnect`.",
+)
+
+template makeAfterConnectHook*(body: untyped): AfterConnectHook =
+  ## Create an ``AfterConnectHook`` that works with both asyncdispatch and chronos.
+  ## Inside ``body``, the new connection is available as ``conn: PgConnection``.
+  ##
+  ## .. code-block:: nim
+  ##   let hook = makeAfterConnectHook:
+  ##     discard await conn.simpleExec("SET search_path TO app")
+  ##
+  ## Kept module-local: routing this through a shared template with an
+  ## `untyped`/`typedesc` param for the parameter type trips asyncdispatch's
+  ## `{.async.}` macro ("cannot use symbol of kind 'func' as a 'param'").
+  when hasChronos:
+    AfterConnectHook(
+      proc(conn {.inject.}: PgConnection) {.async: (raises: [CatchableError]).} =
+        body
+    )
+  else:
+    AfterConnectHook(
+      proc(conn {.inject.}: PgConnection) {.async.} =
+        body
+    )
+
 type
   PoolConfig* = object
     ## Configuration for the connection pool. Create via `initPoolConfig`.
@@ -79,6 +106,34 @@ type
       ## and the `TimeZone` restore (default 5s, ZeroDuration=no timeout). A
       ## hung server would otherwise stall the release path and starve the
       ## pool; on timeout the connection is closed and the release proceeds.
+    afterConnect*: AfterConnectHook
+      ## Runs on each connection the pool opens — `newPool`'s, the maintenance
+      ## refill's and an `acquire`'s own dial — before the pool hands it out or
+      ## parks it (default nil=none): `SET`s, `prepare`, `lookupTypeOids`.
+      ## Not run on a reused connection.
+      ##
+      ## A hook that raises, or leaves the connection not ready or inside a
+      ## transaction, gets the connection closed and fails the connect:
+      ## `acquire` and `newPool` raise `pekAfterConnectFailed` with the hook's
+      ## error as `parent`, and the maintenance loop backs off as after a
+      ## failed dial. Whatever it raises, neither the pool
+      ## nor `retryAdvice` takes it for a refusal or a config fault: the pool
+      ## never stops dialing over it.
+      ##
+      ## An `acquire`'s dial and hook share its `acquireTimeout` budget, and
+      ## the maintenance loop gives the hook `maintenanceInterval`; one cut
+      ## short has its connection closed. `newPool` sets the hook no bound: a
+      ## hung one hangs `newPool`, on asyncdispatch past any `wait` around it,
+      ## so bound the hook's own queries (their `timeout`, or a
+      ## `statement_timeout`).
+      ##
+      ## A `TimeZone` the hook sets is the one `resetSession` restores.
+      ## `resetQuery` starts from the session the hook left: "DISCARD ALL" and
+      ## "RESET ALL" undo its `SET`s (send settings as startup `extraParams`
+      ## instead), and "DISCARD ALL" / "DEALLOCATE ALL" drop its prepared
+      ## statements. A session advisory lock it takes through the typed API
+      ## reads as leaked: the first release reports it to `onLeakedSessionLocks`
+      ## and unlocks it (`resetSession`) or closes the connection (`release`).
     tracer*: PgTracer ## Optional tracer for pool-level hooks (acquire/release)
     pipelined*: bool
       ## Enable implicit query batching for pool.exec/query (default false).
@@ -127,7 +182,8 @@ type
     closeCount*: int64 ## Number of connections closed/discarded
     connectFailureCount*: int64
       ## Number of connect attempts that failed once `newPool` returned: a
-      ## refusal, a config fault or a failure that may clear. A dial cut short
+      ## refusal, a config fault or a failure that may clear (a failed
+      ## `afterConnect` is one). A dial cut short
       ## by an `acquire`'s budget counts in `timeoutCount` instead, and one a
       ## chronos cancel cuts short (the caller's, or `close()`'s) counts nowhere;
       ## asyncdispatch lets the dial end, and counts it.
@@ -288,6 +344,7 @@ proc initPoolConfig*(
     maxPipelineSize = 0,
     connectBackoffInitial = seconds(1),
     connectBackoffMax = seconds(60),
+    afterConnect: AfterConnectHook = nil,
 ): PoolConfig =
   ## Create a pool configuration with sensible defaults.
   ## Maintenance replenishes `size()` toward `minSize`, checked-out
@@ -301,6 +358,7 @@ proc initPoolConfig*(
   ## `connectRefusal`) skips the ramp to `connectBackoffMax` and replenishes one
   ## connection at a time, but a waiter still gets a dial: one refused fails
   ## the waiters no borrower can serve with `PgPoolError(pekRefused)`.
+  ## Set `afterConnect` to run setup on each connection the pool opens.
   ##
   ## Raises `ValueError` if parameters are invalid.
   let cfg = PoolConfig(
@@ -321,6 +379,7 @@ proc initPoolConfig*(
     maxPipelineSize: maxPipelineSize,
     connectBackoffInitial: connectBackoffInitial,
     connectBackoffMax: connectBackoffMax,
+    afterConnect: afterConnect,
   )
   validatePoolConfig(cfg)
   cfg
@@ -404,6 +463,17 @@ proc pruneBackgroundTasks(pool: PgPool) =
       inc i
   pool.pendingBackgroundTasks.setLen(n)
 
+proc closeUncounted(pool: PgPool, conn: PgConnection, byUser: bool = false) =
+  ## `closeNoWait` without the `closeCount`: for a conn whose `afterConnect`
+  ## failed, never counted in `createCount` either.
+  proc doClose() {.async.} =
+    await pool.tracedClose(conn, byUser)
+
+  pool.pruneBackgroundTasks()
+  let fut = doClose()
+  pool.pendingBackgroundTasks.add(fut)
+  asyncSpawn fut
+
 proc closeNoWait(pool: PgPool, conn: PgConnection, byUser: bool = false) =
   ## Schedule connection close without waiting. For use in non-async contexts
   ## (e.g. `release()` is synchronous). The spawned task is tracked in
@@ -417,13 +487,7 @@ proc closeNoWait(pool: PgPool, conn: PgConnection, byUser: bool = false) =
   ## `onPoolCloseError` tracer hook (nil when unconfigured). The connection
   ## is not reused either way.
   pool.metrics.closeCount.inc
-  proc doClose() {.async.} =
-    await pool.tracedClose(conn, byUser)
-
-  pool.pruneBackgroundTasks()
-  let fut = doClose()
-  pool.pendingBackgroundTasks.add(fut)
-  asyncSpawn fut
+  pool.closeUncounted(conn, byUser)
 
 func canRestoreTimeZone(conn: PgConnection): bool =
   ## A server-default zone is RESET, a startup one SET back. With no zone
@@ -580,8 +644,14 @@ type ConnectFailure = enum
   cfRefused ## The server refused the session; recorded in `lastRefusal`.
   cfConfigFault ## The config can never connect; recorded in `configFault`.
 
+type AfterConnectFailure = object of CatchableError
+  ## `afterConnect` failed; `parent` is what it raised.
+
 func connectFailureOf(err: ref CatchableError): ConnectFailure =
-  if err of PgConfigError:
+  if err of AfterConnectFailure:
+    # The hook's error says nothing of the config or the server's answer.
+    cfFailed
+  elif err of PgConfigError:
     cfConfigFault
   elif isLastingRefusal(err):
     cfRefused
@@ -679,6 +749,64 @@ proc boundedConnConfig(pool: PgPool): ConnConfig =
   result = pool.config.connConfig
   if result.connectTimeout == ZeroDuration:
     result.connectTimeout = pool.fallbackTimeout()
+
+func hookError(err: ref CatchableError): ref CatchableError =
+  ## What `afterConnect` raised, for an `AfterConnectFailure`; else `err`.
+  if err of AfterConnectFailure:
+    (ref CatchableError)(err.parent)
+  else:
+    err
+
+proc dialConn(
+    pool: PgPool, cfg: ConnConfig, hookTimeout = ZeroDuration, sharedWithConnect = false
+): Future[PgConnection] {.async.} =
+  ## `connect`, then `afterConnect` on the new conn. A hook failure closes the
+  ## conn and raises `AfterConnectFailure`. `hookTimeout` (zero for none)
+  ## bounds the hook alone, or with `sharedWithConnect` the connect and the
+  ## hook together.
+  let start = Moment.now()
+  let conn = await connect(cfg)
+  # The server took the session, whatever the hook makes of it.
+  pool.lastRefusal = nil
+  let hook = pool.config.afterConnect
+  if hook == nil:
+    return conn
+  var err: ref CatchableError
+  try:
+    if hookTimeout > ZeroDuration:
+      var left = hookTimeout
+      if sharedWithConnect:
+        left = left - (Moment.now() - start)
+      if left <= ZeroDuration:
+        raise newException(AsyncTimeoutError, "connect left afterConnect no time")
+      # On asyncdispatch the hook runs on past the timeout; the close below
+      # fails its pending I/O.
+      await hook(conn).wait(left)
+    else:
+      await hook(conn)
+    if conn.state != csReady:
+      err = newException(PgStateError, "afterConnect left the connection not ready")
+    elif conn.txStatus != tsIdle:
+      err = newException(PgStateError, "afterConnect left a transaction open")
+  except CancelledError as e:
+    pool.closeUncounted(conn)
+    raise e
+  except CatchableError as e:
+    err = e
+  except Defect as d:
+    # Wrapped: a raw Defect cannot cross a chronos async boundary.
+    err = newPoolError(pekDefectWrapped, d.msg, d)
+  if err != nil:
+    # A request still in flight (asyncdispatch's `wait` leaves a timed-out hook
+    # running) is dropped as a cancelled one is: a CancelRequest for the
+    # backend, and no Terminate written into the request.
+    conn.invalidateOnCancel(releaseTransport = false)
+    pool.closeUncounted(conn)
+    raise newException(AfterConnectFailure, "afterConnect failed: " & err.msg, err)
+  if conn.timeZoneChanged:
+    # Otherwise `resetSession` would set the startup zone back over the hook's.
+    conn.noteConnectTimeZone(followsServer = false)
+  return conn
 
 proc hasCapacity(pool: PgPool, dial = true): bool =
   ## Whether a slot is free: an idle conn, or, when `dial` and no config fault
@@ -882,7 +1010,7 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       var connectFuts: seq[Future[PgConnection]]
       let connCfg = pool.boundedConnConfig()
       for i in 0 ..< needed:
-        connectFuts.add(connect(connCfg))
+        connectFuts.add(pool.dialConn(connCfg, pool.fallbackTimeout()))
       var cancelled: ref CancelledError
       try:
         await allFuturesCancelling(connectFuts)
@@ -905,6 +1033,9 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
           if cancelled == nil or f.failed():
             # Same downcast as `newPool`: `connect` only raises `CatchableError`.
             let e = cast[ref CatchableError](f.error)
+            if e of AfterConnectFailure:
+              # Its connect went through: only the hook failed.
+              connected = true
             if pool.noteConnectFailure(e) == cfRefused:
               refusal = e
       if connected and refusal != nil:
@@ -915,6 +1046,9 @@ proc maintenanceLoop(pool: PgPool) {.async.} =
       if cancelled != nil:
         # close() fails the waiters itself, with the error its contract names.
         raise cancelled
+      # The failed dials' slots go to waiters queued behind the reservation,
+      # or they idle until the next sweep.
+      pool.grantSlots(dial = refusal == nil)
       pool.failStrandedWaiters(refusal)
 
 proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
@@ -951,14 +1085,21 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     # The first failure (if any) is raised so the except branch closes the
     # ones that succeeded; they are parked only when all did.
     for i in 0 ..< cfg.minSize:
-      connectFuts.add(connect(cfg.connConfig))
+      connectFuts.add(pool.dialConn(cfg.connConfig))
     await allFuturesCancelling(connectFuts)
     for f in connectFuts:
       if not f.completed():
-        # `connect` only raises `CatchableError`, so the stored exception is
+        # `dialConn` only raises `CatchableError`, so the stored exception is
         # always safe to downcast from `ref Exception` (asyncdispatch) /
         # `ref CatchableError` (chronos) to the typed `ref CatchableError`.
-        raise cast[ref CatchableError](f.error)
+        let e = cast[ref CatchableError](f.error)
+        if e of AfterConnectFailure:
+          # Wrapped as `acquire` does, so `retryAdvice` never reads the hook's
+          # error as the server's answer.
+          raise newPoolError(
+            pekAfterConnectFailed, "Pool afterConnect failed", hookError(e)
+          )
+        raise e
     for f in connectFuts:
       let conn = f.read()
       conn.ownerPool = pool
@@ -970,6 +1111,8 @@ proc newPool*(config: PoolConfig): Future[PgPool] {.async.} =
     for f in connectFuts:
       if f.completed():
         closeFuts.add(pool.tracedClose(f.read()))
+    # The closes of conns whose `afterConnect` failed: no `close()` drains them.
+    closeFuts.add(pool.pendingBackgroundTasks)
     await noCancel allFutures(closeFuts)
     raise e
 
@@ -1452,32 +1595,22 @@ proc acquireImpl(pool: PgPool, queue = true): Future[AcquireResult] {.async.} =
             # Bound the whole connect (across multi-host failover) by the acquire
             # budget: per-address `connectTimeout` alone lets total wait reach
             # `connectTimeout * addresses`. Under asyncdispatch the orphan close
-            # mirrors `attemptHostTimed`'s handling.
-            let attempt = connect(connCfg)
+            # mirrors `attemptHostTimed`'s handling. asyncdispatch's `wait` also
+            # leaves the hook running: what the connect left of `rem` bounds
+            # it, or a hung one would keep its conn open, untracked, for good.
+            let attempt = pool.dialConn(connCfg, rem, sharedWithConnect = true)
             when hasAsyncDispatch:
               newConn = await attempt.wait(
                 rem,
                 onOrphan = proc(fut: Future[PgConnection]) =
                   if fut.completed():
-                    # Track the orphan close so pool.close()'s drain awaits it.
-                    pool.pruneBackgroundTasks()
-                    let closeFut = (
-                      proc() {.async.} =
-                        try:
-                          let orphan = fut.read()
-                          if orphan != nil:
-                            await orphan.closeImpl(byUser = false)
-                        except CatchableError:
-                          discard
-                    )()
-                    pool.pendingBackgroundTasks.add(closeFut)
-                    asyncSpawn closeFut
+                    pool.closeUncounted(fut.read())
                 ,
               )
             else:
               newConn = await attempt.wait(rem)
           else:
-            newConn = await connect(connCfg)
+            newConn = await pool.dialConn(connCfg)
         except CancelledError as e:
           # Cancellation (e.g. a caller's wait()-style deadline) must propagate
           # unwrapped so the canceller's machinery sees it.
@@ -1506,7 +1639,11 @@ proc acquireImpl(pool: PgPool, queue = true): Future[AcquireResult] {.async.} =
             discard
           if budgetSpent:
             pool.metrics.timeoutCount.inc
-            raise newPoolError(pekAcquireTimeout, "Pool acquire timeout", e)
+            raise newPoolError(pekAcquireTimeout, "Pool acquire timeout", hookError(e))
+          if e of AfterConnectFailure:
+            raise newPoolError(
+              pekAfterConnectFailed, "Pool afterConnect failed", hookError(e)
+            )
           raise newPoolError(pekConnectFailed, "Pool connect failed", e)
         pool.dialsInFlight.dec
         pool.metrics.createCount.inc

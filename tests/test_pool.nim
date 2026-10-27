@@ -8378,3 +8378,507 @@ suite "Acquire and maintenance close/cancel races":
         await closeServer(ms)
 
       waitFor t()
+
+suite "Pool afterConnect":
+  type HookLog = ref object
+    conns: seq[PgConnection]
+
+  proc hookPool(ms: MockServer, maxSize = 2): PgPool =
+    result = makePool(maxSize = maxSize)
+    result.config.connConfig = mockConfig(ms.port)
+
+  proc releaseGate(gate: Future[void]) =
+    # chronos cancels the gate along with the hook that awaits it.
+    if not gate.finished:
+      gate.complete()
+
+  test "an acquire's own dial runs the hook; a reused conn does not":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      let log = HookLog()
+      pool.config.afterConnect = makeAfterConnectHook:
+        doAssert conn.ownerPool == nil
+        log.conns.add(conn)
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms)
+      let conn = await acqFut
+      doAssert log.conns == @[conn]
+      doAssert conn.ownerPool == pool
+      doAssert pool.metrics.createCount == 1
+      conn.release()
+      let again = await pool.acquire()
+      doAssert again == conn
+      doAssert log.conns.len == 1
+      again.release()
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "newPool and the maintenance refill run the hook on each conn they open":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = HookLog()
+      var cfg = initPoolConfig(
+        mockConfig(ms.port),
+        minSize = 2,
+        maxSize = 3,
+        maintenanceInterval = milliseconds(20),
+      )
+      # Not the refill's fallback of `maintenanceInterval`.
+      cfg.connConfig.connectTimeout = seconds(5)
+      cfg.afterConnect = makeAfterConnectHook:
+        log.conns.add(conn)
+
+      let poolFut = newPool(cfg)
+      let st1 = await acceptAndReady(ms)
+      let st2 = await acceptAndReady(ms)
+      let pool = await poolFut
+      doAssert log.conns.len == 2
+      # One parked conn gone: the refill opens a replacement.
+      let dropped = pool.idle.popFirst()
+      await dropped.conn.close()
+      let st3 = await acceptAndReady(ms).wait(seconds(5))
+      let deadline = Moment.now() + seconds(5)
+      while pool.idle.len < 2 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(5))
+      doAssert pool.idle.len == 2
+      doAssert log.conns.len == 3
+      doAssert pool.metrics.createCount == 3
+
+      await pool.close()
+      for st in [st1, st2, st3]:
+        await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a raising hook fails the acquire and closes the conn, but never stops the pool":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms, maxSize = 1)
+      let log = HookLog()
+      # A config fault from a dial would stop the pool; from the hook it does not.
+      let cause = newException(PgConfigError, "hook says no")
+      pool.config.afterConnect = makeAfterConnectHook:
+        log.conns.add(conn)
+        if log.conns.len == 1:
+          raise cause
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms)
+      var err: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAfterConnectFailed
+      doAssert err.parent == (ref Exception)(cause)
+      doAssert retryAdvice(err) == raUnclear
+      doAssert pool.configFault == nil
+      doAssert pool.lastRefusal == nil
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 0
+      doAssert pool.metrics.connectFailureCount == 1
+      doAssert pool.metrics.createCount == 0
+      doAssert pool.metrics.closeCount == 0
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+
+      let acq2 = pool.acquire()
+      let st2 = await acceptAndReady(ms)
+      let conn = await acq2
+      doAssert log.conns.len == 2
+      conn.release()
+
+      await pool.close()
+      await closeClient(st)
+      await closeClient(st2)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a failed hook still clears a held refusal: the server took the session":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      discard pool.noteConnectFailure(
+        newStartupError(
+          "refused",
+          (ref PgQueryError)(msg: "28P01", sqlState: "28P01", severity: "FATAL"),
+        )
+      )
+      doAssert pool.connectRefusal() != nil
+      pool.config.afterConnect = makeAfterConnectHook:
+        raise newException(PgError, "hook failed")
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms)
+      var err: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAfterConnectFailed
+      doAssert pool.connectRefusal() == nil
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a hook that leaves a transaction open fails the connect":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      pool.config.afterConnect = makeAfterConnectHook:
+        conn.txStatus = tsInTransaction
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms)
+      var err: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAfterConnectFailed
+      doAssert err.parent of PgStateError
+      doAssert pool.active == 0
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a Defect from the hook fails the connect wrapped and closes the conn":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      pool.config.afterConnect = makeAfterConnectHook:
+        raise newException(AssertionDefect, "hook bug")
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms)
+      var err: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAfterConnectFailed
+      doAssert err.parent of PgPoolError
+      doAssert (ref PgPoolError)(err.parent).kind == pekDefectWrapped
+      doAssert err.parent.parent of AssertionDefect
+      doAssert pool.active == 0
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "newPool wraps the hook's error and closes every conn it opened":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let log = HookLog()
+      # A config fault of the hook's own must not read as the pool's.
+      let cause = newException(PgConfigError, "hook failed")
+      var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 2)
+      cfg.afterConnect = makeAfterConnectHook:
+        log.conns.add(conn)
+        if log.conns.len == 2:
+          raise cause
+
+      let poolFut = newPool(cfg)
+      let st1 = await acceptAndReady(ms)
+      let st2 = await acceptAndReady(ms)
+      var err: ref PgPoolError
+      try:
+        discard await poolFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAfterConnectFailed
+      doAssert err.parent == (ref Exception)(cause)
+      doAssert retryAdvice(err) == raUnclear
+      for st in [st1, st2]:
+        doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+        await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "the maintenance refill backs off after a failed hook, as after a failed dial":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      pool.config.minSize = 1
+      pool.config.maintenanceInterval = milliseconds(10)
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.connectBackoffInitial = seconds(30)
+      pool.config.connectBackoffMax = seconds(30)
+      pool.config.afterConnect = makeAfterConnectHook:
+        raise newException(PgConfigError, "hook says no")
+
+      pool.maintenanceTask = maintenanceLoop(pool)
+      let st = await acceptAndReady(ms).wait(seconds(5))
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+      let deadline = Moment.now() + seconds(5)
+      while pool.metrics.connectFailureCount == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(5))
+      doAssert pool.metrics.connectFailureCount == 1
+      doAssert pool.consecutiveConnectFailures == 1
+      doAssert pool.configFault == nil
+      doAssert pool.lastRefusal == nil
+      doAssert not pool.canAttemptConnect()
+      doAssert pool.active == 0
+      doAssert pool.idle.len == 0
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "the maintenance refill gives the hook maintenanceInterval":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      let gate = newFuture[void]("afterConnect gate")
+      pool.config.minSize = 1
+      pool.config.maintenanceInterval = milliseconds(50)
+      # Only the hook is held to `maintenanceInterval`, and one round dials.
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.connectBackoffInitial = seconds(30)
+      pool.config.connectBackoffMax = seconds(30)
+      pool.config.afterConnect = makeAfterConnectHook:
+        await gate
+
+      pool.maintenanceTask = maintenanceLoop(pool)
+      let st = await acceptAndReady(ms).wait(seconds(5))
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+      let deadline = Moment.now() + seconds(5)
+      while pool.metrics.connectFailureCount == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(5))
+      doAssert pool.metrics.connectFailureCount == 1
+      doAssert pool.metrics.createCount == 0
+
+      gate.releaseGate()
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "an acquire's budget covers the hook; one cut short has its conn closed":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      let gate = newFuture[void]("afterConnect gate")
+      pool.config.acquireTimeout = milliseconds(200)
+      pool.config.afterConnect = makeAfterConnectHook:
+        await gate
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms)
+      var err: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAcquireTimeout
+      doAssert pool.active == 0
+      doAssert pool.metrics.timeoutCount == 1
+      doAssert pool.metrics.createCount == 0
+      # Closed with the hook still hung, on asyncdispatch too.
+      doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
+      gate.releaseGate()
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a TimeZone the hook sets is the one resetSession restores":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      pool.config.afterConnect = makeAfterConnectHook:
+        # As the ParameterStatus after a `SET TimeZone` would.
+        conn.serverParams["TimeZone"] = "Asia/Tokyo"
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms, params = @[("TimeZone", "UTC")])
+      let conn = await acqFut
+      doAssert conn.connectTimeZone == "Asia/Tokyo"
+      doAssert not conn.timeZoneFollowsServer
+      doAssert not conn.timeZoneChanged
+      conn.release()
+      doAssert pool.idle.len == 1
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "an acquire's dial that used up the budget never runs the hook":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      let log = HookLog()
+      pool.config.acquireTimeout = milliseconds(100)
+      pool.config.afterConnect = makeAfterConnectHook:
+        log.conns.add(conn)
+
+      let acqFut = pool.acquire()
+      let st = await ms.accept()
+      await drainStartupMessage(st)
+      var err: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAcquireTimeout
+      when hasAsyncDispatch:
+        # The dial runs on past the budget; its timer may fire a little early,
+        # so land the handshake well after it.
+        await sleepAsync(milliseconds(50))
+        await sendFullHandshake(st)
+      doAssert await closedByPeer(st, seconds(5))
+      doAssert log.conns.len == 0
+
+      await pool.close()
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a hook cut short mid-request gets it cancelled, with no Terminate":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      pool.config.acquireTimeout = milliseconds(200)
+      pool.config.afterConnect = makeAfterConnectHook:
+        discard await conn.simpleExec("SELECT pg_sleep(60)")
+
+      let acqFut = pool.acquire()
+      let st = await acceptAndReady(ms)
+      doAssert (await drainFrontendMessage(st)).msgType == 'Q'
+      var err: ref PgPoolError
+      try:
+        discard await acqFut
+      except PgPoolError as e:
+        err = e
+      doAssert err != nil
+      doAssert err.kind == pekAcquireTimeout
+      # The CancelRequest dials the same server.
+      let cancelSt = await ms.accept().wait(seconds(5))
+      let request = await cancelSt.readN(16).wait(seconds(5))
+      doAssert decodeInt32(request, 4) == 80877102'i32
+      var terminated = false
+      try:
+        terminated = (await st.readN(1).wait(seconds(5)))[0] == byte('X')
+      except AsyncTimeoutError as e:
+        raise e
+      except CatchableError:
+        discard # closed with nothing more sent
+      doAssert not terminated
+
+      await pool.close()
+      await closeClient(cancelSt)
+      await closeClient(st)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a dial whose hook failed still clears a refusal of the same round":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms)
+      pool.config.minSize = 2
+      pool.config.maintenanceInterval = milliseconds(10)
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.connectBackoffInitial = seconds(30)
+      pool.config.connectBackoffMax = seconds(30)
+      pool.config.afterConnect = makeAfterConnectHook:
+        raise newException(PgError, "hook failed")
+
+      pool.maintenanceTask = maintenanceLoop(pool)
+      let st1 = await ms.accept().wait(seconds(5))
+      await drainStartupMessage(st1)
+      let st2 = await ms.accept().wait(seconds(5))
+      await drainStartupMessage(st2)
+      await sendFullHandshake(st1)
+      await sendBytes(st2, wrongPassword())
+      await closeClient(st2)
+      let deadline = Moment.now() + seconds(5)
+      while pool.metrics.connectFailureCount < 2 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(5))
+      doAssert pool.metrics.connectFailureCount == 2
+      doAssert pool.metrics.refusalCount == 1
+      doAssert pool.connectRefusal() == nil
+      doAssert (await drainFrontendMessage(st1).wait(seconds(5))).msgType == 'X'
+
+      await pool.close()
+      await closeClient(st1)
+      await closeServer(ms)
+
+    waitFor t()
+
+  test "a waiter queued behind a refill whose hook fails gets the slot at once":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let pool = hookPool(ms, maxSize = 1)
+      let log = HookLog()
+      let gate = newFuture[void]("afterConnect gate")
+      pool.config.minSize = 1
+      # Long enough that the next sweep's own grant cannot stand in for it.
+      pool.config.maintenanceInterval = milliseconds(200)
+      pool.config.connConfig.connectTimeout = seconds(5)
+      pool.config.afterConnect = makeAfterConnectHook:
+        log.conns.add(conn)
+        if log.conns.len == 1:
+          await gate
+          raise newException(PgError, "hook failed")
+
+      pool.maintenanceTask = maintenanceLoop(pool)
+      let st1 = await acceptAndReady(ms).wait(seconds(5))
+      let deadline = Moment.now() + seconds(5)
+      while log.conns.len == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      # The refill holds the only slot.
+      let acqFut = pool.acquire()
+      doAssert pool.waiterCount == 1
+      gate.releaseGate()
+      while pool.metrics.connectFailureCount == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(1))
+      doAssert pool.metrics.connectFailureCount == 1
+      # Granted in the pass that recorded the failure.
+      doAssert pool.waiterCount == 0
+      doAssert pool.dialsInFlight == 1
+      let st2 = await acceptAndReady(ms).wait(seconds(5))
+      let conn = await acqFut.wait(seconds(5))
+      doAssert log.conns.len == 2
+      conn.release()
+
+      await pool.close()
+      await closeClient(st1)
+      await closeClient(st2)
+      await closeServer(ms)
+
+    waitFor t()

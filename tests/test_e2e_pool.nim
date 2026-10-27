@@ -659,6 +659,57 @@ suite "E2E: Pool TimeZone":
 
     waitFor t()
 
+suite "E2E: Pool afterConnect":
+  proc setupHook(): AfterConnectHook =
+    makeAfterConnectHook:
+      discard await conn.simpleExec(
+        "SET statement_timeout = '4321ms'; SET TimeZone = 'Asia/Tokyo'"
+      )
+
+  proc showSetting(conn: PgConnection, name: string): Future[string] {.async.} =
+    let res = await conn.simpleQuery("SHOW " & name)
+    return res[0].rows[0][0].get().toString()
+
+  test "the hook's session setup reaches the borrower, and its TimeZone is restored":
+    proc t() {.async.} =
+      var cfg = initPoolConfig(plainConfig(), minSize = 1, maxSize = 1)
+      cfg.afterConnect = setupHook()
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        doAssert (await conn.showSetting("statement_timeout")) == "4321ms"
+        doAssert conn.serverParam("TimeZone") == "Asia/Tokyo"
+        discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
+      pool.withConnection(conn2):
+        doAssert conn2.serverParam("TimeZone") == "Asia/Tokyo"
+        doAssert (await conn2.showSetting("statement_timeout")) == "4321ms"
+      # The same conn throughout: neither borrow discarded it.
+      doAssert pool.metrics.createCount == 1
+      doAssert pool.metrics.closeCount == 0
+
+    waitFor t()
+
+  test "a RESET ALL resetQuery undoes the hook's SETs but restores its TimeZone":
+    proc t() {.async.} =
+      var cfg = initPoolConfig(
+        plainConfig(), minSize = 1, maxSize = 1, resetQuery = "RESET ALL"
+      )
+      cfg.afterConnect = setupHook()
+      let pool = await newPool(cfg)
+      defer:
+        await pool.close()
+
+      pool.withConnection(conn):
+        doAssert (await conn.showSetting("statement_timeout")) == "4321ms"
+      pool.withConnection(conn2):
+        doAssert (await conn2.showSetting("statement_timeout")) == "0"
+        doAssert conn2.serverParam("TimeZone") == "Asia/Tokyo"
+      doAssert pool.metrics.createCount == 1
+
+    waitFor t()
+
 suite "E2E: Pool Extended Query":
   test "pool.exec creates table":
     proc t() {.async.} =

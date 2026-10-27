@@ -250,6 +250,8 @@ export pg_pool.PoolConfig
 export pg_pool.PoolMetrics
 export pg_pool.PooledConnHandle
 export pg_pool.PgPool
+export pg_pool.AfterConnectHook
+export pg_pool.makeAfterConnectHook
 export pg_pool.initPoolConfig
 export pg_pool.poolConfig
 export pg_pool.idleCount

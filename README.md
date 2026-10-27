@@ -8,7 +8,7 @@ Async PostgreSQL client in Nim.
 - PostgreSQL wire protocol v3
 - Simple Query and Extended Query Protocol
 - Pipeline mode — batch multiple operations in a single network round trip
-- Connection pooling with health checks and maintenance (broken connections discarded on acquire/release)
+- Connection pooling with health checks and maintenance (broken connections discarded on acquire/release), and an `afterConnect` hook to set up each new connection
 - Pool cluster with read replica routing
 - SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full) with optional client certificate authentication (mTLS)
 - `sslnegotiation` mode (postgres, direct) for Direct SSL connections (PostgreSQL 17+)
