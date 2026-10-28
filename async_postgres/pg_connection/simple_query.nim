@@ -246,8 +246,12 @@ proc cancelRound(
     msg: seq[byte],
     abandoned: ref bool,
 ) {.async.} =
-  ## Dial the cancel connection ``side``, send ``msg`` and wait for the hang-up.
-  let dialed = await dialTargets(targets)
+  ## Dial the cancel connection ``side`` (``targets`` empty: what its host
+  ## resolves to), send ``msg`` and wait for the hang-up.
+  var toDial = targets
+  if toDial.len == 0:
+    toDial = await resolveTargets(side.host, side.port)
+  let dialed = await dialTargets(toDial)
   side.attachTransport(dialed.stream, dialed.target, sslHost)
   try:
     # Only on asyncdispatch, whose `wait` cannot stop a dial that lands late.
@@ -265,11 +269,7 @@ proc cancelWithin(conn: PgConnection, timeout: Duration) {.async.} =
   let msg = encodeCancelRequest(conn.pid, conn.secretKey)
   # The session's own address: another the host resolves to may be another
   # server, which would ignore the request.
-  let targets =
-    if conn.cancelTarget.len > 0:
-      conn.cancelTarget
-    else:
-      resolveTargets(conn.host, conn.port)
+  let targets = conn.cancelTarget
   # Taken before the dial, like the key: a reconnect may replace them meanwhile.
   let overTls = conn.sslEnabled
   let sslHost = conn.sslHost

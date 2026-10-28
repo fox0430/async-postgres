@@ -263,7 +263,9 @@ type
     applicationName*: string
     connectTimeout*: Duration
       ## Timeout per address a host resolves to, dial to ready (libpq
-      ## ``connect_timeout``); ``ZeroDuration`` (default, or negative) = none.
+      ## ``connect_timeout``), and on the lookup of each host (only with
+      ## threads on: without, the lookup blocks the loop, unbounded);
+      ## ``ZeroDuration`` (default, or negative) = none.
     keepAlive*: bool
       ## Enable TCP keepalive (default true via parseDsn). POSIX only: Windows
       ## has no keepalive path, so this and the timing options below are ignored there.

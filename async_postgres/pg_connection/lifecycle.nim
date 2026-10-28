@@ -488,6 +488,11 @@ proc connectToHostImpl(
     else:
       hostConfig(config, entry)
 
+  # Once, for both sslmode=allow legs to dial.
+  var toDial = targets
+  if toDial.len == 0:
+    toDial = await resolveTargets(entry.dialAddr, entry.port)
+
   # Without TLS there is no second leg: `negotiateSSL` leaves allow plaintext.
   if hasTls and config.sslMode == sslAllow and allowLeg == alNone:
     if isUnixSocket(entry.dialAddr):
@@ -495,13 +500,12 @@ proc connectToHostImpl(
       # there: one plaintext attempt, its error returned as-is (not folded
       # with a second, identical one).
       return await connectToHostImpl(
-        config, entry, alPlaintext, targets, creds, reached, true
+        config, entry, alPlaintext, toDial, creds, reached, true
       )
     if config.channelBinding == cbRequire or config.requireAuth == {amScramSha256Plus}:
       # Channel binding and SCRAM-SHA-256-PLUS need TLS, so the plaintext leg
       # could only fail.
-      return
-        await connectToHostImpl(config, entry, alTls, targets, creds, reached, true)
+      return await connectToHostImpl(config, entry, alTls, toDial, creds, reached, true)
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
     # WARNING: This is vulnerable to MITM downgrade attacks. A network
     # attacker can force the first attempt to fail and then intercept
@@ -509,7 +513,7 @@ proc connectToHostImpl(
     var plainErr: ref CatchableError
     try:
       return await connectToHostImpl(
-        config, entry, alPlaintext, targets, creds, reached, true
+        config, entry, alPlaintext, toDial, creds, reached, true
       )
     except CancelledError as e:
       raise e
@@ -519,8 +523,7 @@ proc connectToHostImpl(
 
     # Still allow, not require: an 'N' here is no refusal of required TLS.
     try:
-      return
-        await connectToHostImpl(config, entry, alTls, targets, creds, reached, true)
+      return await connectToHostImpl(config, entry, alTls, toDial, creds, reached, true)
     except CancelledError as e:
       raise e
     except PgConfigError as e:
@@ -544,11 +547,7 @@ proc connectToHostImpl(
 
   var conn: PgConnection
 
-  let dialing =
-    if targets.len > 0:
-      dialTargets(targets)
-    else:
-      dialServer(hostAddr, hostPort)
+  let dialing = dialTargets(toDial)
 
   when hasChronos:
     let dialed = await dialing
@@ -896,8 +895,9 @@ proc attemptHostTimed(
   ## ``attemptHost`` at each of ``targets`` in turn with ``creds``, each within
   ## its own ``connectTimeout`` (libpq semantics). Only a failed dial or a
   ## timeout moves on: past the dial, the host's one server has answered.
-  # The loop is inlined, not a proc per address: an extra future layer would
-  # delay chronos cancellation (see `dialServer`).
+  # The loop is inlined, not a proc per address: an extra future layer delays
+  # a pump's cancellation by a tick, which chronos (4.4) may run only at the
+  # next I/O or timer event.
   var failures: seq[ref CatchableError]
   var errors: seq[string]
   var timedOut = false
@@ -970,7 +970,7 @@ proc orderedHosts*(config: ConnConfig): seq[HostEntry] =
 
 proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Connect with multi-host failover, ``targetSessionAttrs``, ``connectTimeout``
-  ## per address a host resolves to.
+  ## per address a host resolves to and per lookup.
   ## Per-host failures fold into one ``PgConnectionError``; a ``PgConfigError`` escapes the fold.
   ## Unlike libpq, a failed authentication or security check moves on to the next
   ## host; a host's next address is tried only after a failed dial or a timeout.
@@ -1000,8 +1000,8 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     # first), so every host that failed is judged by its last attempt.
     var failures = newSeq[ref CatchableError](hosts.len)
     # Each host is checked, resolved and given its credentials once, on first
-    # use: the preferStandby passes share the lookup, a blocking call, and the
-    # credentials. `ready`: all three succeeded.
+    # use: the preferStandby passes share the lookup and the credentials.
+    # `ready`: all three succeeded.
     var prepared = newSeq[
       tuple[config: ConnConfig, targets: seq[DialTarget], creds: AuthCreds, ready: bool]
     ](hosts.len)
@@ -1009,7 +1009,8 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     template prepare(i: int) =
       prepared[i].config = hostConfig(config, hosts[i], validated = true)
       # After the check: a config fault must not hide behind a failed lookup.
-      prepared[i].targets = resolveTargets(hosts[i].dialAddr, hosts[i].port)
+      prepared[i].targets =
+        await resolveTargets(hosts[i].dialAddr, hosts[i].port, config.connectTimeout)
 
     template attempt(i: int, attrs: TargetSessionAttrs): untyped =
       attemptHostTimed(

@@ -7,6 +7,8 @@
 ## prevents accidental reuse (`csClosed`).
 
 import std/[unittest, strutils, base64]
+when defined(linux):
+  from std/os import walkDir
 
 import pkg/nimcrypto/pbkdf2
 
@@ -14,6 +16,12 @@ import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/types
+when compileOption("threads"):
+  import std/[atomics, importutils, tables]
+  from std/os import sleep
+  from ../async_postgres/pg_connection/buffer_io {.all.} import
+    threadGai, gai, Lookup, LookupFlight, flights
+  privateAccess(LookupFlight)
 from ../async_postgres/pg_connection/lifecycle {.all.} import
   attemptHostTimed, fixedCredentials
 from ../async_postgres/pg_connection/simple_query {.all.} import
@@ -36,6 +44,44 @@ proc mockConfig(port: int): ConnConfig =
     password: "pencil",
     sslMode: sslDisable,
   )
+
+when compileOption("threads"):
+  var lookupHeld: Atomic[bool]
+  var lookupsStarted, lookupsDone: Atomic[int]
+
+  proc heldGai(host, service: cstring, numeric: bool): Lookup {.raises: [], gcsafe.} =
+    discard lookupsStarted.fetchAdd(1)
+    while lookupHeld.load():
+      sleep(1)
+    result = gai(host, service, numeric)
+    discard lookupsDone.fetchAdd(1)
+
+  proc countLookups(held: bool) =
+    ## Count the lookup threads from here on, holding them back while ``held``.
+    lookupsStarted.store(0)
+    lookupsDone.store(0)
+    lookupHeld.store(held)
+    threadGai = heldGai
+
+  proc restoreLookups() =
+    lookupHeld.store(false)
+    threadGai = gai
+
+  proc heldLookup(cfg: ConnConfig): Future[ref CatchableError] {.async.} =
+    ## ``connect(cfg)``'s failure while every name lookup is held.
+    countLookups(held = true)
+    try:
+      discard await connect(cfg)
+    except CatchableError as e:
+      result = e
+    finally:
+      restoreLookups()
+    # Let the held lookup finish and the loop reap its thread.
+    for _ in 0 ..< 1000:
+      if lookupsDone.load() > 0:
+        break
+      await sleepAsync(milliseconds(5))
+    await sleepAsync(milliseconds(20))
 
 proc hasIpv6Loopback(): bool =
   ## Whether ::1 can be bound: not in a container or runner with IPv6 off.
@@ -141,7 +187,7 @@ suite "Dial":
         let ms = startMockServer()
         let accepted = ms.accept()
         let side = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
-        let dialed = await dialTargets(resolveTargets("127.0.0.1", ms.port))
+        let dialed = await dialTargets(await resolveTargets("127.0.0.1", ms.port))
         side.attachTransport(dialed.stream, dialed.target, "")
         let client = await accepted
         when hasChronos:
@@ -166,7 +212,7 @@ suite "Dial":
         let ms = startMockServer()
         let accepted = ms.accept()
         let conn = newPgConnection("127.0.0.1", ms.port, mockConfig(ms.port))
-        let dialed = await dialTargets(resolveTargets("127.0.0.1", ms.port))
+        let dialed = await dialTargets(await resolveTargets("127.0.0.1", ms.port))
         conn.attachTransport(dialed.stream, dialed.target, "")
         when hasChronos:
           conn.initPlainStreams()
@@ -197,8 +243,8 @@ suite "Dial":
       proc testBody(): Future[string] {.async.} =
         let ms = startMockServer("127.0.0.1")
         let accepted = ms.accept()
-        let targets =
-          resolveTargets("127.0.0.2", ms.port) & resolveTargets("127.0.0.1", ms.port)
+        var targets = await resolveTargets("127.0.0.2", ms.port)
+        targets.add(await resolveTargets("127.0.0.1", ms.port))
         let dialed = await dialTargets(targets)
         let client = await accepted
         result = dialed.target.shown
@@ -213,8 +259,8 @@ suite "Dial":
         let ms = startMockServer("127.0.0.1")
         let port = ms.port
         await closeServer(ms)
-        let targets =
-          resolveTargets("127.0.0.2", port) & resolveTargets("127.0.0.3", port)
+        var targets = await resolveTargets("127.0.0.2", port)
+        targets.add(await resolveTargets("127.0.0.3", port))
         try:
           discard await dialTargets(targets)
         except CatchableError as e:
@@ -257,19 +303,184 @@ suite "Dial":
     # A container or pod may not be registered yet; a typo retries to the cap.
     var err: ref CatchableError
     try:
-      discard resolveTargets("nonexistent.invalid", 5432)
+      discard waitFor resolveTargets("nonexistent.invalid", 5432)
     except CatchableError as e:
       err = e
     check err of PgUnavailableError
     check "nonexistent.invalid" in err.msg
     check isTransientError(err)
 
+  test "an unbounded timeout reads as none":
+    # A timer this far out would overflow the clock; it is the largest value
+    # the DSN parser accepts, so the lookup must read it as no timeout.
+    let huge = seconds(9223372036)
+    check isUnbounded(huge)
+    check (waitFor resolveTargets("localhost", 5432, huge)).len > 0
+
+  test "a literal address arms no lookup timer":
+    let held = holdTimer()
+    let timers = farTimerCount()
+    check resolveTargets("127.0.0.1", 5432, hours(48)).finished()
+    check farTimerCount() == timers
+    cancelTimer(held)
+
+  when compileOption("threads"):
+    test "a name is looked up off the loop, a literal address at once":
+      let literal = resolveTargets("127.0.0.1", 5432)
+      check literal.finished()
+      let named = resolveTargets("localhost", 5432)
+      # Only the loop can take the lookup thread's report.
+      check not named.finished()
+      check (waitFor named).len > 0
+
+    test "a lookup past connectTimeout fails a lone host with a raw timeout":
+      # The pool retries on the type, as for a dial that timed out.
+      var cfg = mockConfig(5432)
+      cfg.host = "localhost"
+      cfg.connectTimeout = milliseconds(50)
+      let err = waitFor heldLookup(cfg)
+      check err of AsyncTimeoutError
+      check "Could not resolve host localhost: no answer within" in err.msg
+
+    test "a lookup past connectTimeout folds with the other hosts' failures":
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      waitFor closeServer(gone)
+      var cfg = mockConfig(refusedPort)
+      cfg.hosts = @[
+        HostEntry(host: "localhost", port: refusedPort),
+        HostEntry(host: "127.0.0.1", port: refusedPort),
+      ]
+      cfg.connectTimeout = milliseconds(50)
+      let err = waitFor heldLookup(cfg)
+      require err of PgConnectionError
+      let attempts = (ref PgConnectionError)(err).attempts
+      check attempts.len == 2
+      check attempts[0] of AsyncTimeoutError
+      check "Could not resolve host localhost: no answer within" in err.msg
+      check isTransientError(err)
+
+    test "concurrent lookups of one name and port share a thread":
+      proc testBody(): Future[seq[int]] {.async.} =
+        countLookups(held = false)
+        try:
+          let a = resolveTargets("localhost", 5432)
+          let b = resolveTargets("localhost", 5432)
+          let otherPort = resolveTargets("localhost", 5433)
+          let ta = await a
+          let tb = await b
+          discard await otherPort
+          result = @[ta.len, tb.len, lookupsStarted.load()]
+        finally:
+          restoreLookups()
+
+      let r = waitFor testBody()
+      check r[0] > 0
+      check r[1] == r[0]
+      check r[2] == 2
+
+    test "a retry joins the lookup a timed-out connect left in flight":
+      proc testBody(): Future[seq[int]] {.async.} =
+        var cfg = mockConfig(5432)
+        cfg.host = "localhost"
+        cfg.connectTimeout = milliseconds(50)
+        countLookups(held = true)
+        try:
+          try:
+            discard await connect(cfg)
+          except CatchableError:
+            discard
+          let retry = resolveTargets("localhost", 5432)
+          result.add(ord(retry.finished))
+          lookupHeld.store(false)
+          let targets = await retry
+          result.add(targets.len)
+          result.add(lookupsStarted.load())
+          # Landed, it is not kept: the next call looks the name up afresh.
+          discard await resolveTargets("localhost", 5432)
+          result.add(lookupsStarted.load())
+        finally:
+          restoreLookups()
+
+      let r = waitFor testBody()
+      check r[0] == 0
+      check r[1] > 0
+      check r[2] == 1
+      check r[3] == 2
+
+    test "a call that gave up on a lookup is dropped once the next joins":
+      proc testBody(): Future[seq[int]] {.async.} =
+        countLookups(held = true)
+        try:
+          for _ in 0 ..< 3:
+            try:
+              discard await resolveTargets("localhost", 5432, milliseconds(20))
+            except AsyncTimeoutError:
+              discard
+          result.add(flights[("localhost", 5432)].waiters.len)
+          lookupHeld.store(false)
+          discard await resolveTargets("localhost", 5432)
+          result.add(lookupsStarted.load())
+        finally:
+          restoreLookups()
+
+      check (waitFor testBody()) == @[1, 1]
+
+    test "sslmode=allow looks a name up once for both legs":
+      let gone = startMockServer()
+      let refusedPort = gone.port
+      waitFor closeServer(gone)
+
+      proc testBody(): Future[int] {.async.} =
+        var cfg = mockConfig(refusedPort)
+        cfg.sslMode = sslAllow
+        countLookups(held = false)
+        try:
+          discard
+            await connectToHost(cfg, HostEntry(host: "localhost", port: refusedPort))
+        except CatchableError:
+          discard
+        finally:
+          restoreLookups()
+        lookupsStarted.load()
+
+      check (waitFor testBody()) == 1
+
+  when defined(linux):
+    proc openFds(): int =
+      for _ in walkDir("/proc/self/fd"):
+        inc result
+
+    test "a name lookup leaves no descriptor behind":
+      proc testBody(): Future[int] {.async.} =
+        let before = openFds()
+        discard await resolveTargets("localhost", 5432)
+        openFds() - before
+
+      check (waitFor testBody()) == 0
+
+    when hasChronos and compileOption("threads"):
+      test "a lookup cancelled in flight is reaped once its thread reports":
+        proc testBody(): Future[(bool, int)] {.async.} =
+          let before = openFds()
+          let named = resolveTargets("localhost", 5432)
+          await cancelAndWaitPumped(named)
+          result[0] = named.cancelled()
+          # The thread's signal is closed by the reap.
+          let deadline = Moment.now() + seconds(5)
+          while openFds() != before and Moment.now() < deadline:
+            await sleepAsync(milliseconds(10))
+          result[1] = openFds() - before
+
+        check (waitFor testBody()) == (true, 0)
+
   when hasAsyncDispatch and defined(linux):
     test "a mapped IPv4 is dialed over IPv4, with no second lookup":
       proc testBody(): Future[string] {.async.} =
         let ms = startMockServer("127.0.0.1")
         let accepted = ms.accept()
-        let dialed = await dialTargets(resolveTargets("::ffff:127.0.0.1", ms.port))
+        let dialed =
+          await dialTargets(await resolveTargets("::ffff:127.0.0.1", ms.port))
         let client = await accepted
         result = dialed.target.shown
         await closeClient(dialed.stream)
@@ -279,11 +490,11 @@ suite "Dial":
       check (waitFor testBody()) == "127.0.0.1"
 
     test "a resolved address keeps its zone and unmaps a mapped IPv4":
-      let linkLocal = resolveTargets("fe80::1%1", 5432)
+      let linkLocal = waitFor resolveTargets("fe80::1%1", 5432)
       check linkLocal.len == 1
       check linkLocal[0].domain == Domain.AF_INET6
       check linkLocal[0].address == "fe80::1%1"
-      let mapped = resolveTargets("::ffff:127.0.0.1", 5432)
+      let mapped = waitFor resolveTargets("::ffff:127.0.0.1", 5432)
       check mapped.len == 1
       check mapped[0].domain == Domain.AF_INET
       check mapped[0].address == "127.0.0.1"
@@ -322,8 +533,8 @@ suite "Per-address connectTimeout":
       let ms = startMockServer()
       let stalled = silent.accept()
       let accepted = ms.acceptAndReady()
-      let targets =
-        resolveTargets("127.0.0.1", silent.port) & resolveTargets("127.0.0.1", ms.port)
+      var targets = await resolveTargets("127.0.0.1", silent.port)
+      targets.add(await resolveTargets("127.0.0.1", ms.port))
       let cfg = timedConfig(ms.port)
       let conn = await attemptHostTimed(
         cfg,
@@ -348,8 +559,8 @@ suite "Per-address connectTimeout":
       let b = startMockServer()
       let stalledA = a.accept()
       let stalledB = b.accept()
-      let targets =
-        resolveTargets("127.0.0.1", a.port) & resolveTargets("127.0.0.1", b.port)
+      var targets = await resolveTargets("127.0.0.1", a.port)
+      targets.add(await resolveTargets("127.0.0.1", b.port))
       var cfg = timedConfig(a.port)
       # Each address waits out its own budget; nothing here needs it long.
       cfg.connectTimeout = milliseconds(100)
@@ -380,9 +591,8 @@ suite "Per-address connectTimeout":
       let refusedPort = gone.port
       await closeServer(gone)
       let stalled = silent.accept()
-      let targets =
-        resolveTargets("127.0.0.1", silent.port) &
-        resolveTargets("127.0.0.1", refusedPort)
+      var targets = await resolveTargets("127.0.0.1", silent.port)
+      targets.add(await resolveTargets("127.0.0.1", refusedPort))
       var cfg = timedConfig(silent.port)
       when defined(windows):
         # Windows retries a refused SYN for about 2s before failing the dial.
@@ -427,9 +637,8 @@ suite "Per-address connectTimeout":
       let serverFut = refuse()
       var cfg = mockConfig(refusing.port)
       cfg.connectTimeout = timeout
-      let targets =
-        resolveTargets("127.0.0.1", refusing.port) &
-        resolveTargets("127.0.0.1", refusedPort)
+      var targets = await resolveTargets("127.0.0.1", refusing.port)
+      targets.add(await resolveTargets("127.0.0.1", refusedPort))
       try:
         discard await attemptHostTimed(
           cfg,
@@ -467,9 +676,8 @@ suite "Per-address connectTimeout":
       let serverFut = serve()
       var cfg = mockConfig(standby.port)
       cfg.connectTimeout = timeout
-      let targets =
-        resolveTargets("127.0.0.1", standby.port) &
-        resolveTargets("127.0.0.1", refusedPort)
+      var targets = await resolveTargets("127.0.0.1", standby.port)
+      targets.add(await resolveTargets("127.0.0.1", refusedPort))
       let conn = await attemptHostTimed(
         cfg,
         HostEntry(host: "127.0.0.1", port: standby.port),
@@ -495,8 +703,8 @@ suite "Per-address connectTimeout":
       await closeServer(gone)
       let ms = startMockServer()
       let accepted = ms.acceptAndReady()
-      let targets =
-        resolveTargets("127.0.0.1", refusedPort) & resolveTargets("127.0.0.1", ms.port)
+      var targets = await resolveTargets("127.0.0.1", refusedPort)
+      targets.add(await resolveTargets("127.0.0.1", ms.port))
       let cfg = mockConfig(refusedPort)
       let conn = await attemptHostTimed(
         cfg,

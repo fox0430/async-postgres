@@ -7,7 +7,9 @@
 ## - Transport teardown (`closeTransport`)
 ## - TCP keepalive / TCP_NODELAY socket options
 ## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`) and dialing
-##   (`resolveTargets`, `dialTargets`, `dialServer`, `socketError`, `oneLine`)
+##   (`resolveTargets`, `dialTargets`, `socketError`, `oneLine`); a name is
+##   looked up on a thread, one per name and port in flight, as `getaddrinfo`
+##   blocks
 ## - `makeCopyOutCallback` / `makeCopyInCallback` cross-backend templates
 ##
 ## The receive buffer and its fills live in `types` with the private
@@ -21,6 +23,8 @@
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
 import std/[options, strutils]
+when compileOption("threads"):
+  import std/[sequtils, tables, typedthreads]
 when defined(posix):
   import std/posix
 
@@ -29,11 +33,14 @@ import types
 
 when hasChronos:
   import chronos/streams/tlsstream
+  when compileOption("threads"):
+    import chronos/threadsync
+  when defined(windows):
+    from chronos/osdefs import Sockaddr_storage, SockLen
 elif hasAsyncDispatch:
   import std/asyncnet
   from std/nativesockets import
-    Domain, SockType, Protocol, `==`, getAddrInfo, freeAddrInfo, toKnownDomain,
-    getAddrString, getSockOptInt
+    Domain, SockType, Protocol, `==`, toKnownDomain, getAddrString, getSockOptInt
   when defined(posix):
     from std/oserrors import OSErrorCode, newOSError, osLastError
 
@@ -43,11 +50,14 @@ when defined(posix):
   var MSG_DONTWAIT {.importc, header: "<sys/socket.h>".}: cint
 elif defined(windows):
   from std/winlean import nil
+  from std/oserrors import nil
 
   # winsock2.h values winlean lacks
   const
     WSAENOBUFS = 10055'i32
     IpprotoTcp = 6.cint
+    SockStream = 1.cint
+    AiNumericHost = 4.cint
 
 type
   RecvWatch* = ref object
@@ -183,28 +193,172 @@ proc unresolved(host: string): ref PgConnectionError =
   newException(PgUnavailableError, lookupFailed(host, "no addresses"))
 
 when defined(posix):
-  proc lookup(host: string, port: int): ptr posix.AddrInfo =
-    ## ``host``'s TCP addresses, to free with ``freeAddrInfo``. An unknown name
-    ## is transient: it may be a container not registered yet.
+  type AddrList = ptr posix.AddrInfo
+else:
+  type AddrList = ptr winlean.AddrInfo
+
+type Lookup = object ## One ``getaddrinfo`` outcome.
+  rc: cint
+  sysErr: cint ## ``errno`` for ``EAI_SYSTEM``, read on the calling thread
+  list: AddrList ## to free with ``freeList``
+
+proc gai(host, service: cstring, numeric: bool): Lookup {.raises: [], gcsafe.} =
+  ## ``host``'s TCP addresses; ``numeric``: parse a literal address, no resolver.
+  when defined(posix):
     var hints: posix.AddrInfo
+    if numeric:
+      hints.ai_flags = posix.AI_NUMERICHOST
     hints.ai_family = posix.AF_UNSPEC
     hints.ai_socktype = posix.SOCK_STREAM
     hints.ai_protocol = posix.IPPROTO_TCP
-    let rc = posix.getaddrinfo(cstring(host), cstring($port), addr hints, result)
-    if rc != 0:
-      let sysErr = posix.errno
-      let reason =
-        if rc == posix.EAI_SYSTEM:
-          $posix.strerror(sysErr)
+    result.rc = posix.getaddrinfo(host, service, addr hints, result.list)
+    if result.rc == posix.EAI_SYSTEM:
+      result.sysErr = posix.errno
+  else:
+    var hints: winlean.AddrInfo
+    if numeric:
+      hints.ai_flags = AiNumericHost
+    hints.ai_family = winlean.AF_UNSPEC
+    hints.ai_socktype = SockStream
+    hints.ai_protocol = IpprotoTcp
+    # Its return is the WSA error code.
+    result.rc = winlean.getaddrinfo(host, service, addr hints, result.list)
+
+proc freeList(list: AddrList) =
+  when defined(posix):
+    posix.freeAddrInfo(list)
+  else:
+    winlean.freeAddrInfo(list)
+
+proc lookupError(host: string, found: Lookup): ref PgConnectionError =
+  ## ``found``'s failure. An unknown name is transient: it may be a container
+  ## not registered yet.
+  when defined(posix):
+    let reason =
+      if found.rc == posix.EAI_SYSTEM:
+        $posix.strerror(found.sysErr)
+      else:
+        $posix.gai_strerror(found.rc)
+    let msg = lookupFailed(host, reason)
+    if found.rc in [
+      posix.EAI_FAIL, posix.EAI_FAMILY, posix.EAI_SOCKTYPE, posix.EAI_SERVICE,
+      posix.EAI_BADFLAGS,
+    ] or (found.rc == posix.EAI_SYSTEM and not isTransientErrno(found.sysErr)):
+      return newException(PgConnectionError, msg)
+    newException(PgUnavailableError, msg)
+  else:
+    const WSANO_RECOVERY = 11003 # as EAI_FAIL
+    let msg =
+      lookupFailed(host, oneLine(oserrors.osErrorMsg(oserrors.OSErrorCode(found.rc))))
+    if found.rc == WSANO_RECOVERY:
+      return newException(PgConnectionError, msg)
+    newException(PgUnavailableError, msg)
+
+when compileOption("threads"):
+  type LookupJob = object
+    ## A lookup on a thread of its own. Kept on the loop's thread until that
+    ## thread is joined; the thread writes only ``found``.
+    host, service: string
+    found: Lookup
+    thread: Thread[ptr LookupJob]
+    when hasChronos:
+      signal: ThreadSignalPtr
+    else:
+      event: AsyncEvent
+
+  var threadGai:
+    proc(host, service: cstring, numeric: bool): Lookup {.nimcall, raises: [], gcsafe.} =
+    gai ## What a lookup thread runs; tests stall it.
+
+  proc runLookup(job: ptr LookupJob) {.thread, raises: [].} =
+    job.found = threadGai(cstring(job.host), cstring(job.service), numeric = false)
+    when hasChronos:
+      discard job.signal.fireSync()
+    else:
+      try:
+        job.event.trigger()
+      except CatchableError:
+        discard
+
+  proc reap(job: ref LookupJob) =
+    ## Join ``job``'s thread and release its signal.
+    joinThread(job.thread)
+    when defined(windows):
+      # joinThread leaves the handle open.
+      discard winlean.closeHandle(job.thread.handle)
+    when hasChronos:
+      discard job.signal.close()
+    else:
+      try:
+        job.event.close()
+      except CatchableError:
+        discard
+
+  proc unstarted(host: string, e: ref CatchableError): ref PgConnectionError =
+    ## A lookup thread or its signal that could not be made.
+    (ref PgUnavailableError)(msg: lookupFailed(host, oneLine(e.msg)), parent: e)
+
+  when hasChronos:
+    proc startLookup(job: ref LookupJob, landed: proc() {.gcsafe, raises: [].}) =
+      ## Run ``job`` on a thread of its own; once it reports, join it and run
+      ## ``landed`` on the loop.
+      let signal = ThreadSignalPtr.new()
+      if signal.isErr:
+        raise newException(PgUnavailableError, lookupFailed(job.host, signal.error))
+      job.signal = signal.get
+      try:
+        createThread(job.thread, runLookup, addr job[])
+      except ResourceExhaustedError as e:
+        discard job.signal.close()
+        raise unstarted(job.host, e)
+      job.signal.wait().addCallback(
+        proc(udata: pointer) {.gcsafe, raises: [].} =
+          # A failed wait leaves reap to join the blocking way.
+          reap(job)
+          landed()
+      )
+
+  else:
+    proc startLookup(job: ref LookupJob, landed: proc() {.gcsafe.}) =
+      ## Run ``job`` on a thread of its own; once it reports, join it and run
+      ## ``landed`` on the loop.
+      try:
+        job.event = newAsyncEvent()
+      except CatchableError as e:
+        raise unstarted(job.host, e)
+      # Before the thread starts: a failure here leaves no thread to wait out.
+      try:
+        job.event.addEvent(
+          proc(fd: AsyncFD): bool =
+            # Once the dispatcher is done with the event, which reap closes.
+            callSoon(
+              proc() =
+                reap(job)
+                landed()
+            )
+            true
+        )
+      except CatchableError as e:
+        when defined(windows):
+          # addEvent has closed the handle; only the event's memory is left.
+          deallocShared(cast[pointer](job.event))
         else:
-          $posix.gai_strerror(rc)
-      let msg = lookupFailed(host, reason)
-      if rc in [
-        posix.EAI_FAIL, posix.EAI_FAMILY, posix.EAI_SOCKTYPE, posix.EAI_SERVICE,
-        posix.EAI_BADFLAGS,
-      ] or (rc == posix.EAI_SYSTEM and not isTransientErrno(sysErr)):
-        raise newException(PgConnectionError, msg)
-      raise newException(PgUnavailableError, msg)
+          try:
+            job.event.close()
+          except CatchableError:
+            discard
+        raise unstarted(job.host, e)
+      try:
+        createThread(job.thread, runLookup, addr job[])
+      except ResourceExhaustedError as e:
+        # Still registered, a closed event's number could be reused: a failed
+        # unregister leaves it open.
+        try:
+          job.event.unregister()
+          job.event.close()
+        except CatchableError:
+          discard
+        raise unstarted(job.host, e)
 
 when hasChronos:
   type
@@ -219,40 +373,27 @@ when hasChronos:
     else:
       t.host
 
-  proc resolveTargets*(host: string, port: int): seq[DialTarget] =
-    ## What ``host`` names: its Unix socket, or each address it resolves to in
-    ## the resolver's order.
-    if isUnixSocket(host):
-      when defined(posix):
-        try:
-          return @[initTAddress(unixSocketPath(host, port))]
-        except TransportAddressError as e:
-          raise (ref PgConnectionError)(msg: e.msg, parent: e)
-      else:
-        raise newException(
-          PgConnectionError, "Unix sockets are not supported on this platform"
-        )
+  proc unixTargets(host: string, port: int): seq[DialTarget] =
+    ## The Unix socket ``host`` names.
     when defined(posix):
-      let aiList = lookup(host, port)
       try:
-        var it = aiList
-        while it != nil:
-          var ta: TransportAddress
-          fromSAddr(cast[ptr Sockaddr_storage](it.ai_addr), SockLen(it.ai_addrlen), ta)
-          if ta.family in {AddressFamily.IPv4, AddressFamily.IPv6} and ta notin result:
-            result.add(ta)
-          it = it.ai_next
-      finally:
-        posix.freeAddrInfo(aiList)
-    else:
-      try:
-        result = resolveTAddress(host, Port(port))
+        @[initTAddress(unixSocketPath(host, port))]
       except TransportAddressError as e:
-        # Its resolver code is lost here: judged as a name not known yet.
-        raise
-          (ref PgUnavailableError)(msg: lookupFailed(host, oneLine(e.msg)), parent: e)
-    if result.len == 0:
-      raise unresolved(host)
+        raise (ref PgConnectionError)(msg: e.msg, parent: e)
+    else:
+      raise newException(
+        PgConnectionError, "Unix sockets are not supported on this platform"
+      )
+
+  proc ipTargets(list: AddrList, port: int): seq[DialTarget] =
+    ## ``list``'s IP addresses in order, each once; they carry ``port`` already.
+    var it = list
+    while it != nil:
+      var ta: TransportAddress
+      fromSAddr(cast[ptr Sockaddr_storage](it.ai_addr), SockLen(it.ai_addrlen), ta)
+      if ta.family in {AddressFamily.IPv4, AddressFamily.IPv6} and ta notin result:
+        result.add(ta)
+      it = it.ai_next
 
   proc dialTargets*(targets: seq[DialTarget]): Future[Dialed] {.async.} =
     ## Connect to the first of ``targets`` that accepts, as libpq does.
@@ -292,91 +433,71 @@ elif hasAsyncDispatch:
     # Not `sa`: the text names the address, zone included.
     a.domain == b.domain and a.address == b.address and a.port == b.port
 
-  proc resolveTargets*(host: string, port: int): seq[DialTarget] =
-    ## What ``host`` names: its Unix socket, or each address it resolves to in
-    ## the resolver's order.
-    if isUnixSocket(host):
-      when defined(posix):
-        var t: DialTarget
-        t.domain = Domain.AF_UNIX
-        t.address = unixSocketPath(host, port)
-        t.port = Port(port)
-        return @[t]
-      else:
-        raise newException(
-          PgConnectionError, "Unix sockets are not supported on this platform"
-        )
+  proc unixTargets(host: string, port: int): seq[DialTarget] =
+    ## The Unix socket ``host`` names.
     when defined(posix):
-      let aiList = lookup(host, port)
-      try:
-        var it = aiList
-        while it != nil:
-          var t: DialTarget
-          t.port = Port(port)
-          if it.ai_family == posix.AF_INET:
+      var t: DialTarget
+      t.domain = Domain.AF_UNIX
+      t.address = unixSocketPath(host, port)
+      t.port = Port(port)
+      @[t]
+    else:
+      raise newException(
+        PgConnectionError, "Unix sockets are not supported on this platform"
+      )
+
+  proc ipTargets(list: AddrList, port: int): seq[DialTarget] =
+    ## ``list``'s IP addresses in order, each once.
+    var it = list
+    when defined(posix):
+      while it != nil:
+        var t: DialTarget
+        t.port = Port(port)
+        if it.ai_family == posix.AF_INET:
+          t.domain = Domain.AF_INET
+          copyMem(addr t.sa, it.ai_addr, it.ai_addrlen)
+          t.saLen = it.ai_addrlen
+        elif it.ai_family == posix.AF_INET6:
+          let sa6 = cast[ptr Sockaddr_in6](it.ai_addr)
+          if posix.IN6_IS_ADDR_V4MAPPED(addr sa6.sin6_addr) != 0:
+            # Dial the IPv4 it names: an AF_INET6 socket may be v6-only.
+            var sa4: Sockaddr_in
+            sa4.sin_family = typeof(sa4.sin_family)(posix.AF_INET)
+            sa4.sin_port = sa6.sin6_port
+            copyMem(addr sa4.sin_addr, addr sa6.sin6_addr.s6_addr[12], 4)
             t.domain = Domain.AF_INET
+            copyMem(addr t.sa, addr sa4, sizeof(sa4))
+            t.saLen = SockLen(sizeof(sa4))
+          else:
+            t.domain = Domain.AF_INET6
             copyMem(addr t.sa, it.ai_addr, it.ai_addrlen)
             t.saLen = it.ai_addrlen
-          elif it.ai_family == posix.AF_INET6:
-            let sa6 = cast[ptr Sockaddr_in6](it.ai_addr)
-            if posix.IN6_IS_ADDR_V4MAPPED(addr sa6.sin6_addr) != 0:
-              # Dial the IPv4 it names: an AF_INET6 socket may be v6-only.
-              var sa4: Sockaddr_in
-              sa4.sin_family = typeof(sa4.sin_family)(posix.AF_INET)
-              sa4.sin_port = sa6.sin6_port
-              copyMem(addr sa4.sin_addr, addr sa6.sin6_addr.s6_addr[12], 4)
-              t.domain = Domain.AF_INET
-              copyMem(addr t.sa, addr sa4, sizeof(sa4))
-              t.saLen = SockLen(sizeof(sa4))
-            else:
-              t.domain = Domain.AF_INET6
-              copyMem(addr t.sa, it.ai_addr, it.ai_addrlen)
-              t.saLen = it.ai_addrlen
-          else:
-            it = it.ai_next
-            continue
-          # nim doc builds nativesockets on winlean: name its types.
-          t.address = getAddrString(cast[ptr nativesockets.SockAddr](addr t.sa))
-          if t.domain == Domain.AF_INET6:
-            # The text form drops a link-local address's zone; keep it.
-            let scope = cast[ptr Sockaddr_in6](addr t.sa).sin6_scope_id
-            if scope != 0:
-              t.address.add("%" & $scope)
+        else:
+          it = it.ai_next
+          continue
+        # nim doc builds nativesockets on winlean: name its types.
+        t.address = getAddrString(cast[ptr nativesockets.SockAddr](addr t.sa))
+        if t.domain == Domain.AF_INET6:
+          # The text form drops a link-local address's zone; keep it.
+          let scope = cast[ptr Sockaddr_in6](addr t.sa).sin6_scope_id
+          if scope != 0:
+            t.address.add("%" & $scope)
+        if t notin result:
+          result.add(t)
+        it = it.ai_next
+    else:
+      while it != nil:
+        let known = toKnownDomain(it.ai_family)
+        if known.isSome and known.get in {Domain.AF_INET, Domain.AF_INET6}:
+          var domain = known.get
+          let ip = getAddrString(it.ai_addr)
+          if domain == Domain.AF_INET6 and ':' notin ip:
+            # getAddrString unmaps ::ffff:a.b.c.d; dial the IPv4 it names.
+            domain = Domain.AF_INET
+          let t: DialTarget = (domain: domain, address: ip, port: Port(port))
           if t notin result:
             result.add(t)
-          it = it.ai_next
-      finally:
-        posix.freeAddrInfo(aiList)
-    else:
-      # Resolved here rather than by std `dial`: its lookup failure carries a
-      # stale errno, so only this split tells it from a refused connect.
-      let aiList =
-        try:
-          getAddrInfo(host, Port(port), Domain.AF_UNSPEC)
-        except OSError as e:
-          const WSANO_RECOVERY = 11003 # as EAI_FAIL
-          let msg = lookupFailed(host, oneLine(e.msg))
-          if e.errorCode == WSANO_RECOVERY:
-            raise (ref PgConnectionError)(msg: msg, parent: e)
-          raise (ref PgUnavailableError)(msg: msg, parent: e)
-      try:
-        var it = aiList
-        while it != nil:
-          let known = toKnownDomain(it.ai_family)
-          if known.isSome and known.get in {Domain.AF_INET, Domain.AF_INET6}:
-            var domain = known.get
-            let ip = getAddrString(it.ai_addr)
-            if domain == Domain.AF_INET6 and ':' notin ip:
-              # getAddrString unmaps ::ffff:a.b.c.d; dial the IPv4 it names.
-              domain = Domain.AF_INET
-            let t: DialTarget = (domain: domain, address: ip, port: Port(port))
-            if t notin result:
-              result.add(t)
-          it = it.ai_next
-      finally:
-        freeAddrInfo(aiList)
-    if result.len == 0:
-      raise unresolved(host)
+        it = it.ai_next
 
   when defined(posix):
     proc connectResolved(sock: AsyncSocket, t: DialTarget): Future[void] =
@@ -441,11 +562,93 @@ elif hasAsyncDispatch:
         failures.add((t.shown, e))
     raise dialError(failures)
 
-proc dialServer*(host: string, port: int): Future[Dialed] =
-  ## Connect to the first address ``host`` resolves to that accepts.
-  # No future of its own: each extra layer delays a pump's cancellation by a
-  # tick, which chronos (4.4) may run only at the next I/O or timer event.
-  dialTargets(resolveTargets(host, port))
+proc targetsOf(found: Lookup, host: string, port: int): seq[DialTarget] =
+  ## ``found``'s addresses; the caller frees its list.
+  if found.rc != 0:
+    raise lookupError(host, found)
+  result = ipTargets(found.list, port)
+  if result.len == 0:
+    raise unresolved(host)
+
+when compileOption("threads"):
+  type LookupFlight = ref object ## A name's lookup in flight.
+    waiters: seq[Future[seq[DialTarget]]]
+
+  var flights {.threadvar.}: Table[(string, int), LookupFlight]
+
+  proc land(
+      found: Lookup, host: string, port: int, waiters: seq[Future[seq[DialTarget]]]
+  ) =
+    ## Hand ``found`` to each call still waiting, then free its list.
+    for w in waiters:
+      if not w.finished:
+        # Per waiter: a raise rewrites its error's trace, so none is shared.
+        try:
+          w.complete(targetsOf(found, host, port))
+        except CatchableError as e:
+          w.fail(e)
+    if found.rc == 0:
+      freeList(found.list)
+
+  proc lookupShared(host: string, port: int): Future[seq[DialTarget]] =
+    ## What the name ``host`` resolves to, from the lookup in flight for it or
+    ## a new one: retries and concurrent dials share one thread. A call that
+    ## stops waiting leaves the lookup running for the next.
+    result = newFuture[seq[DialTarget]]("lookupShared")
+    let key = (host, port)
+    let flying = flights.getOrDefault(key)
+    if flying != nil:
+      # Retries against a slow lookup would pile up the calls that gave up.
+      flying.waiters.keepItIf(not it.finished)
+      flying.waiters.add(result)
+      return
+    let job = (ref LookupJob)(host: host, service: $port)
+    let flight = LookupFlight(waiters: @[result])
+    startLookup(
+      job,
+      proc() =
+        flights.del(key)
+        land(job.found, host, port, flight.waiters),
+    )
+    flights[key] = flight
+
+proc resolveTargets*(
+    host: string, port: int, timeout = ZeroDuration
+): Future[seq[DialTarget]] {.async.} =
+  ## What ``host`` names: its Unix socket, or each address it resolves to in
+  ## the resolver's order. A lookup past ``timeout`` (zero, negative or
+  ## unbounded: none) fails with ``AsyncTimeoutError``; without threads it
+  ## blocks, unbounded.
+  if isUnixSocket(host):
+    return unixTargets(host, port)
+  # A literal address is read here; a name is looked up on a thread, as the
+  # resolver blocks (without threads, here too). `lookupShared` is a plain
+  # future, not an async proc: an extra future layer delays a pump's
+  # cancellation by a tick (see `attemptHostTimed`).
+  let service = $port
+  when compileOption("threads"):
+    let found = gai(cstring(host), cstring(service), numeric = true)
+    if found.rc != 0:
+      let resolving = lookupShared(host, port)
+      if timeout <= ZeroDuration or timeout.isUnbounded:
+        return await resolving
+      try:
+        return await resolving.wait(timeout)
+      except AsyncTimeoutError as e:
+        when not hasChronos:
+          # Not cancelled without chronos: finished, its flight drops it.
+          if not resolving.finished:
+            resolving.fail(newException(AsyncTimeoutError, "Timeout"))
+        raise newException(
+          AsyncTimeoutError, lookupFailed(host, "no answer within " & $timeout), e
+        )
+  else:
+    let found = gai(cstring(host), cstring(service), numeric = false)
+  try:
+    result = targetsOf(found, host, port)
+  finally:
+    if found.rc == 0:
+      freeList(found.list)
 
 proc socketError*(e: ref CatchableError): ref PgConnectionError =
   ## A failed connect or send, classified as a dial is.
