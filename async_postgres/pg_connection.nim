@@ -65,6 +65,10 @@ export types.AuthMethod
 export types.TargetSessionAttrs
 export types.LoadBalanceHosts
 export types.HostEntry
+export types.CredentialsRequest
+export types.ConnCredentials
+export types.CredentialsProvider
+export types.makeCredentialsProvider
 export types.ConnConfig
 export types.PgTracer
 export types.Notification

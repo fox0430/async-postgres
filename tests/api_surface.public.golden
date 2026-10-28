@@ -446,11 +446,14 @@ async_postgres/pg_connection.nim	export types.CleanupKind
 async_postgres/pg_connection.nim	export types.CleanupSkipReason
 async_postgres/pg_connection.nim	export types.ClientCertPairingErrorMsg
 async_postgres/pg_connection.nim	export types.ConnConfig
+async_postgres/pg_connection.nim	export types.ConnCredentials
 async_postgres/pg_connection.nim	export types.CopyInCallback
 async_postgres/pg_connection.nim	export types.CopyInInfo
 async_postgres/pg_connection.nim	export types.CopyOutCallback
 async_postgres/pg_connection.nim	export types.CopyOutInfo
 async_postgres/pg_connection.nim	export types.CopyResult
+async_postgres/pg_connection.nim	export types.CredentialsProvider
+async_postgres/pg_connection.nim	export types.CredentialsRequest
 async_postgres/pg_connection.nim	export types.HostEntry
 async_postgres/pg_connection.nim	export types.ListenErrorCallback
 async_postgres/pg_connection.nim	export types.LoadBalanceHosts
@@ -507,6 +510,7 @@ async_postgres/pg_connection.nim	export types.host
 async_postgres/pg_connection.nim	export types.listenError
 async_postgres/pg_connection.nim	export types.listenReconnectMaxAttempts
 async_postgres/pg_connection.nim	export types.listenReconnectMaxBackoff
+async_postgres/pg_connection.nim	export types.makeCredentialsProvider
 async_postgres/pg_connection.nim	export types.notifyDropped
 async_postgres/pg_connection.nim	export types.notifyMaxQueue
 async_postgres/pg_connection.nim	export types.notifyMaxQueueBytes
@@ -591,6 +595,7 @@ async_postgres/pg_connection/types.nim	ConnConfig
 async_postgres/pg_connection/types.nim	ConnConfig.applicationName
 async_postgres/pg_connection/types.nim	ConnConfig.channelBinding
 async_postgres/pg_connection/types.nim	ConnConfig.connectTimeout
+async_postgres/pg_connection/types.nim	ConnConfig.credentialsProvider
 async_postgres/pg_connection/types.nim	ConnConfig.database
 async_postgres/pg_connection/types.nim	ConnConfig.extraParams
 async_postgres/pg_connection/types.nim	ConnConfig.host
@@ -615,6 +620,9 @@ async_postgres/pg_connection/types.nim	ConnConfig.sslSni
 async_postgres/pg_connection/types.nim	ConnConfig.targetSessionAttrs
 async_postgres/pg_connection/types.nim	ConnConfig.tracer
 async_postgres/pg_connection/types.nim	ConnConfig.user
+async_postgres/pg_connection/types.nim	ConnCredentials
+async_postgres/pg_connection/types.nim	ConnCredentials.password
+async_postgres/pg_connection/types.nim	ConnCredentials.user
 async_postgres/pg_connection/types.nim	CopyInInfo
 async_postgres/pg_connection/types.nim	CopyInInfo.columnFormats
 async_postgres/pg_connection/types.nim	CopyInInfo.commandTag
@@ -628,6 +636,9 @@ async_postgres/pg_connection/types.nim	CopyResult.columnFormats
 async_postgres/pg_connection/types.nim	CopyResult.commandTag
 async_postgres/pg_connection/types.nim	CopyResult.data
 async_postgres/pg_connection/types.nim	CopyResult.format
+async_postgres/pg_connection/types.nim	CredentialsRequest
+async_postgres/pg_connection/types.nim	CredentialsRequest.host
+async_postgres/pg_connection/types.nim	CredentialsRequest.user
 async_postgres/pg_connection/types.nim	HostEntry
 async_postgres/pg_connection/types.nim	HostEntry.host
 async_postgres/pg_connection/types.nim	HostEntry.hostaddr
@@ -799,6 +810,7 @@ async_postgres/pg_connection/types.nim	host
 async_postgres/pg_connection/types.nim	listenError
 async_postgres/pg_connection/types.nim	listenReconnectMaxAttempts
 async_postgres/pg_connection/types.nim	listenReconnectMaxBackoff
+async_postgres/pg_connection/types.nim	makeCredentialsProvider
 async_postgres/pg_connection/types.nim	notifyDropped
 async_postgres/pg_connection/types.nim	notifyMaxQueue
 async_postgres/pg_connection/types.nim	notifyMaxQueueBytes

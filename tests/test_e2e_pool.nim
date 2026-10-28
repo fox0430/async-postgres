@@ -710,6 +710,55 @@ suite "E2E: Pool afterConnect":
 
     waitFor t()
 
+suite "E2E: Pool credentialsProvider":
+  proc counting(calls: ref int, password: string): CredentialsProvider =
+    makeCredentialsProvider:
+      inc calls[]
+      return ConnCredentials(password: password)
+
+  proc providedConfig(provider: CredentialsProvider): ConnConfig =
+    result = plainConfig()
+    result.password = ""
+    result.credentialsProvider = provider
+
+  test "each connection the pool opens asks the provider":
+    proc t(): Future[int] {.async.} =
+      let calls = new int
+      let pool = await newPool(
+        initPoolConfig(
+          providedConfig(counting(calls, PgPassword)), minSize = 2, maxSize = 2
+        )
+      )
+      defer:
+        await pool.close()
+      pool.withConnection(conn):
+        discard await conn.simpleQuery("SELECT 1")
+      return calls[]
+
+    check (waitFor t()) == 2
+
+  test "a wrong token is no refusal: acquire fails as a connect failure":
+    proc t(): Future[ref PgPoolError] {.async.} =
+      let pool = await newPool(
+        initPoolConfig(
+          providedConfig(counting(new int, "expired")), minSize = 0, maxSize = 1
+        )
+      )
+      defer:
+        await pool.close()
+      try:
+        let conn = await pool.acquire()
+        release(conn)
+      except PgPoolError as e:
+        result = e
+      doAssert pool.connectRefusal == nil
+      doAssert pool.metrics.refusalCount == 0
+
+    let err = waitFor t()
+    check err != nil
+    check err.kind == pekConnectFailed
+    check retryAdvice(err) == raUnclear
+
 suite "E2E: Pool Extended Query":
   test "pool.exec creates table":
     proc t() {.async.} =

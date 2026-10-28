@@ -79,6 +79,57 @@ elif hasAsyncDispatch:
     type DialTarget* = tuple[domain: Domain, address: string, port: Port]
       ## One address to dial: an IP (its zone kept) and port.
 
+# Ahead of `ConnConfig`'s section: `declareAsyncCallback` emits a section of
+# its own, so what `CredentialsProvider` takes must be declared before it.
+type
+  HostEntry* = object ## A single host:port entry for multi-host connection.
+    host*: string
+      ## Host name (or Unix socket dir); used for SSL verification, except
+      ## `127.0.0.1` alongside a `hostaddr` (see `effectiveHost`).
+    hostaddr*: string
+      ## Address dialed instead of resolving `host` (libpq `hostaddr`).
+      ## Empty = resolve `host`.
+    port*: int
+
+  CredentialsRequest* = object
+    ## What `ConnConfig.credentialsProvider` is asked for: the credentials to
+    ## authenticate to `host` with.
+    host*: HostEntry ## The host about to be dialed.
+    user*: string ## `ConnConfig.user`.
+
+  ConnCredentials* = object
+    ## The credentials a `CredentialsProvider` returns for one host.
+    user*: string ## Sent instead of `ConnConfig.user`; empty keeps it.
+    password*: string ## Must not be empty.
+
+declareAsyncCallback(
+  CredentialsProvider, proc(req: CredentialsRequest): Future[ConnCredentials],
+  "Callback returning the credentials for a host `connect` dials; see `ConnConfig.credentialsProvider`.",
+)
+
+template makeCredentialsProvider*(body: untyped): CredentialsProvider =
+  ## Create a ``CredentialsProvider`` that works with both asyncdispatch and
+  ## chronos. Inside ``body``, the request is available as
+  ## ``req: CredentialsRequest``; end it with the ``ConnCredentials``. Inside
+  ## an ``{.async.}`` proc, a ``return`` in ``body`` does not compile: that
+  ## proc's macro takes it as its own.
+  ##
+  ## .. code-block:: nim
+  ##   config.credentialsProvider = makeCredentialsProvider:
+  ##     ConnCredentials(password: await tokenFor(req.host.host, req.user))
+  when hasChronos:
+    CredentialsProvider(
+      proc(
+          req {.inject.}: CredentialsRequest
+      ): Future[ConnCredentials] {.async: (raises: [CatchableError]).} =
+        body
+    )
+  else:
+    CredentialsProvider(
+      proc(req {.inject.}: CredentialsRequest): Future[ConnCredentials] {.async.} =
+        body
+    )
+
 type
   PgConnState* = enum
     ## Connection lifecycle state.
@@ -147,15 +198,6 @@ type
     lbhDisable ## Configured order (default)
     lbhRandom ## Shuffle host list per connection (replica spread)
 
-  HostEntry* = object ## A single host:port entry for multi-host connection.
-    host*: string
-      ## Host name (or Unix socket dir); used for SSL verification, except
-      ## `127.0.0.1` alongside a `hostaddr` (see `effectiveHost`).
-    hostaddr*: string
-      ## Address dialed instead of resolving `host` (libpq `hostaddr`).
-      ## Empty = resolve `host`.
-    port*: int
-
   ConnConfig* = object
     ## Connection configuration. Construct via `parseDsn` or set fields directly.
     host*: string
@@ -169,6 +211,24 @@ type
       ## Cleartext password (libpq ``password``), held in plaintext in memory.
       ## DSN parse/validation errors never echo parameter values, but callers
       ## must not log it either.
+    credentialsProvider*: CredentialsProvider
+      ## Returns the user and password per host instead of the fixed ``user``
+      ## and ``password``, e.g. an expiring token (AWS RDS IAM, Microsoft Entra
+      ## ID) or a rotated secret. Nil = none. Set with a non-empty
+      ## ``password``, it is a ``PgConfigError``; a DSN cannot set it.
+      ##
+      ## ``connect`` calls it once per host, before the dial, within a
+      ## ``connectTimeout`` of its own; the host's addresses and
+      ## ``sslmode=allow``'s legs share the result. It runs even for a server
+      ## that asks for no password, and again for every new connection (each a
+      ## pool opens, a listen reconnect), so cache a token until shortly before
+      ## it expires. On asyncdispatch a call that timed out keeps running.
+      ##
+      ## The password is sent as ``password`` would be: use ``sslVerifyFull``
+      ## for a bearer token. If it raises (kept as ``parent``) or returns an
+      ## empty password, that host fails with ``PgConnectionError`` before any
+      ## dial, which ``retryAdvice`` never reads as a stop. A ``28P01`` that
+      ## answers its credentials is no refusal either (see ``isLastingRefusal``).
     database*: string
     sslMode*: SslMode
       ## SSL/TLS negotiation mode. `parseDsn` and `initConnConfig` default this
