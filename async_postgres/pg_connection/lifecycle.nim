@@ -32,10 +32,12 @@ type AuthStep = enum
 
 # Error message helpers
 
-proc startupError(fields: seq[ErrorField]): ref PgConnectionError =
+proc startupError(
+    fields: seq[ErrorField], providedCredentials: bool
+): ref PgConnectionError =
   ## The server refused the session; keep its fields so callers can tell a
   ## bad password from a server that is still starting up.
-  newStartupError(formatError(fields), newPgQueryError(fields))
+  newStartupError(formatError(fields), newPgQueryError(fields), providedCredentials)
 
 proc foldFailures(
     msg: string, attempts: seq[ref CatchableError], perHost = false
@@ -411,18 +413,75 @@ type AllowLeg = enum
   alPlaintext ## The plaintext leg: TLS negotiation is skipped for it.
   alTls ## The TLS leg.
 
+type AuthCreds = object
+  ## What one host is authenticated with. Passed apart from ``ConnConfig``,
+  ## which the connection keeps: a provider's password must not end up there.
+  user, password: string
+  provided: bool ## From ``credentialsProvider``.
+
+func fixedCredentials(config: ConnConfig): AuthCreds =
+  AuthCreds(user: config.user, password: config.password)
+
+proc provideCredentials(
+    config: ConnConfig, entry: HostEntry
+): Future[AuthCreds] {.async.} =
+  ## ``credentialsProvider``'s credentials for ``entry``. A failure is a
+  ## ``PgConnectionError``, never a config fault, whatever the provider raised.
+  var got: ConnCredentials
+  try:
+    got = await config.credentialsProvider(
+      CredentialsRequest(host: entry, user: config.user)
+    )
+  except CancelledError as e:
+    raise e
+  except CatchableError as e:
+    raise newException(
+      PgConnectionError, "credentialsProvider failed: " & oneLine(e.msg), e
+    )
+  if got.password.len == 0:
+    # libpq never sends an empty password either; the server would answer 28P01.
+    raise
+      newException(PgConnectionError, "credentialsProvider returned an empty password")
+  # Here, not where they are encoded: that would raise `PgTypeError`.
+  if got.user.find('\0') >= 0 or got.password.find('\0') >= 0:
+    raise newException(PgConnectionError, "credentialsProvider returned a zero byte")
+  return AuthCreds(
+    user: if got.user.len > 0: got.user else: config.user,
+    password: got.password,
+    provided: true,
+  )
+
+proc hostCredentials(
+    config: ConnConfig, entry: HostEntry
+): Future[AuthCreds] {.async.} =
+  ## What ``entry`` is authenticated with: the fixed ``user`` and ``password``,
+  ## or ``credentialsProvider``'s within a ``connectTimeout`` of its own.
+  if config.credentialsProvider == nil:
+    return fixedCredentials(config)
+  if config.connectTimeout == default(Duration):
+    return await provideCredentials(config, entry)
+  try:
+    # Nothing to release if the call outlives the timeout: no dial yet.
+    return await provideCredentials(config, entry).wait(
+      normalizeTimeout(config.connectTimeout)
+    )
+  except AsyncTimeoutError as e:
+    # Still an `AsyncTimeoutError`, as a dial's is, but not a bare "Timeout".
+    raise newException(AsyncTimeoutError, "credentialsProvider timed out", e)
+
 proc connectToHostImpl(
     config: ConnConfig,
     entry: HostEntry,
     allowLeg: AllowLeg,
     targets: seq[DialTarget],
+    creds: AuthCreds,
     reached: ref bool = nil,
     checked = false,
 ): Future[PgConnection] {.async.} =
   ## ``connectToHost``; ``allowLeg`` which sslmode=allow leg this call is,
-  ## ``targets`` what to dial (empty: what ``entry`` resolves to). Sets
-  ## ``reached`` once a dial succeeds. ``checked``: ``config`` is already
-  ## ``hostConfig``'s.
+  ## ``targets`` what to dial (empty: what ``entry`` resolves to), ``creds``
+  ## what to authenticate with. Sets ``reached`` once a dial succeeds.
+  ## ``checked``: ``config`` is already ``hostConfig``'s.
   let config =
     if checked:
       config
@@ -435,18 +494,23 @@ proc connectToHostImpl(
       # libpq never sends SSLRequest over AF_UNIX, so allow has no TLS leg
       # there: one plaintext attempt, its error returned as-is (not folded
       # with a second, identical one).
-      return await connectToHostImpl(config, entry, alPlaintext, targets, reached, true)
+      return await connectToHostImpl(
+        config, entry, alPlaintext, targets, creds, reached, true
+      )
     if config.channelBinding == cbRequire or config.requireAuth == {amScramSha256Plus}:
       # Channel binding and SCRAM-SHA-256-PLUS need TLS, so the plaintext leg
       # could only fail.
-      return await connectToHostImpl(config, entry, alTls, targets, reached, true)
+      return
+        await connectToHostImpl(config, entry, alTls, targets, creds, reached, true)
     # sslAllow: try plaintext first, then fall back to SSL (libpq semantics).
     # WARNING: This is vulnerable to MITM downgrade attacks. A network
     # attacker can force the first attempt to fail and then intercept
     # the SSL connection. Use sslRequire or stronger if security is needed.
     var plainErr: ref CatchableError
     try:
-      return await connectToHostImpl(config, entry, alPlaintext, targets, reached, true)
+      return await connectToHostImpl(
+        config, entry, alPlaintext, targets, creds, reached, true
+      )
     except CancelledError as e:
       raise e
     except CatchableError as e:
@@ -455,7 +519,8 @@ proc connectToHostImpl(
 
     # Still allow, not require: an 'N' here is no refusal of required TLS.
     try:
-      return await connectToHostImpl(config, entry, alTls, targets, reached, true)
+      return
+        await connectToHostImpl(config, entry, alTls, targets, creds, reached, true)
     except CancelledError as e:
       raise e
     except PgConfigError as e:
@@ -575,7 +640,7 @@ proc connectToHostImpl(
       startupParams.add(("TimeZone", timeZone.get))
     if config.applicationName.len > 0:
       startupParams.add(("application_name", config.applicationName))
-    await conn.sendMsg(encodeStartup(config.user, config.database, startupParams))
+    await conn.sendMsg(encodeStartup(creds.user, config.database, startupParams))
     conn.markState(csAuthentication)
     await conn.checkPreV3Error()
 
@@ -597,14 +662,14 @@ proc connectToHostImpl(
           of bmkAuthenticationCleartextPassword:
             if not conn.sslEnabled:
               fireInsecureAuth(conn, amPassword)
-            var pwMsg = encodePassword(config.password)
+            var pwMsg = encodePassword(creds.password)
             try:
               await conn.sendMsg(pwMsg)
             finally:
               ncutils.burnMem(pwMsg)
           of bmkAuthenticationMD5Password:
             fireDeprecatedAuth(conn, amMd5)
-            var hash = md5AuthHash(config.user, config.password, msg.md5Salt)
+            var hash = md5AuthHash(creds.user, creds.password, msg.md5Salt)
             var hashMsg = encodePassword(hash)
             burnStr(hash)
             try:
@@ -622,13 +687,13 @@ proc connectToHostImpl(
             # filtered offer; this guards against a future fallback past it.
             enforceAuthAllowed(chosen, config.requireAuth, $msg.saslMechanisms)
             let clientFirst = scramClientFirstMessage(
-              config.user, scramState, choice.cbType, choice.cbData,
+              creds.user, scramState, choice.cbType, choice.cbData,
               choice.cbSupportedButUnused,
             )
             await conn.sendMsg(encodeSASLInitialResponse(choice.mechanism, clientFirst))
           of bmkAuthenticationSASLContinue:
             var clientFinal = scramClientFinalMessage(
-              config.password, msg.saslData, scramState,
+              creds.password, msg.saslData, scramState,
               config.effectiveMaxScramIterations,
             )
             var saslMsg = encodeSASLResponse(clientFinal)
@@ -640,7 +705,7 @@ proc connectToHostImpl(
           of bmkAuthenticationSASLFinal:
             discard # verified by advanceAuth
           of bmkErrorResponse:
-            raise startupError(msg.errorFields)
+            raise startupError(msg.errorFields, creds.provided)
           else:
             # As libpq: skipping it would wait for an AuthenticationOk that
             # never comes.
@@ -666,7 +731,7 @@ proc connectToHostImpl(
             conn.markReady()
             break readyLoop
           of bmkErrorResponse:
-            raise startupError(msg.errorFields)
+            raise startupError(msg.errorFields, creds.provided)
           else:
             # Skipping it would wait for a ReadyForQuery that may never come.
             raise newException(
@@ -725,7 +790,17 @@ proc connectToHost*(config: ConnConfig, entry: HostEntry): Future[PgConnection] 
   ##
   ## On Unix sockets TLS is skipped (libpq parity); if ``sslCert`` is set a
   ## stderr warning is emitted because the client certificate is not sent.
-  connectToHostImpl(config, entry, alNone, @[])
+  ## A ``credentialsProvider`` is called without a timeout.
+  if config.credentialsProvider == nil:
+    return connectToHostImpl(config, entry, alNone, @[], fixedCredentials(config))
+  proc withProvider(): Future[PgConnection] {.async.} =
+    # Checked before the provider runs, as `connect` does.
+    let checkedConfig = hostConfig(config, entry)
+    let creds = await provideCredentials(checkedConfig, entry)
+    return
+      await connectToHostImpl(checkedConfig, entry, alNone, @[], creds, checked = true)
+
+  withProvider()
 
 # Close
 
@@ -801,10 +876,12 @@ proc attemptHost(
     entry: HostEntry,
     attrs: TargetSessionAttrs,
     target: DialTarget,
+    creds: AuthCreds,
     reached: ref bool,
 ): Future[PgConnection] {.async.} =
   ## Dial ``target`` and verify ``attrs``; nil = wrong role (already closed).
-  let conn = await connectToHostImpl(config, entry, alNone, @[target], reached, true)
+  let conn =
+    await connectToHostImpl(config, entry, alNone, @[target], creds, reached, true)
   if attrs == tsaAny or await conn.matchesOrClose(attrs):
     return conn
   return nil
@@ -814,10 +891,11 @@ proc attemptHostTimed(
     entry: HostEntry,
     attrs: TargetSessionAttrs,
     targets: seq[DialTarget],
+    creds: AuthCreds,
 ): Future[PgConnection] {.async.} =
-  ## ``attemptHost`` at each of ``targets`` in turn, each within its own
-  ## ``connectTimeout`` (libpq semantics). Only a failed dial or a timeout
-  ## moves on: past the dial, the host's one server has answered.
+  ## ``attemptHost`` at each of ``targets`` in turn with ``creds``, each within
+  ## its own ``connectTimeout`` (libpq semantics). Only a failed dial or a
+  ## timeout moves on: past the dial, the host's one server has answered.
   # The loop is inlined, not a proc per address: an extra future layer would
   # delay chronos cancellation (see `dialServer`).
   var failures: seq[ref CatchableError]
@@ -827,11 +905,11 @@ proc attemptHostTimed(
     let reached = new(bool)
     try:
       if config.connectTimeout == default(Duration):
-        return await attemptHost(config, entry, attrs, target, reached)
+        return await attemptHost(config, entry, attrs, target, creds, reached)
       when hasAsyncDispatch:
         # asyncdispatch's wait() cannot cancel the attempt: close a connection
         # it produces after the timeout instead of leaking it.
-        let attempt = attemptHost(config, entry, attrs, target, reached)
+        let attempt = attemptHost(config, entry, attrs, target, creds, reached)
         return await attempt.wait(
           config.connectTimeout,
           onOrphan = proc(fut: Future[PgConnection]) =
@@ -850,7 +928,7 @@ proc attemptHostTimed(
           ,
         )
       else:
-        return await attemptHost(config, entry, attrs, target, reached).wait(
+        return await attemptHost(config, entry, attrs, target, creds, reached).wait(
           normalizeTimeout(config.connectTimeout)
         )
     except CancelledError as e:
@@ -897,8 +975,8 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
   ## Unlike libpq, a failed authentication or security check moves on to the next
   ## host; a host's next address is tried only after a failed dial or a timeout.
   ## Its ``attempts`` hold each host's latest failure, a mismatch included
-  ## (``serverErrors`` collects their refusals), its ``parent`` the last one; a
-  ## ``PgSecurityError`` when every host was.
+  ## (``serverErrors`` collects their ErrorResponses), its ``parent`` the last
+  ## one; a ``PgSecurityError`` when every host was.
   ## A single host's timeout raises ``AsyncTimeoutError`` (not folded).
   # Local mutable copy: ``validateConnConfig`` may normalize ``connectTimeout``.
   var config = config
@@ -921,10 +999,12 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     # Each host's latest failure (a preferStandby second pass overwrites the
     # first), so every host that failed is judged by its last attempt.
     var failures = newSeq[ref CatchableError](hosts.len)
-    # Each host is checked and resolved once, on first use: the preferStandby
-    # passes share the lookup, a blocking call.
-    var prepared =
-      newSeq[tuple[config: ConnConfig, targets: seq[DialTarget]]](hosts.len)
+    # Each host is checked, resolved and given its credentials once, on first
+    # use: the preferStandby passes share the lookup, a blocking call, and the
+    # credentials. `ready`: all three succeeded.
+    var prepared = newSeq[
+      tuple[config: ConnConfig, targets: seq[DialTarget], creds: AuthCreds, ready: bool]
+    ](hosts.len)
 
     template prepare(i: int) =
       prepared[i].config = hostConfig(config, hosts[i], validated = true)
@@ -932,13 +1012,17 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       prepared[i].targets = resolveTargets(hosts[i].dialAddr, hosts[i].port)
 
     template attempt(i: int, attrs: TargetSessionAttrs): untyped =
-      attemptHostTimed(prepared[i].config, hosts[i], attrs, prepared[i].targets)
+      attemptHostTimed(
+        prepared[i].config, hosts[i], attrs, prepared[i].targets, prepared[i].creds
+      )
 
     if config.targetSessionAttrs == tsaPreferStandby:
       # First pass: look for a standby
       for i, entry in hosts:
         try:
           prepare(i)
+          prepared[i].creds = await hostCredentials(prepared[i].config, entry)
+          prepared[i].ready = true
           let conn = await attempt(i, tsaStandby)
           if conn != nil:
             return conn
@@ -950,8 +1034,8 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
           errors.add(entry.displayHost & ":" & $entry.port & ": " & oneLine(e.msg))
       # Second pass: accept any server
       for i, entry in hosts:
-        if prepared[i].targets.len == 0:
-          continue # its check or lookup failed in the first pass
+        if not prepared[i].ready:
+          continue # its check, lookup or credentials failed in the first pass
         try:
           return await attempt(i, tsaAny)
         except CancelledError as e:
@@ -964,6 +1048,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
       for i, entry in hosts:
         try:
           prepare(i)
+          prepared[i].creds = await hostCredentials(prepared[i].config, entry)
           let conn = await attempt(i, config.targetSessionAttrs)
           if conn != nil:
             return conn

@@ -1179,6 +1179,22 @@ suite "isTransientError":
     check retryAdvice(hosts(lost, badPassword)) == raUnclear
     check retryAdvice((ref PgConfigError)(msg: "cert")) == raStop
 
+  test "a 28P01 answering a provider's credentials is no refusal":
+    # The provider's next call may return a valid token.
+    proc provided(sqlState: string): ref PgConnectionError =
+      newStartupError(
+        sqlState, queryError(sqlState, "FATAL"), providedCredentials = true
+      )
+
+    let expired = provided("28P01")
+    check not isLastingRefusal(expired)
+    check retryAdvice(expired) == raUnclear
+    check retryAdvice(newPoolError(pekConnectFailed, "failed", expired)) == raUnclear
+    check retryAdvice(hosts(expired, expired)) == raUnclear
+    # The rest of the list says nothing of the credentials.
+    for sqlState in ["3D000", "42501"]:
+      check isLastingRefusal(provided(sqlState))
+
   test "25006 is not transient":
     # A standby in recovery returns it, but so does a read-only transaction,
     # which no retry gets past.

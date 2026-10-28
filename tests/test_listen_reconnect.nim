@@ -39,6 +39,13 @@ proc mockConfig(port: int): ConnConfig =
     host: "127.0.0.1", port: port, user: "test", database: "test", sslMode: sslDisable
   )
 
+proc countingProvider(calls: ref int): CredentialsProvider =
+  ## Count the calls. Outside the `{.async.}` test bodies, which would take
+  ## the `return` as their own.
+  makeCredentialsProvider:
+    inc calls[]
+    return ConnCredentials(password: "tok")
+
 # Every redial first sleeps a backoff step, 1s by default. Restored at the end.
 let savedBackoffUnitMs = listenBackoffUnitMs
 listenBackoffUnitMs = 50
@@ -836,11 +843,15 @@ suite "listen reconnect gives up on a refusal":
       discard
 
   proc redialKeepsRetrying(
-      reply: seq[byte], onReListen = false, refusingStandby = false
+      reply: seq[byte],
+      onReListen = false,
+      refusingStandby = false,
+      provider: CredentialsProvider = nil,
   ) {.async.} =
     ## The first redial gets `reply` to its startup (or, `onReListen`, to its
     ## re-LISTEN) and is closed; the next one succeeds. `refusingStandby`: a
-    ## host listed ahead of it refuses every startup.
+    ## host listed ahead of it refuses every startup. `provider`: the config's
+    ## `credentialsProvider`.
     let ms = startMockServer()
     let pumpStarted = newFuture[void]("pumpStarted")
     var sc3: MockClient
@@ -862,6 +873,7 @@ suite "listen reconnect gives up on a refusal":
 
     let serverFut = serverHandler()
     var cfg = mockConfig(ms.port)
+    cfg.credentialsProvider = provider
     var standby: MockServer
     if refusingStandby:
       standby = startMockServer()
@@ -935,6 +947,17 @@ suite "listen reconnect gives up on a refusal":
     waitFor redialKeepsRetrying(
       buildErrorResponse("28000", "LDAP authentication failed for user", "FATAL")
     )
+
+  test "a redial whose provided token meets a 28P01 keeps retrying, asking again":
+    # An expired token: the provider's next call may return a valid one.
+    let calls = new int
+    waitFor redialKeepsRetrying(
+      buildErrorResponse("28P01", "password authentication failed", "FATAL"),
+      provider = countingProvider(calls),
+    )
+    # The connect, the refused redial and the one that succeeded. A password
+    # kept in the connection's config would fail the redials as a config fault.
+    check calls[] == 3
 
   test "a FATAL ending the redial's re-LISTEN is not a refusal":
     # A listed SQLSTATE counts only as the startup's answer.

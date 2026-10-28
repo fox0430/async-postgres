@@ -14,7 +14,8 @@ import ../async_postgres/[async_backend, pg_protocol]
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/buffer_io
 import ../async_postgres/pg_connection/types
-from ../async_postgres/pg_connection/lifecycle {.all.} import attemptHostTimed
+from ../async_postgres/pg_connection/lifecycle {.all.} import
+  attemptHostTimed, fixedCredentials
 from ../async_postgres/pg_connection/simple_query {.all.} import
   cancelWithin, sendCancelRequest
 when hasAsyncDispatch:
@@ -323,11 +324,13 @@ suite "Per-address connectTimeout":
       let accepted = ms.acceptAndReady()
       let targets =
         resolveTargets("127.0.0.1", silent.port) & resolveTargets("127.0.0.1", ms.port)
+      let cfg = timedConfig(ms.port)
       let conn = await attemptHostTimed(
-        timedConfig(ms.port),
+        cfg,
         HostEntry(host: "127.0.0.1", port: ms.port),
         tsaAny,
         targets,
+        fixedCredentials(cfg),
       )
       let client = await accepted
       result = conn.state
@@ -352,7 +355,11 @@ suite "Per-address connectTimeout":
       cfg.connectTimeout = milliseconds(100)
       try:
         discard await attemptHostTimed(
-          cfg, HostEntry(host: "127.0.0.1", port: a.port), tsaAny, targets
+          cfg,
+          HostEntry(host: "127.0.0.1", port: a.port),
+          tsaAny,
+          targets,
+          fixedCredentials(cfg),
         )
       except CatchableError as e:
         result = e
@@ -382,7 +389,11 @@ suite "Per-address connectTimeout":
         cfg.connectTimeout = seconds(3)
       try:
         discard await attemptHostTimed(
-          cfg, HostEntry(host: "127.0.0.1", port: silent.port), tsaAny, targets
+          cfg,
+          HostEntry(host: "127.0.0.1", port: silent.port),
+          tsaAny,
+          targets,
+          fixedCredentials(cfg),
         )
       except CatchableError as e:
         result = e
@@ -421,7 +432,11 @@ suite "Per-address connectTimeout":
         resolveTargets("127.0.0.1", refusedPort)
       try:
         discard await attemptHostTimed(
-          cfg, HostEntry(host: "127.0.0.1", port: refusing.port), tsaAny, targets
+          cfg,
+          HostEntry(host: "127.0.0.1", port: refusing.port),
+          tsaAny,
+          targets,
+          fixedCredentials(cfg),
         )
       except CatchableError as e:
         result = e
@@ -456,7 +471,11 @@ suite "Per-address connectTimeout":
         resolveTargets("127.0.0.1", standby.port) &
         resolveTargets("127.0.0.1", refusedPort)
       let conn = await attemptHostTimed(
-        cfg, HostEntry(host: "127.0.0.1", port: standby.port), tsaPrimary, targets
+        cfg,
+        HostEntry(host: "127.0.0.1", port: standby.port),
+        tsaPrimary,
+        targets,
+        fixedCredentials(cfg),
       )
       result[0] = conn == nil
       result[1] = await serverFut
@@ -478,11 +497,13 @@ suite "Per-address connectTimeout":
       let accepted = ms.acceptAndReady()
       let targets =
         resolveTargets("127.0.0.1", refusedPort) & resolveTargets("127.0.0.1", ms.port)
+      let cfg = mockConfig(refusedPort)
       let conn = await attemptHostTimed(
-        mockConfig(refusedPort),
+        cfg,
         HostEntry(host: "127.0.0.1", port: refusedPort),
         tsaAny,
         targets,
+        fixedCredentials(cfg),
       )
       let client = await accepted
       let cancelSide = ms.accept()

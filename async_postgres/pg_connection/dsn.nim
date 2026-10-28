@@ -1099,8 +1099,14 @@ proc validateConnConfig*(config: var ConnConfig) =
   ## credentials to whatever listens on localhost. The scalar
   ## ``host``/``hostaddr``/``port`` are mirrored from ``hosts[0]``, which is
   ## what ``getHosts`` dials. Negative ``connectTimeout`` becomes
-  ## ``ZeroDuration``.
+  ## ``ZeroDuration``. A ``credentialsProvider`` alongside a non-empty
+  ## ``password`` is rejected: which one is sent would not show.
   rejectRawNul(config)
+  if config.credentialsProvider != nil and config.password.len > 0:
+    raise newException(
+      PgConfigError,
+      "password and credentialsProvider are both set; clear password to use the provider",
+    )
   if config.connectTimeout < ZeroDuration:
     config.connectTimeout = ZeroDuration
 

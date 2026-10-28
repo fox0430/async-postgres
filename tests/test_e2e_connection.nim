@@ -505,6 +505,27 @@ suite "E2E: Authentication":
         await conn.close()
       doAssert conn.state == csReady
 
+  proc providing(user, password: string): CredentialsProvider =
+    makeCredentialsProvider:
+      return ConnCredentials(user: user, password: password)
+
+  test "credentialsProvider's user and password log in over SCRAM":
+    proc t() {.async.} =
+      withProbeRole("async_pg_provider_probe", "pro\xC2\xA0vided", ""):
+        cfg.requireAuth = {amScramSha256}
+        # The config's own user stays the default one.
+        cfg.user = PgUser
+        cfg.password = ""
+        cfg.credentialsProvider =
+          providing("async_pg_provider_probe", "pro\xC2\xA0vided")
+        let conn = await connect(cfg)
+        defer:
+          await conn.close()
+        let res = await conn.simpleQuery("SELECT current_user")
+        doAssert res[0].rows[0][0].get().toString() == "async_pg_provider_probe"
+
+    waitFor t()
+
   test "SCRAM password with a code point unassigned in Unicode 3.2":
     # The server hashes such a password raw, U+00A0 included.
     waitFor scramLogin("pass\xC2\xA0word\xF0\x9F\x98\x80")

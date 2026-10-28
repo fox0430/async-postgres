@@ -22,7 +22,7 @@
 ## - ``raStop``: no attempt can succeed until something outside the process
 ##   changes: a ``PgConfigError``, a closed pool, or a refusal
 ##   (``isLastingRefusal``: a startup answered with ``28P01``, ``3D000`` or
-##   ``42501``).
+##   ``42501``; ``28P01`` only for a fixed password).
 ## - ``raUnclear``: neither established (a ``PgProtocolError``, a
 ##   ``PgSecurityError``, ...): retry within a budget.
 ##
@@ -91,6 +91,9 @@ type
     atStartup: bool
       ## ``serverError`` answered the startup: the server's verdict on the
       ## session, not a FATAL that ended one.
+    providedCredentials: bool
+      ## The startup sent ``credentialsProvider``'s credentials, which its next
+      ## call may replace: a ``28P01`` need not recur.
 
   PgProtocolError* = object of PgConnectionError
     ## Raised on PostgreSQL wire protocol violations. The connection stream is
@@ -262,11 +265,16 @@ proc setPerHost*(e: ref PgConnectionError, value: bool) {.inline.} =
   e.perHost = value
 
 proc newStartupError*(
-    msg: string, serverError: ref PgQueryError
+    msg: string, serverError: ref PgQueryError, providedCredentials = false
 ): ref PgConnectionError {.inline.} =
   ## The ErrorResponse that answered the startup. Sibling-only, like
   ## ``setPerHost``.
-  (ref PgConnectionError)(msg: msg, serverError: serverError, atStartup: true)
+  (ref PgConnectionError)(
+    msg: msg,
+    serverError: serverError,
+    atStartup: true,
+    providedCredentials: providedCredentials,
+  )
 
 template newPoolError*(
     errKind: PoolErrorKind, message: string, parentErr: ref Exception = nil
@@ -360,13 +368,18 @@ func isTransientServerError(se: ref PgQueryError): bool =
     (s.inClass("53") and s != SqlStateConfigurationLimitExceeded) or s in listed or
     (fatal and s == SqlStateQueryCanceled)
 
-func isStatedRefusal(se: ref PgQueryError): bool =
+func isStatedRefusal(ce: ref PgConnectionError): bool =
   ## Whether a startup's ErrorResponse names the config's own fault: 28P01 (a
   ## wrong password), 3D000 (no such database) or 42501 (no CONNECT privilege);
-  ## false for nil. Listed, not inferred: a proxy or a waking server may answer
-  ## with anything else, and a fresh dial may get past it. Not 28000: an LDAP,
-  ## RADIUS or PAM check answers with it when its own server is down too.
+  ## false without a ``serverError``. Listed, not inferred: a proxy or a waking
+  ## server may answer with anything else, and a fresh dial may get past it. Not
+  ## 28000: an LDAP, RADIUS or PAM check answers with it when its own server is
+  ## down too. Not 28P01 for a provider's credentials: RDS Proxy answers an
+  ## expired token so.
+  let se = ce.serverError
   if se == nil:
+    return false
+  if ce.providedCredentials and se.sqlState == SqlStateInvalidPassword:
     return false
   const refused =
     [SqlStateInvalidPassword, SqlStateInvalidCatalogName, SqlStateInsufficientPrivilege]
@@ -459,7 +472,7 @@ func verdict(e: ref CatchableError): Verdict {.raises: [], gcsafe.} =
         vRetry
       else:
         vUnclear
-    elif ce.atStartup and isStatedRefusal(ce.serverError):
+    elif ce.atStartup and isStatedRefusal(ce):
       vRefused
     elif e of PgSecurityError or e of PgProtocolError:
       # Client-side: says nothing about whether the server will take us next.
@@ -488,7 +501,9 @@ func isLastingRefusal*(e: ref CatchableError): bool {.raises: [], gcsafe.} =
   ## session never does. Narrower than ``not isTransientError(e)``: an
   ## unclassified failure such as ``PgProtocolError``, ``08P01``, a proxy's
   ## ``XX000`` or a ``28000`` (an LDAP server that is down answers with it too)
-  ## is not a refusal, and a fresh dial may get past it. An error
+  ## is not a refusal, and a fresh dial may get past it. Nor is a ``28P01``
+  ## answering ``ConnConfig.credentialsProvider``'s credentials: its next call
+  ## may return valid ones (RDS Proxy answers an expired token so). An error
   ## summing up ``attempts`` is one only when every attempt is: another host or
   ## ``sslmode=allow`` leg may still take the session, so a mix is ``raUnclear``.
   verdict(e) == vRefused
