@@ -399,9 +399,10 @@ when hasChronos:
         doAssert pool.pendingOps.len == 2,
           "both ops must be queued before dispatch drains them as a batch"
         var raised = 0
-        for f in [f1, f2]:
+        # Not `f`: env fields are named name & position, so it can clash with `f1`.
+        for fut in [f1, f2]:
           try:
-            discard await f
+            discard await fut
           except PgPoolError:
             inc raised
         await replyFut

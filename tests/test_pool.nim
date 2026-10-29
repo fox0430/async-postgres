@@ -8451,8 +8451,9 @@ suite "Pool afterConnect":
       doAssert pool.metrics.createCount == 3
 
       await pool.close()
-      for st in [st1, st2, st3]:
-        await closeClient(st)
+      # Not `st`: env fields are named name & position, so it can clash with `st1`.
+      for client in [st1, st2, st3]:
+        await closeClient(client)
       await closeServer(ms)
 
     waitFor t()
@@ -8612,9 +8613,10 @@ suite "Pool afterConnect":
       doAssert err.kind == pekAfterConnectFailed
       doAssert err.parent == (ref Exception)(cause)
       doAssert retryAdvice(err) == raUnclear
-      for st in [st1, st2]:
-        doAssert (await drainFrontendMessage(st).wait(seconds(5))).msgType == 'X'
-        await closeClient(st)
+      # Not `st`: env fields are named name & position, so it can clash with `st1`.
+      for client in [st1, st2]:
+        doAssert (await drainFrontendMessage(client).wait(seconds(5))).msgType == 'X'
+        await closeClient(client)
       await closeServer(ms)
 
     waitFor t()
