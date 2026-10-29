@@ -31,7 +31,7 @@ proc derefObjectTy(t: NimNode): NimNode =
   if result.kind == nnkRefTy:
     result = result[0].getTypeImpl
 
-macro isCaseObject(T: typedesc): bool =
+macro isCaseObject*(T: typedesc): bool =
   ## Whether ``T`` or one of its bases has a ``case`` section.
   var t = derefObjectTy(T.getTypeImpl[1])
   while t.kind == nnkObjectTy:
@@ -116,7 +116,7 @@ proc decodeValue[F](row: Row, col: int, _: typedesc[F]): F =
         "in a module imported where `to` is called"
     .}
 
-proc fieldContext(owner, field: string): string =
+proc fieldContext*(owner, field: string): string =
   ## Error prefix naming the field, or only its owner for a positional one.
   if field.len > 0:
     owner & "." & field & ": "
@@ -131,10 +131,18 @@ proc decodeField[F](row: Row, col: int, _: typedesc[F], owner, field: string): F
     err.msg = fieldContext(owner, field) & err.msg
     raise err
 
-proc findColumn(data: RowData, owner, field, key: string, exact: bool): int =
+proc findColumn*(
+    data: RowData,
+    owner, field, key: string,
+    exact: bool,
+    optional = false,
+    fromQuery = true,
+): int =
   ## Index of the column ``key`` names among ``data``'s fields. Unless
   ## ``exact``, case and ``_`` are ignored as in Nim identifiers, and among
-  ## several such matches only a byte-exact one is taken.
+  ## several such matches only a byte-exact one is taken. When ``optional``,
+  ## no match is ``-1`` instead of an error. ``fromQuery`` is whether the
+  ## columns come from the caller's query, which could alias them.
   if data == nil or data.fields.len == 0:
     # `SELECT FROM t` describes no columns, so it has no metadata to miss.
     let why =
@@ -157,6 +165,8 @@ proc findColumn(data: RowData, owner, field, key: string, exact: bool): int =
   if exactCount == 0 and foldedCount == 1:
     return foldedAt
   if exactCount == 0 and foldedCount == 0:
+    if optional:
+      return -1
     raise newException(
       PgTypeError,
       fieldContext(owner, field) & "no column " & (if exact: "named" else: "matches") &
@@ -168,11 +178,15 @@ proc findColumn(data: RowData, owner, field, key: string, exact: bool): int =
       if names.len > 0:
         names.add(", ")
       names.add('"' & f.name & '"')
+  var fixes: seq[string]
+  if fromQuery:
+    fixes.add("alias them in the query")
+  if exactCount == 0:
+    fixes.add("name one with pgColumn")
   raise newException(
     PgTypeError,
-    fieldContext(owner, field) & "more than one column matches (" & names &
-      "); alias them in the query" &
-      (if exactCount == 0: " or name one with pgColumn" else: ""),
+    fieldContext(owner, field) & "more than one column matches (" & names & ")" &
+      (if fixes.len > 0: "; " & fixes.join(" or ") else: ""),
   )
 
 proc resolveColumns[O](obj: var O, data: RowData, owner: string, cols: var seq[int]) =

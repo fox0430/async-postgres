@@ -332,11 +332,22 @@ macro declareAsyncCallback*(
   ## chronos gets `{.async: (raises: [CatchableError]), gcsafe.}`; asyncdispatch
   ## gets `{.gcsafe.}`. `procType` must be a bare proc-type expression with no
   ## pragmas attached. Optional `doc` becomes the emitted type's docstring.
+  ## A generic `name` (`Cb[T]`) declares a generic type.
   when hasChronos:
     const pragmas = "{.async: (raises: [CatchableError]), gcsafe.}"
   else:
     const pragmas = "{.gcsafe.}"
-  var src = "type " & $name & "* = " & procType.repr & " " & pragmas
+  var decl = ""
+  if name.kind == nnkBracketExpr:
+    decl = $name[0] & "*["
+    for i in 1 ..< name.len:
+      if i > 1:
+        decl.add(", ")
+      decl.add(name[i].repr)
+    decl.add("]")
+  else:
+    decl = $name & "*"
+  var src = "type " & decl & " = " & procType.repr & " " & pragmas
   if doc.len > 0:
     src.add("\n  ## ")
     src.add(doc.replace("\n", "\n  ## "))

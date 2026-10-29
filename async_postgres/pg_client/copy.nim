@@ -1,13 +1,15 @@
 ## COPY IN / COPY OUT via the simple-query protocol, including the streaming
-## `copyInStream` / `copyOutStream` variants that move data through callbacks.
+## `copyInStream` / `copyOutStream` variants that move data through callbacks,
+## and `copyInRows`, which writes typed rows in binary COPY.
 ##
 ## Internal module: not part of the public API. Import the `pg_client` hub instead.
 
-import std/options
+import std/[options, typetraits]
 
 import ../[async_backend, pg_protocol, pg_types]
 import ../pg_connection/[types, buffer_io, simple_query]
-import core
+import ../pg_types/copy_rows
+import core, prepared, transaction
 
 proc pollCopyInError(
     conn: PgConnection, watch: RecvWatch
@@ -501,6 +503,273 @@ proc copyInStream*(
       "COPY IN stream timed out",
     )
   return info
+
+declareAsyncCallback(
+  CopyInRowsCallback[T],
+  proc(): Future[seq[T]],
+  "Callback supplying the next batch of rows to `copyInRowsStream`. Return an empty seq to finish.",
+)
+
+template makeCopyInRowsCallback*(T: typedesc, body: untyped): CopyInRowsCallback[T] =
+  ## Create a ``CopyInRowsCallback[T]`` that works with both asyncdispatch and
+  ## chronos. ``body`` must evaluate to ``seq[T]``; an empty one finishes.
+  ##
+  ## .. code-block:: nim
+  ##   var page = 0
+  ##   let cb = makeCopyInRowsCallback(User):
+  ##     inc page
+  ##     await fetchUsers(page) # empty past the last page
+  ##   discard await conn.copyInRowsStream("users", cb)
+  when hasChronos:
+    CopyInRowsCallback[T](
+      proc(): Future[seq[T]] {.async: (raises: [CatchableError]).} =
+        body
+    )
+  else:
+    CopyInRowsCallback[T](
+      proc(): Future[seq[T]] {.async.} =
+        body
+    )
+
+type CopyRowsPlanner = proc(
+  fields: seq[FieldDescription]
+): (CopyRowsPlan, CopyInCallback) {.gcsafe, raises: [CatchableError].}
+  ## The plan for the target's described columns and the callback streaming
+  ## the rows by it.
+
+const rowsChunkCap = copyBatchSize + 65536
+  ## Headroom for the row that crosses `copyBatchSize`.
+
+proc describeColumns(
+    conn: PgConnection, sql: string
+): Future[seq[FieldDescription]] {.async.} =
+  ## Describe ``sql`` as the unnamed statement, traced as a prepare.
+  conn.checkReady()
+  var stmt: PreparedStatement
+  withConnTracing(
+    conn,
+    onPrepareStart,
+    onPrepareEnd,
+    TracePrepareStartData(name: "", sql: sql),
+    TracePrepareEndData,
+    TracePrepareEndData(),
+  ):
+    stmt = await conn.describeImpl("", sql)
+  return stmt.fields
+
+proc enumTypes(conn: PgConnection, oids: seq[int32]): Future[seq[int32]] {.async.} =
+  ## Those of ``oids`` that are enum types.
+  var list = ""
+  for oid in oids:
+    if list.len > 0:
+      list.add(',')
+    list.add($cast[uint32](oid))
+  # As int4, an OID past 2^31 comes back negative, as Describe reports it.
+  let res = await conn.simpleQuery(
+    "SELECT oid::pg_catalog.int4 FROM pg_catalog.pg_type WHERE typtype = 'e' AND " &
+      "oid = ANY ('{" & list & "}'::pg_catalog.oid[])"
+  )
+  var enums: seq[int32]
+  for row in res[0].rows:
+    enums.add(row.getInt(0))
+  return enums
+
+proc copyInRowsSteps(
+    conn: PgConnection, target, selected: string, planner: CopyRowsPlanner
+): Future[CommandResult] {.async.} =
+  ## Describe ``target``, check the plan against it, then COPY the rows.
+  let fields = await conn.describeColumns("SELECT " & selected & " FROM " & target)
+  let (plan, callback) = planner(fields)
+  if plan.enumChecks.len > 0:
+    var oids: seq[int32]
+    for c in plan.enumChecks:
+      oids.add(c.oid)
+    let enums = await conn.enumTypes(oids)
+    plan.checkEnumColumns(enums)
+  var sql = "COPY " & target & " ("
+  for i, n in plan.columns:
+    if i > 0:
+      sql.add(", ")
+    sql.add(quoteIdentifier(n))
+  sql.add(") FROM STDIN (FORMAT binary)")
+  let info = await conn.copyInStream(sql, callback)
+  return initCommandResult(info.commandTag)
+
+proc copyInRowsImpl(
+    conn: PgConnection,
+    table, schema: string,
+    columns: seq[string],
+    positional: bool,
+    planner: CopyRowsPlanner,
+): Future[CommandResult] {.async.} =
+  if positional and columns.len == 0:
+    raise newException(
+      PgTypeError, "copyInRows: rows without field names need the columns named"
+    )
+  checkNoNul(table, "table name")
+  checkNoNul(schema, "schema name")
+  for i, c in columns:
+    checkNoNul(c, "column name")
+    if c in columns.toOpenArray(0, i - 1):
+      raise newException(PgTypeError, "copyInRows: column \"" & c & "\" is named twice")
+  var target = quoteIdentifier(table)
+  if schema.len > 0:
+    target = quoteIdentifier(schema) & "." & target
+  var selected = ""
+  if columns.len == 0:
+    selected = "*"
+  for i, c in columns:
+    if i > 0:
+      selected.add(", ")
+    selected.add(quoteIdentifier(c))
+  conn.checkReady()
+  if conn.txStatus != tsIdle:
+    return await conn.copyInRowsSteps(target, selected, planner)
+  # Hold the Describe's lock, which pins the column types, until the COPY.
+  var res: CommandResult
+  try:
+    conn.withTransaction:
+      res = await conn.copyInRowsSteps(target, selected, planner)
+  except CancelledError as e:
+    # A cancellation skips the ROLLBACK: retire rather than hand back a
+    # connection inside a transaction the caller never opened.
+    if conn.txStatus != tsIdle:
+      conn.markClosed()
+    raise e
+  return res
+
+proc copyInRowsTimed(
+    conn: PgConnection,
+    table, schema: string,
+    columns: seq[string],
+    positional: bool,
+    planner: CopyRowsPlanner,
+    timeout: Duration,
+): Future[CommandResult] {.async.} =
+  var res: CommandResult
+  awaitOrInvalidate(
+    conn,
+    res,
+    copyInRowsImpl(conn, table, schema, columns, positional, planner),
+    timeout,
+    "COPY IN timed out",
+  )
+  return res
+
+proc copyInRowsStream*[T: object | tuple | ref object](
+    conn: PgConnection,
+    table: string,
+    callback: CopyInRowsCallback[T],
+    columns: openArray[string] = [],
+    schema = "",
+    timeout: Duration = ZeroDuration,
+): Future[CommandResult] =
+  ## `copyInRows`, pulling rows from ``callback`` in batches until it returns
+  ## an empty one, gathered into sends of about 256 KiB.
+  ##
+  ## ``callback`` is first called once the columns are checked and the COPY
+  ## has started. If it raises, the COPY is aborted as for an unwritable
+  ## value and its error is raised; row indexes in errors count across batches.
+  let given = columns.len > 0
+  let planner: CopyRowsPlanner = proc(
+      fields: seq[FieldDescription]
+  ): (CopyRowsPlan, CopyInCallback) =
+    let plan = planCopyRows[T](fields, given)
+    var batch: seq[T]
+    var next, base = 0
+    var started, finished = false
+    let pull = makeCopyInCallback:
+      var buf: seq[byte]
+      if not finished:
+        buf = newSeqOfCap[byte](rowsChunkCap)
+        if not started:
+          buf.addCopyBinaryHeader()
+          started = true
+        while buf.len < copyBatchSize:
+          if next == batch.len:
+            base += batch.len
+            next = 0
+            batch = await callback()
+            if batch.len == 0:
+              buf.addCopyBinaryTrailer()
+              finished = true
+              break
+          encodeCopyRows(buf, batch, next, plan, copyBatchSize, base)
+      buf
+    (plan, pull)
+  copyInRowsTimed(
+    conn, table, schema, @columns, T is tuple and not isNamedTuple(T), planner, timeout
+  )
+
+proc copyInRows*[T: object | tuple | ref object](
+    conn: PgConnection,
+    table: string,
+    rows: sink seq[T],
+    columns: openArray[string] = [],
+    schema = "",
+    timeout: Duration = ZeroDuration,
+): Future[CommandResult] =
+  ## Write ``rows`` to ``table`` with ``COPY ... FROM STDIN (FORMAT binary)``;
+  ## ``affectedRows`` is the number of rows written.
+  ##
+  ## Each field goes to the column its name matches by ``to``'s rules
+  ## (``createdAt`` writes ``created_at``; ``pgColumn``, ``pgSkip``). Without
+  ## ``columns`` every field must match a column; with them, each column must
+  ## be matched and other fields are skipped. An unnamed tuple writes
+  ## ``columns`` by position. ``table`` and ``schema`` are quoted: pass a
+  ## schema in ``schema``, not as ``"schema.table"``.
+  ##
+  ## Binary COPY would read a mismatched payload as another value, so each
+  ## field's type is checked against a Describe of the target first; outside
+  ## a transaction both run in one. A field of type ``F`` may be written to:
+  ##
+  ## - ``int`` / ``int16`` / ``int32`` / ``int64``: smallint, integer, bigint
+  ##   or numeric; a value out of the column's range fails.
+  ## - ``float32`` / ``float64``: real or double precision; a value that
+  ##   overflows real or underflows to 0 fails.
+  ## - ``bool``: boolean. ``seq[byte]``: bytea.
+  ## - ``string``: text, varchar, char(n), name, json, jsonb, xml, uuid (its
+  ##   text form) or numeric (a plain decimal).
+  ## - ``DateTime``: timestamp (its UTC wall clock), timestamptz (its instant,
+  ##   whatever the session ``TimeZone``) or date (its UTC calendar day).
+  ## - ``JsonNode``: json or jsonb.
+  ## - an enum without a ``toPgBinaryParam``: its ``$`` label (not its
+  ##   ``toPgParam``), to text, varchar, char(n), name or an enum type.
+  ## - ``seq`` of an integer type or ``DateTime``, or of ``Option`` of one:
+  ##   an array of any of the column types above for the element.
+  ## - ``Option[F]``: as ``F``, ``none`` as NULL.
+  ## - a type with a ``toPgBinaryParam``: a column of the type it encodes,
+  ##   any text type for a text type, any text array type for a text array.
+  ## - a distinct type without one (a domain): as its base type, not through
+  ##   its ``toPgParam``.
+  ##
+  ## Composite types, arrays of enums, hstore and arrays of ranges are not
+  ## supported, nor are strings for types outside PostgreSQL's own.
+  ##
+  ## A mismatch raises ``PgTypeError`` before the COPY. A value that cannot be
+  ## written (out of range, uninitialized ``DateTime``, ``nil`` row) aborts it
+  ## with CopyFail, writing no row and leaving the connection usable, and
+  ## raises ``PgTypeError`` naming the row, field and column. On timeout the
+  ## connection is retired unless the wire had settled, and always inside a
+  ## transaction this call opened.
+  ##
+  ## .. code-block:: nim
+  ##   type User = object
+  ##     id {.pgSkip.}: int64
+  ##     name: string
+  ##     createdAt: DateTime
+  ##
+  ##   let res = await conn.copyInRows("users", users)
+  ##   echo res.affectedRows
+  var rows = rows
+  var sent = false
+  let callback = makeCopyInRowsCallback(T):
+    if sent:
+      newSeq[T]()
+    else:
+      sent = true
+      move rows
+  copyInRowsStream(conn, table, callback, columns, schema, timeout)
 
 proc copyOutImpl(conn: PgConnection, sql: string): Future[CopyResult] {.async.} =
   conn.checkReady()

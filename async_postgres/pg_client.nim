@@ -109,6 +109,10 @@ export prepared.paramOids
 # `copy` — COPY IN / COPY OUT entry points (`*Impl` stay internal).
 export copy.copyIn
 export copy.copyInStream
+export copy.copyInRows
+export copy.copyInRowsStream
+export copy.CopyInRowsCallback
+export copy.makeCopyInRowsCallback
 export copy.copyOut
 export copy.copyOutStream
 

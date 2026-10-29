@@ -16,6 +16,8 @@ when hasAsyncDispatch:
 
 declareAsyncCallback(TestCb, proc(): Future[seq[byte]])
 declareAsyncCallback(SinkCb, proc(data: sink seq[byte]): Future[void])
+declareAsyncCallback(PairCb[A, B], proc(a: A): Future[B])
+declareAsyncCallback(IntCb[T: SomeInteger], proc(a: T): Future[T])
 
 suite "makeAsyncSeqByteCallback":
   test "final-expression body yields value":
@@ -53,6 +55,24 @@ suite "makeAsyncSinkByteCallback":
       got
 
     check (waitFor run()) == @[byte(1), byte(2)]
+
+suite "declareAsyncCallback":
+  test "a generic name declares a generic callback type":
+    when hasChronos:
+      let cb = PairCb[int, string](
+        proc(a: int): Future[string] {.async: (raises: [CatchableError]).} =
+          $a
+      )
+    else:
+      let cb = PairCb[int, string](
+        proc(a: int): Future[string] {.async.} =
+          $a
+      )
+    check (waitFor cb(7)) == "7"
+
+  test "a constrained generic parameter keeps its constraint":
+    check compiles(IntCb[int])
+    check not compiles(IntCb[string])
 
 suite "Duration":
   test "conversion helpers":
