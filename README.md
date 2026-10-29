@@ -29,7 +29,7 @@ Async PostgreSQL client in Nim.
 - Prepared statements with server-side statement cache (LRU eviction)
 - Server-side cursors (streaming row chunks)
 - Transactions (`withTransaction`)
-- COPY IN / COPY OUT (buffered and streaming)
+- COPY IN / COPY OUT (buffered and streaming), and typed rows in binary COPY (`conn.copyInRows("users", users)`, streamed with `copyInRowsStream`)
 - Large Object API (streaming binary data)
 - LISTEN/NOTIFY with auto-reconnect
 - Advisory locks (session/transaction, exclusive/shared)

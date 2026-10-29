@@ -79,14 +79,11 @@ proc checkPreparedName(name: string) =
         "', which is reserved for the statement cache",
     )
 
-proc prepareImpl*(
+proc describeImpl*(
     conn: PgConnection, name: string, sql: string
 ): Future[PreparedStatement] {.async.} =
-  conn.checkReady()
-  # The name is the application's, not a generated `nextStmtName()`, so it is
-  # checked for NUL and reserved names, and charged against the Parse envelope.
-  checkNoNul(name, "prepared statement name")
-  checkPreparedName(name)
+  ## Parse ``sql`` as statement ``name`` (``""`` for the unnamed one) and
+  ## Describe it, on a ``conn`` already checked ready.
   validateParseMsg(sql, nParams = 0, stmtNameLen = name.len)
 
   var batch = newSeqOfCap[byte](sql.len + name.len + 32)
@@ -114,6 +111,16 @@ proc prepareImpl*(
     discard
 
   return stmt
+
+proc prepareImpl*(
+    conn: PgConnection, name: string, sql: string
+): Future[PreparedStatement] {.async.} =
+  conn.checkReady()
+  # The name is the application's, not a generated `nextStmtName()`, so it is
+  # checked for NUL and reserved names, and charged against the Parse envelope.
+  checkNoNul(name, "prepared statement name")
+  checkPreparedName(name)
+  return await conn.describeImpl(name, sql)
 
 proc prepare*(
     conn: PgConnection, name: string, sql: string, timeout: Duration = ZeroDuration

@@ -233,10 +233,14 @@ async_postgres/pg_bytes.nim	writeBE16
 async_postgres/pg_bytes.nim	writeBE32
 async_postgres/pg_bytes.nim	writeBE64
 async_postgres/pg_bytes.nim	writeBytesAt
+async_postgres/pg_client.nim	export copy.CopyInRowsCallback
 async_postgres/pg_client.nim	export copy.copyIn
+async_postgres/pg_client.nim	export copy.copyInRows
+async_postgres/pg_client.nim	export copy.copyInRowsStream
 async_postgres/pg_client.nim	export copy.copyInStream
 async_postgres/pg_client.nim	export copy.copyOut
 async_postgres/pg_client.nim	export copy.copyOutStream
+async_postgres/pg_client.nim	export copy.makeCopyInRowsCallback
 async_postgres/pg_client.nim	export core.AccessMode
 async_postgres/pg_client.nim	export core.DeferrableMode
 async_postgres/pg_client.nim	export core.IsolationLevel
@@ -299,9 +303,12 @@ async_postgres/pg_client/copy.nim	copyIn
 async_postgres/pg_client/copy.nim	copyIn#2
 async_postgres/pg_client/copy.nim	copyIn#3
 async_postgres/pg_client/copy.nim	copyIn#4
+async_postgres/pg_client/copy.nim	copyInRows
+async_postgres/pg_client/copy.nim	copyInRowsStream
 async_postgres/pg_client/copy.nim	copyInStream
 async_postgres/pg_client/copy.nim	copyOut
 async_postgres/pg_client/copy.nim	copyOutStream
+async_postgres/pg_client/copy.nim	makeCopyInRowsCallback
 async_postgres/pg_client/core.nim	AccessMode
 async_postgres/pg_client/core.nim	AccessMode.amDefault
 async_postgres/pg_client/core.nim	AccessMode.amReadOnly
@@ -1471,7 +1478,7 @@ async_postgres/pg_types.nim	export encoding.writeParamFormat
 async_postgres/pg_types.nim	export encoding.writeParamOid
 async_postgres/pg_types.nim	export encoding.writeParamValue
 async_postgres/pg_types.nim	export ranges
-async_postgres/pg_types.nim	export row_mapping except mapRow, resolveRowColumns
+async_postgres/pg_types.nim	export row_mapping except mapRow, resolveRowColumns, findColumn, fieldContext, isCaseObject
 async_postgres/pg_types.nim	export user_types
 async_postgres/pg_types.nim	get
 async_postgres/pg_types.nim	pgParams

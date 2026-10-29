@@ -1,7 +1,8 @@
 ## COPY protocol example.
 ##
 ## Demonstrates bulk data import/export using PostgreSQL's COPY protocol,
-## including both buffered and streaming variants.
+## including both buffered and streaming variants, and typed rows with
+## `copyInRows`.
 ##
 ## Usage:
 ##   nim c -r examples/copy.nim
@@ -9,6 +10,10 @@
 import pkg/async_postgres
 
 const Dsn = "postgresql://test:test@127.0.0.1:15432/test?sslmode=disable"
+
+type Item = object
+  id: int
+  name: string
 
 proc main() {.async.} =
   let conn = await connect(Dsn)
@@ -59,5 +64,24 @@ proc main() {.async.} =
   echo "\ncopyOutStream rows (", outInfo.commandTag, "):"
   for chunk in chunks:
     stdout.write "  ", chunk.toString()
+
+  # copyInRows: typed rows, each field to the column its name matches
+  discard await conn.exec("TRUNCATE items")
+
+  let items = @[Item(id: 100, name: "Frank"), Item(id: 200, name: "Grace")]
+  let res = await conn.copyInRows("items", items)
+  echo "\ncopyInRows wrote ", res.affectedRows, " rows"
+
+  # copyInRowsStream: typed rows pulled in batches until an empty one
+  var page = 0
+  let pages = makeCopyInRowsCallback(Item):
+    inc page
+    if page <= 3:
+      @[Item(id: 1000 + page, name: "Page " & $page)]
+    else:
+      newSeq[Item]()
+
+  let streamed = await conn.copyInRowsStream("items", pages)
+  echo "copyInRowsStream wrote ", streamed.affectedRows, " rows"
 
 waitFor main()

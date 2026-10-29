@@ -90,8 +90,9 @@ export ranges
 
 # `row_mapping` — `to(row, T)` and its field pragmas. `mapRow` and
 # `resolveRowColumns` (the column cache behind `to(QueryResult, seq[T])`) are
-# sibling-only.
-export row_mapping except mapRow, resolveRowColumns
+# sibling-only, as are the matching helpers `copy_rows` shares.
+export row_mapping except
+  mapRow, resolveRowColumns, findColumn, fieldContext, isCaseObject
 
 # Name-based accessors bound here so both accessors.nim (non-range getters)
 # and ranges.nim (Range/Multirange getters) are visible when `nameAccessor`
