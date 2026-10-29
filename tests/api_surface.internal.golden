@@ -119,7 +119,6 @@ async_postgres/pg_connection/buffer_io.nim	closeTransport
 async_postgres/pg_connection/buffer_io.nim	configureKeepalive
 async_postgres/pg_connection/buffer_io.nim	configureTcpNoDelay
 async_postgres/pg_connection/buffer_io.nim	configureTcpNoDelay#2
-async_postgres/pg_connection/buffer_io.nim	dialServer
 async_postgres/pg_connection/buffer_io.nim	dialTargets
 async_postgres/pg_connection/buffer_io.nim	dialTargets#2
 async_postgres/pg_connection/buffer_io.nim	idleProbe
@@ -134,7 +133,6 @@ async_postgres/pg_connection/buffer_io.nim	ready
 async_postgres/pg_connection/buffer_io.nim	rearm
 async_postgres/pg_connection/buffer_io.nim	recvMessage
 async_postgres/pg_connection/buffer_io.nim	resolveTargets
-async_postgres/pg_connection/buffer_io.nim	resolveTargets#2
 async_postgres/pg_connection/buffer_io.nim	sendBufMsg
 async_postgres/pg_connection/buffer_io.nim	sendMsg
 async_postgres/pg_connection/buffer_io.nim	sendRawBytes
