@@ -627,15 +627,8 @@ proc copyInRowsImpl(
     return await conn.copyInRowsSteps(target, selected, planner)
   # Hold the Describe's lock, which pins the column types, until the COPY.
   var res: CommandResult
-  try:
-    conn.withTransaction:
-      res = await conn.copyInRowsSteps(target, selected, planner)
-  except CancelledError as e:
-    # A cancellation skips the ROLLBACK: retire rather than hand back a
-    # connection inside a transaction the caller never opened.
-    if conn.txStatus != tsIdle:
-      conn.markClosed()
-    raise e
+  conn.withTransaction:
+    res = await conn.copyInRowsSteps(target, selected, planner)
   return res
 
 proc copyInRowsTimed(

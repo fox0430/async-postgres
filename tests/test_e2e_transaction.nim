@@ -1854,6 +1854,44 @@ suite "E2E: Transaction":
 
     waitFor t()
 
+  when hasChronos:
+    test "a timed-out withSavepoint does not let the outer COMMIT keep its writes":
+      # The cancel lands while the savepoint body sleeps, between statements.
+      # The caller catches the timeout and goes on, so an open connection would
+      # commit the savepoint's INSERT with the outer transaction.
+      proc t() {.async.} =
+        let admin = await connect(plainConfig())
+        discard await admin.exec("DROP TABLE IF EXISTS test_sp_cancel")
+        discard await admin.exec("CREATE TABLE test_sp_cancel (val text)")
+
+        let conn = await connect(plainConfig())
+        proc savepointBody() {.async.} =
+          conn.withSavepoint("sp"):
+            discard await conn.exec("INSERT INTO test_sp_cancel VALUES ('sp')")
+            await sleepAsync(seconds(5))
+
+        var outerErr = false
+        try:
+          conn.withTransaction:
+            try:
+              await savepointBody().wait(milliseconds(200))
+            except AsyncTimeoutError:
+              discard
+            discard await conn.exec("INSERT INTO test_sp_cancel VALUES ('outer')")
+        except CatchableError:
+          outerErr = true
+        doAssert outerErr, "the outer transaction must fail, not commit"
+        doAssert conn.state == csClosed, "got " & $conn.state
+        await conn.close()
+
+        let res = await admin.query("SELECT count(*) FROM test_sp_cancel")
+        doAssert res.rows[0].getInt64(0) == 0, "rows were committed"
+
+        discard await admin.exec("DROP TABLE test_sp_cancel")
+        await admin.close()
+
+      waitFor t()
+
 suite "E2E: Deadline-bounded Transaction":
   test "withTransactionDeadline commits on success":
     proc t() {.async.} =

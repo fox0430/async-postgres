@@ -342,6 +342,72 @@ when hasChronos:
 
       waitFor t()
 
+  proc cancelBetweenStatements(conn: PgConnection, fut: Future[void]) {.async.} =
+    ## Cancel `fut` while its body awaits something off the wire, so the wire is
+    ## settled and the scope's transaction is open.
+    await sleepAsync(milliseconds(100))
+    doAssert not fut.finished, "the body should be parked on its sleep"
+    doAssert conn.state == csReady and conn.txStatus == tsInTransaction,
+      "expected a settled wire inside the transaction; got " & $conn.state & "/" &
+        $conn.txStatus
+    await fut.cancelAndWait()
+    let err = fut.readError()
+    doAssert err != nil and err of CancelledError
+
+  template retiresOnCancelBetweenStatements(
+      name: string, inSavepoint: bool, scope: untyped
+  ) {.dirty.} =
+    ## `scope` runs on `conn` with a BEGIN or SAVEPOINT reply ready and parks its
+    ## body on a sleep; cancelling it there must retire the connection.
+    test name:
+      proc t() {.async.} =
+        let (conn, server, sTx) = await makeScriptedConn()
+        if inSavepoint:
+          discard
+            await sTx.write(buildCommandComplete("SAVEPOINT") & buildReadyForQuery('T'))
+          conn.txStatus = tsInTransaction
+        else:
+          await preBufferBeginReply(sTx)
+
+        proc runScope() {.async.} =
+          scope
+
+        await cancelBetweenStatements(conn, runScope())
+        doAssert conn.state == csClosed, "got " & $conn.state
+
+        await cleanupScripted(server, sTx)
+
+      waitFor t()
+
+  suite "cancel between statements retires the connection":
+    # No ROLLBACK is awaited on cancel, so a connection handed back would run
+    # the caller's next statements in, or commit, the abandoned transaction.
+    retiresOnCancelBetweenStatements("withTransaction", false):
+      conn.withTransaction:
+        await sleepAsync(seconds(10))
+
+    retiresOnCancelBetweenStatements("withTransactionRetry", false):
+      conn.withTransactionRetry(RetryOptions(maxAttempts: 3)):
+        await sleepAsync(seconds(10))
+
+    retiresOnCancelBetweenStatements("withTransactionDeadline", false):
+      conn.withTransactionDeadline(seconds(60)):
+        await sleepAsync(seconds(10))
+
+    retiresOnCancelBetweenStatements("withTransactionRetryDeadline", false):
+      conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), seconds(60)):
+        await sleepAsync(seconds(10))
+
+    # Handing the connection back would let the outer COMMIT keep the
+    # savepoint's writes, which neither RELEASE nor ROLLBACK TO settled.
+    retiresOnCancelBetweenStatements("withSavepoint", true):
+      conn.withSavepoint("sp1"):
+        await sleepAsync(seconds(10))
+
+    retiresOnCancelBetweenStatements("withSavepointDeadline", true):
+      conn.withSavepointDeadline("sp1", seconds(60)):
+        await sleepAsync(seconds(10))
+
   suite "pool with* macro external cancellation":
     test "withConnection: cancel during release re-raises CancelledError":
       # buildReleaseAndReraise's `except CancelledError` arm: a cancel landing
