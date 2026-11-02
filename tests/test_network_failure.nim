@@ -9,6 +9,8 @@
 import std/[unittest, strutils, base64]
 when defined(linux):
   from std/os import walkDir
+  from std/net import newSocket, bindAddr, listen, getLocalAddr, connect, close
+  from std/times import epochTime
 
 import pkg/nimcrypto/pbkdf2
 
@@ -253,6 +255,38 @@ suite "Dial":
         await closeServer(ms)
 
       check (waitFor testBody()) == "127.0.0.1"
+
+    test "userTimeout bounds a handshake the server never answers":
+      # A full accept queue drops further SYNs, so the dial would hang for the
+      # kernel's SYN retries without the bound.
+      let listener = newSocket()
+      listener.bindAddr(Port(0), "127.0.0.1")
+      listener.listen(0)
+      let port = listener.getLocalAddr()[1]
+      let queued = newSocket()
+      queued.connect("127.0.0.1", port)
+      defer:
+        queued.close()
+        listener.close()
+
+      proc testBody(): Future[ref CatchableError] {.async.} =
+        try:
+          let dialed = await dialTargets(
+            await resolveTargets("127.0.0.1", int(port)), userTimeout = 300
+          )
+          await closeClient(dialed.stream)
+        except CatchableError as e:
+          result = e
+
+      let start = epochTime()
+      let err = waitFor testBody()
+      let elapsed = epochTime() - start
+      check elapsed < 4.0
+      # Below 1s it still waits for the first SYN retransmit, as the kernel
+      # does: a server answering within that second is not given up on.
+      check elapsed >= 0.9
+      check err of PgUnavailableError
+      check "timed out" in err.msg
 
     test "every refused address is reported, on one line each":
       proc testBody(): Future[ref CatchableError] {.async.} =

@@ -121,27 +121,34 @@ proc parseLoadBalanceHosts(s: string): LoadBalanceHosts =
   else:
     raise newException(PgConfigError, "Invalid load_balance_hosts (len=" & $s.len & ")")
 
-proc parseDsnInt(val, label: string): int =
-  ## Parse a DSN integer. Rejects digit-group underscores (``1_0``); unlike
-  ## ``parsePort``, whitespace is not stripped.
-  if val.find('_') >= 0:
-    raise newException(PgConfigError, "Invalid " & label & " (len=" & $val.len & ")")
+proc parseLibpqInt(s: string, cInt = true): Option[int] =
+  ## libpq's strtol-based integer: surrounding whitespace and a leading sign
+  ## are accepted, digit-group underscores (which Nim's parseInt takes) are
+  ## not, and with `cInt` the value must fit a C int.
+  let t = s.strip()
+  if t.len == 0 or t.find('_') >= 0:
+    return none(int)
   try:
-    result = parseInt(val)
+    let n = parseInt(t)
+    if not cInt or (n >= int(low(int32)) and n <= int(high(int32))):
+      result = some(n)
   except ValueError:
+    discard
+
+proc parseDsnInt(val, label: string, cInt = true): int =
+  ## A DSN integer by `parseLibpqInt`'s rules. `cInt = false` is for this
+  ## client's own keywords, which libpq does not bound.
+  let n = parseLibpqInt(val, cInt)
+  if n.isNone:
     raise newException(PgConfigError, "Invalid " & label & " (len=" & $val.len & ")")
+  n.get
 
 proc parsePort(s: string): int =
-  ## Follows libpq's strtol-based rules: surrounding whitespace and a leading
-  ## sign are accepted (libpq takes `+5432` too), digit-group underscores are
-  ## not, and the final value must be in 1–65535.
-  let t = s.strip()
-  if t.find('_') >= 0:
+  ## libpq's integer rules (`+5432` is taken too), in 1–65535.
+  let n = parseLibpqInt(s, cInt = false)
+  if n.isNone:
     raise newException(PgConfigError, "Invalid port in DSN (len=" & $s.len & ")")
-  try:
-    result = parseInt(t)
-  except ValueError:
-    raise newException(PgConfigError, "Invalid port in DSN (len=" & $s.len & ")")
+  result = n.get
   if result < 1 or result > 65535:
     raise
       newException(PgConfigError, "Port out of range (1-65535) (len=" & $s.len & ")")
@@ -403,6 +410,7 @@ when defined(linux):
     maxKeepAliveIdle = 32767'i64
     maxKeepAliveInterval = 32767'i64
     maxKeepAliveCount = 127'i64
+    maxTcpUserTimeout = int64(high(cint))
 else:
   const
     maxSockOptInt = int64(high(cint))
@@ -412,6 +420,7 @@ else:
     maxKeepAliveIdle = maxSockOptInt
     maxKeepAliveInterval = maxSockOptInt
     maxKeepAliveCount = maxSockOptInt
+    maxTcpUserTimeout = maxSockOptInt
 
 proc checkClientEncoding(val: string) =
   ## The client pins ``client_encoding`` to UTF8.
@@ -551,13 +560,6 @@ proc applyParam(result: var ConnConfig, key, val: string) =
     result.applicationName = val
   of "connect_timeout":
     let secs = parseDsnInt(val, "connect_timeout")
-    # `seconds` builds a nanosecond Duration, so anything past this multiplies
-    # past high(int64) and raises an uncatchable OverflowDefect.
-    const maxTimeoutSecs = high(int64) div 1_000_000_000
-    if int64(secs) > maxTimeoutSecs:
-      raise newException(
-        PgConfigError, "connect_timeout out of range (len=" & $val.len & ")"
-      )
     # libpq treats a zero or negative connect_timeout as "wait indefinitely";
     # ZeroDuration is this codebase's "no timeout" sentinel. Mapping <= 0 here
     # avoids building a negative Duration, which would make `wait` time out
@@ -577,7 +579,9 @@ proc applyParam(result: var ConnConfig, key, val: string) =
     else:
       result.sslKey = readPemFileParam(val, "sslkey", checkKeyPerms = true)
   of "sslsni":
-    result.sslSni = parseDsnInt(val, "sslsni") != 0
+    # libpq only checks for a leading '1'; garbage is still refused here.
+    discard parseDsnInt(val, "sslsni", cInt = false)
+    result.sslSni = val.len > 0 and val[0] == '1'
   of "keepalives":
     result.keepAlive = parseDsnInt(val, "keepalives") != 0
   of "keepalives_idle":
@@ -621,13 +625,13 @@ proc applyParam(result: var ConnConfig, key, val: string) =
   of "load_balance_hosts":
     result.loadBalanceHosts = parseLoadBalanceHosts(val)
   of "max_message_size":
-    result.maxMessageSize = parseDsnInt(val, "max_message_size")
+    result.maxMessageSize = parseDsnInt(val, "max_message_size", cInt = false)
     if result.maxMessageSize < 0:
       raise newException(
         PgConfigError, "max_message_size must be non-negative (len=" & $val.len & ")"
       )
   of "max_scram_iterations":
-    result.maxScramIterations = parseDsnInt(val, "max_scram_iterations")
+    result.maxScramIterations = parseDsnInt(val, "max_scram_iterations", cInt = false)
     if result.maxScramIterations < 0:
       raise newException(
         PgConfigError,
@@ -662,9 +666,41 @@ type
       ## environment or a service may fill it; unfilled, it is rejected.
     hostOrigin, addrOrigin, portOrigin: string
 
+const DsnKeywords = [
+  # libpq's (but client_encoding, a GUC this client checks as one) and this
+  # client's own. libpq matches them case-sensitively.
+  "service", "user", "password", "passfile", "channel_binding", "connect_timeout",
+  "dbname", "host", "hostaddr", "port", "options", "application_name",
+  "fallback_application_name", "keepalives", "keepalives_idle", "keepalives_interval",
+  "keepalives_count", "tcp_user_timeout", "sslmode", "sslnegotiation", "sslcompression",
+  "sslcert", "sslkey", "sslcertmode", "sslpassword", "sslrootcert", "sslcrl",
+  "sslcrldir", "sslsni", "requirepeer", "require_auth", "min_protocol_version",
+  "max_protocol_version", "ssl_min_protocol_version", "ssl_max_protocol_version",
+  "gssencmode", "krbsrvname", "gsslib", "gssdelegation", "replication",
+  "target_session_attrs", "load_balance_hosts", "scram_client_key", "scram_server_key",
+  "oauth_issuer", "oauth_client_id", "oauth_client_secret", "oauth_scope",
+  "oauth_ca_file", "sslkeylogfile", "max_message_size", "max_scram_iterations",
+]
+
+proc sameKey(a, b: string): bool =
+  ## A keyword only matches itself; `SSLMODE` is a startup parameter, not
+  ## `sslmode`. Other names are GUCs, which the server matches without case.
+  if a == b:
+    true
+  elif a in DsnKeywords or b in DsnKeywords:
+    false
+  else:
+    isGucName(a, b)
+
+func canonicalKey(key: string): string =
+  ## The server's application_name in any case is kept as the keyword, so an
+  ## environment value, a service line or a fallback cannot override it.
+  if isGucName(key, "application_name"): "application_name" else: key
+
 proc add(f: var DsnFields, key, val, origin: string) =
   ## Record a setting. `host`, `hostaddr` and `port` are comma-separated lists
-  ## correlated only once all are seen; a later one replaces an earlier one.
+  ## correlated only once all are seen. A later setting of a key replaces an
+  ## earlier one, as libpq keeps only the last.
   case key
   of "host":
     f.hostList = splitList(val)
@@ -680,11 +716,15 @@ proc add(f: var DsnFields, key, val, origin: string) =
     f.portGiven = true
     f.portOrigin = origin
   else:
+    let key = canonicalKey(key)
+    for it in f.items.mitems:
+      if sameKey(it.key, key):
+        it = DsnItem(key: key, val: val, origin: origin)
+        return
     f.items.add DsnItem(key: key, val: val, origin: origin)
 
 proc has(f: DsnFields, key: string): bool =
-  ## Whether `key` is set, even to "". Other keys are startup parameters,
-  ## whose names the server matches case-insensitively.
+  ## Whether `key` is set, even to "" (see `sameKey`).
   case key
   of "host":
     f.hostGiven and not f.hostBlank
@@ -693,10 +733,22 @@ proc has(f: DsnFields, key: string): bool =
   of "port":
     f.portGiven
   else:
+    let key = canonicalKey(key)
     for it in f.items:
-      if isGucName(it.key, key):
+      if sameKey(it.key, key):
         return true
     false
+
+proc translateLibpqAlias(key, val: var string, uri: bool) =
+  ## libpq's aliases for ``sslmode`` in a connection string: the deprecated
+  ## ``requiressl`` (a value starting with ``1`` means require, anything else
+  ## prefer) and, in a URI only, JDBC's ``ssl=true``.
+  if key == "requiressl":
+    key = "sslmode"
+    val = if val.len > 0 and val[0] == '1': "require" else: "prefer"
+  elif uri and key == "ssl" and val == "true":
+    key = "sslmode"
+    val = "require"
 
 proc collectKeyValueDsn(dsn: string): DsnFields =
   ## The settings of a libpq keyword=value connection string.
@@ -782,6 +834,7 @@ proc collectKeyValueDsn(dsn: string): DsnFields =
           val.add dsn[i]
           inc i
 
+    translateLibpqAlias(key, val, uri = false)
     result.add(key, val, "")
 
 proc pctDecode(s: string, field: string): string =
@@ -993,6 +1046,7 @@ proc collectUriDsn(dsn: string): DsnFields =
           PgConfigError,
           "Empty key in URI query parameter (item #" & $idx & ", len=" & $pair.len & ")",
         )
+      translateLibpqAlias(key, val, uri = true)
       result.add(key, val, "")
 
 proc rejectRawNul(config: ConnConfig) =
@@ -1099,6 +1153,13 @@ proc validateConnConfig*(config: var ConnConfig) =
       PgConfigError, "keepalives_count out of range (0-" & $maxKeepAliveCount & ")"
     )
 
+  if config.tcpUserTimeout < 0:
+    raise newException(PgConfigError, "tcp_user_timeout must be non-negative")
+  if int64(config.tcpUserTimeout) > maxTcpUserTimeout:
+    raise newException(
+      PgConfigError, "tcp_user_timeout out of range (0-" & $maxTcpUserTimeout & ")"
+    )
+
   if config.maxMessageSize < 0:
     raise newException(PgConfigError, "max_message_size must be non-negative")
   if config.maxScramIterations < 0:
@@ -1139,6 +1200,7 @@ proc initConnConfig*(
     maxScramIterations = 0,
     sslNegotiation = sslnPostgres,
     passFile = "",
+    tcpUserTimeout = 0,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead. Unlike `parseDsn`,
@@ -1178,6 +1240,7 @@ proc initConnConfig*(
     maxMessageSize: maxMessageSize,
     maxScramIterations: maxScramIterations,
     passFile: passFile,
+    tcpUserTimeout: tcpUserTimeout,
   )
   validateConnConfig(result)
   validateClientCertConfig(result)
@@ -1195,6 +1258,7 @@ type
     loIgnore
     loReject
     loNoClientCert ## Holds unless a client certificate is set.
+    loInvalid ## A value libpq refuses too.
 
 const
   EnvKeywords = [
@@ -1249,35 +1313,56 @@ proc libpqOnly(key, val: string): LibpqOnly =
   ## for a check or a limit would quietly weaken the connection, so those are
   ## rejected unless the value asks for what already holds (TLS 1.2 or later,
   ## protocol 3.0, no GSS encryption, a client certificate only if set, or
-  ## none when none is set).
-  result =
-    case key
-    of "sslcrl", "sslcrldir", "requirepeer":
-      loReject
-    of "sslcertmode":
-      case val
-      of "allow": loIgnore
-      of "disable": loNoClientCert
-      else: loReject
-    of "ssl_min_protocol_version":
-      if val.toLowerAscii in ["tlsv1", "tlsv1.1", "tlsv1.2"]: loIgnore else: loReject
-    of "ssl_max_protocol_version":
-      # asyncdispatch may negotiate TLS 1.3, so a lower cap would not hold.
-      if val.toLowerAscii == "tlsv1.3": loIgnore else: loReject
-    of "gssencmode":
-      if val in ["disable", "prefer"]: loIgnore else: loReject
-    of "min_protocol_version":
-      if val == "3.0": loIgnore else: loReject
-    of "max_protocol_version", "krbsrvname", "gsslib", "gssdelegation",
-        "sslcompression", "tcp_user_timeout", "fallback_application_name",
-        "sslpassword", "sslkeylogfile", "oauth_issuer", "oauth_client_id",
-        "oauth_client_secret", "oauth_scope", "oauth_ca_file", "scram_client_key",
-        "scram_server_key":
-      loIgnore
+  ## none when none is set). A value libpq itself refuses is `loInvalid`.
+  ##
+  ## An empty value (never a variable's, which counts as unset) is stored by
+  ## libpq, which refuses it for an enum option.
+  case key
+  of "sslcrl", "sslcrldir", "requirepeer":
+    if val.len == 0: loIgnore else: loReject
+  of "sslcertmode":
+    case val
+    of "allow": loIgnore
+    of "disable": loNoClientCert
+    of "require": loReject
+    else: loInvalid
+  of "ssl_min_protocol_version", "ssl_max_protocol_version":
+    let v = val.toLowerAscii
+    if v.len == 0:
+      loIgnore # libpq too
+    elif v notin ["tlsv1", "tlsv1.1", "tlsv1.2", "tlsv1.3"]:
+      loInvalid
+    elif key == "ssl_min_protocol_version":
+      if v == "tlsv1.3": loReject else: loIgnore
     else:
-      loNone
-  if result == loReject and val.len == 0:
-    result = loIgnore # unset, as libpq reads an empty value
+      # asyncdispatch may negotiate TLS 1.3, so a lower cap would not hold
+      # there; chronos (BearSSL) speaks TLS 1.2 only.
+      when hasChronos:
+        if v in ["tlsv1.2", "tlsv1.3"]: loIgnore else: loReject
+      else:
+        if v == "tlsv1.3": loIgnore else: loReject
+  of "gssencmode":
+    case val
+    of "disable", "prefer": loIgnore
+    of "require": loReject
+    else: loInvalid
+  of "min_protocol_version":
+    case val
+    of "3.0": loIgnore
+    of "3.2", "latest": loReject
+    else: loInvalid
+  of "max_protocol_version":
+    # The client speaks protocol 3.0, so every value libpq reads is a cap it
+    # never exceeds.
+    case val
+    of "3.0", "3.2", "latest": loIgnore
+    else: loInvalid
+  of "krbsrvname", "gsslib", "gssdelegation", "sslcompression", "sslpassword",
+      "sslkeylogfile", "oauth_issuer", "oauth_client_id", "oauth_client_secret",
+      "oauth_scope", "oauth_ca_file", "scram_client_key", "scram_server_key":
+    loIgnore
+  else:
+    loNone
 
 proc processEnv(): DsnEnv =
   DsnEnv(
@@ -1387,8 +1472,14 @@ proc mergeService(f: var DsnFields, env: DsnEnv) =
         else: ": no service file to search"),
     )
   for e in entries:
+    let origin = "service file \"" & path & "\", line " & $e.line
+    if e.key == "requiressl":
+      # libpq rejects it here. Read as sslmode, it would outrank PGSSLMODE
+      # and could lower a verify-full asked for there.
+      raise newException(PgConfigError, "requiressl is not supported in a service file")
+        .withOrigin(origin)
     if not f.has(e.key):
-      f.add(e.key, e.value, "service file \"" & path & "\", line " & $e.line)
+      f.add(e.key, e.value, origin)
 
 proc mergeEnvironment(f: var DsnFields, env: DsnEnv) =
   ## Fill what `f` still leaves out from libpq's environment variables. An
@@ -1439,8 +1530,11 @@ proc applyFields(f: DsnFields): ConnConfig =
   result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
   result.sslSni = true # libpq default
   var tlsFiles: seq[DsnItem] # from the environment or a service file
+  var ownCertFiles: seq[DsnItem] # the string's sslcert/sslkey, once sslcertmode is known
   var noClientCert = none(string) # where an sslcertmode=disable came from
   var modeOrigin = ""
+  var tcpUserTimeout = none(DsnItem)
+  var fallbackAppName = ""
   for it in f.items:
     case it.key
     of "service":
@@ -1450,32 +1544,59 @@ proc applyFields(f: DsnFields): ConnConfig =
     of "passfile":
       result.passFile = it.val
       continue
-    of "sslcert", "sslkey", "sslrootcert":
-      if it.origin.len > 0:
-        tlsFiles.add it
-        continue
+    of "fallback_application_name":
+      fallbackAppName = it.val
+      continue
     of "client_encoding":
       # psql's display encoding; this client always speaks UTF8.
       if it.origin.len > 0:
         continue
+    of "tcp_user_timeout":
+      # Read once the hosts and keepalives are known, as libpq reads it.
+      tcpUserTimeout = some(it)
+      continue
+    of "sslcert", "sslkey", "sslrootcert":
+      if it.origin.len > 0:
+        tlsFiles.add it
+        continue
+      if it.key != "sslrootcert":
+        ownCertFiles.add it
+        continue
     else:
       discard
-    if it.origin.len > 0:
-      case libpqOnly(it.key, it.val)
-      of loIgnore:
-        continue
-      of loReject:
-        raise newException(PgConfigError, it.key & " is not supported by this client")
-          .withOrigin(it.origin)
-      of loNoClientCert:
-        noClientCert = some(it.origin)
-        continue
-      of loNone:
-        discard
+    case libpqOnly(it.key, it.val)
+    of loIgnore:
+      continue
+    of loReject:
+      raise newException(PgConfigError, it.key & " is not supported by this client")
+        .withOrigin(it.origin)
+    of loInvalid:
+      raise newException(
+          PgConfigError, "invalid " & it.key & " value (len=" & $it.val.len & ")"
+        )
+        .withOrigin(it.origin)
+    of loNoClientCert:
+      noClientCert = some(it.origin)
+      continue
+    of loNone:
+      discard
     try:
       result.applyParam(it.key, it.val)
     except PgConfigError as e:
       raise e.withOrigin(it.origin)
+  # The string's client certificate waits for sslcertmode. With disable,
+  # libpq reads neither file (a key goes only with a certificate); one that
+  # sslmode would send is refused rather than quietly left out.
+  if noClientCert.isNone:
+    for it in ownCertFiles:
+      result.applyParam(it.key, it.val)
+  elif ownCertFiles.anyIt(it.key == "sslcert" and it.val.len > 0) and
+      result.sslMode notin {sslDisable, sslAllow}:
+    raise newException(
+        PgConfigError,
+        "sslcertmode=disable is not supported by this client with a client certificate",
+      )
+      .withOrigin(noClientCert.get)
   # Read only if this sslmode uses it, as libpq does: an mTLS shell must not
   # break a sslmode=disable DSN, nor a missing CA one that verifies nothing,
   # nor a certificate one with sslcertmode=disable that sends none.
@@ -1521,12 +1642,6 @@ proc applyFields(f: DsnFields): ConnConfig =
   if result.sslMode == sslRequire and result.sslRootCert.len > 0:
     raise
       newException(PgConfigError, RootCertUnderRequireErrorMsg).withOrigin(modeOrigin)
-  if noClientCert.isSome and result.sslCert.len > 0:
-    raise newException(
-        PgConfigError,
-        "sslcertmode=disable is not supported by this client with a client certificate",
-      )
-      .withOrigin(noClientCert.get)
   # A spelled-out empty target is a host or address fault, never a port's.
   try:
     checkExplicitHosts(f.hostList, f.addrList, f.hostGiven, f.addrGiven)
@@ -1540,6 +1655,21 @@ proc applyFields(f: DsnFields): ConnConfig =
     (host: f.hostOrigin, address: f.addrOrigin, port: f.portOrigin),
   )
   result.setHostDefaulted(not f.hostGiven and not f.addrGiven)
+  if result.applicationName.len == 0:
+    result.applicationName = fallbackAppName
+  if tcpUserTimeout.isSome and result.keepAlive and
+      not result.hosts.allIt(isUnixSocket(it.dialAddr)):
+    # libpq parses it (pqParseIntParam) only for a TCP socket with keepalives
+    # on; a Unix socket listed first does not excuse a later TCP host. A
+    # negative value is clamped to 0, its default.
+    let it = tcpUserTimeout.get
+    let n = parseLibpqInt(it.val)
+    if n.isNone:
+      raise newException(
+          PgConfigError, "invalid tcp_user_timeout value (len=" & $it.val.len & ")"
+        )
+        .withOrigin(it.origin)
+    result.tcpUserTimeout = max(n.get, 0)
   # Back-compat: set scalar host/hostaddr/port from the first entry;
   # `host` falls back to `hostaddr` like libpq's PQhost().
   result.host = result.hosts[0].displayHost
@@ -1619,10 +1749,34 @@ proc parseDsn*(dsn: string, environment = true): ConnConfig =
   ## ``sslrootcert=system`` (libpq's system trust store, which there implies
   ## verify-full) is a ``PgConfigError``. ``client_encoding`` is
   ## ignored there and ``PGDATESTYLE`` keeps only its field order (``DMY``,
-  ## ...): the session is UTF8 and ISO regardless. A libpq keyword this
-  ## client does not implement is ignored there, unless it asks for a check
-  ## or a limit this client would not apply (``sslcrl``, ``requirepeer``,
-  ## ``ssl_min_protocol_version=TLSv1.3``, ...), which is a ``PgConfigError``.
+  ## ...): the session is UTF8 and ISO regardless.
+  ##
+  ## A libpq keyword this client does not implement (``gssencmode=disable``,
+  ## ``krbsrvname``, ...) is ignored wherever it is set, unless it asks for a
+  ## check or a limit this client would not apply (``sslcrl``,
+  ## ``requirepeer``, ``ssl_min_protocol_version=TLSv1.3``, ...), which is a
+  ## ``PgConfigError``. So is a value libpq refuses too (an empty
+  ## ``sslcertmode=`` in the string or the service file, ...).
+  ## ``tcp_user_timeout`` is read only as libpq reads it, for a TCP host with
+  ## keepalives on (a malformed value there is a ``PgConfigError``), into
+  ## ``ConnConfig.tcpUserTimeout``; it is applied to the socket on Linux, as
+  ## libpq applies it, and never sent to the server.
+  ## ``fallback_application_name`` is the ``application_name`` when none is
+  ## set. ``Application_Name`` in any case is read as ``application_name``,
+  ## the server setting it names. The deprecated ``requiressl`` is read as ``sslmode`` in the
+  ## string and a URI (a value starting with ``1`` is ``require``, anything
+  ## else ``prefer``), and a URI's ``ssl=true`` as ``sslmode=require``; in the
+  ## service file ``requiressl`` is a ``PgConfigError``, as in libpq. A key set
+  ## twice in the string keeps the last value; a keyword matches only in its
+  ## own case (``SSLMODE`` is a startup parameter, as libpq would refuse it).
+  ## Integers follow libpq's strtol rules: surrounding spaces and a sign are
+  ## taken, and a libpq keyword's value must fit a C int.
+  ## ``sslsni`` is on only for a value starting with ``1``, as in libpq; a
+  ## value that is not an integer is a ``PgConfigError``.
+  ## ``sslcertmode=disable`` is honored: no client certificate is sent, and
+  ## one in the string with it is a ``PgConfigError`` unless ``sslmode`` is
+  ## ``disable`` or ``allow``, where the string's certificate and key are
+  ## dropped unread (so is a key given without a certificate, in any mode).
   ## With ``environment = false`` only the string counts: no variable, no
   ## default file and no OS user; a ``service`` there then finds no file.
   ##

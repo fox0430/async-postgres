@@ -170,6 +170,20 @@ suite "parseDsn: environment variables":
     check parseDsnWith("sslmode=allow", fakeEnv({"PGREQUIRESSL": "1"})).sslMode ==
       sslAllow
 
+  test "requiressl in the string outranks PGSSLMODE":
+    check parseDsnWith("requiressl=1", fakeEnv({"PGSSLMODE": "disable"})).sslMode ==
+      sslRequire
+    check parseDsnWith("requiressl=0", fakeEnv({"PGSSLMODE": "require"})).sslMode ==
+      sslPrefer
+
+  test "a URI's ssl=true is read as sslmode=require, as libpq does":
+    let cfg = parseDsn("postgresql://h/db?ssl=true", environment = false)
+    check cfg.sslMode == sslRequire
+    check cfg.extraParams.len == 0
+    # Only in a URI, and only "true".
+    check parseDsn("host=h ssl=true", environment = false).extraParams ==
+      @[("ssl", "true")]
+
   test "PGDATESTYLE and PGGEQO become startup parameters":
     let cfg = parseDsnWith("", fakeEnv({"PGDATESTYLE": "ISO, DMY", "PGGEQO": "off"}))
     check ("DateStyle", "DMY") in cfg.extraParams
@@ -221,13 +235,24 @@ suite "parseDsn: environment variables":
       ("PGREQUIREPEER", "postgres"),
       ("PGSSLCERTMODE", "require"),
       ("PGSSLMINPROTOCOLVERSION", "TLSv1.3"),
-      ("PGSSLMAXPROTOCOLVERSION", "TLSv1.2"),
+      ("PGSSLMAXPROTOCOLVERSION", "TLSv1.1"),
       ("PGGSSENCMODE", "require"),
       ("PGMINPROTOCOLVERSION", "3.2"),
     ]:
       let msg = parseError("", fakeEnv({name: val}))
       check msg.startsWith(name & ": ")
       check "is not supported" in msg
+
+  test "a TLSv1.2 cap holds only where TLS 1.3 is never negotiated":
+    let env = fakeEnv({"PGSSLMAXPROTOCOLVERSION": "TLSv1.2"})
+    when hasChronos:
+      check parseDsnWith("host=h", env).extraParams.len == 0
+      check parseDsn("host=h ssl_max_protocol_version=TLSv1.2", environment = false).extraParams.len ==
+        0
+    else:
+      check "is not supported" in parseError("host=h", env)
+      check parseError("host=h ssl_max_protocol_version=TLSv1.2", DsnEnv()) ==
+        "ssl_max_protocol_version is not supported by this client"
 
   test "a libpq keyword whose value already holds is ignored":
     for (name, val) in [
@@ -466,6 +491,68 @@ suite "parseDsn: what psql's environment asks for that this client does not":
         fakeEnv({"PGSERVICEFILE": file, "PGSSLCERT": cert, "PGSSLKEY": key}),
       ).sslCert == ""
 
+  test "a string's sslcertmode=disable leaves a variable's certificate unread":
+    withTempDir:
+      let cert = dir / "c.pem"
+      let key = dir / "k.pem"
+      writeFile(cert, "cert")
+      writeFile(key, "key")
+      setFilePermissions(key, {fpUserRead, fpUserWrite})
+      let env = fakeEnv({"PGSSLCERT": cert, "PGSSLKEY": key})
+      # Without it, the variable's pair is read and sent.
+      check parseDsnWith("host=h sslmode=require", env).sslCert.len > 0
+      # With it, libpq sends no certificate, so neither file is read.
+      let cfg = parseDsnWith("host=h sslmode=require sslcertmode=disable", env)
+      check cfg.sslCert == ""
+      check cfg.sslKey == ""
+      # A certificate in the string itself cannot be suppressed: it is an
+      # error, not a silent drop.
+      check parseError(
+        "host=h sslmode=require sslcertmode=disable sslcert=" & dsnQuote(cert) &
+          " sslkey=" & dsnQuote(key),
+        DsnEnv(),
+      ) ==
+        "sslcertmode=disable is not supported by this client with a client certificate"
+      # Under disable or allow no certificate is sent, so none is kept.
+      for mode in ["disable", "allow"]:
+        let quiet = parseDsnWith(
+          "host=h sslmode=" & mode & " sslcertmode=disable sslcert=" & dsnQuote(cert) &
+            " sslkey=" & dsnQuote(key),
+          DsnEnv(),
+        )
+        check quiet.sslCert == ""
+        check quiet.sslKey == ""
+        # A key alone is dropped too, not refused as an unpaired one.
+        check parseDsnWith(
+          "host=h sslmode=" & mode & " sslcertmode=disable sslkey=" & dsnQuote(key),
+          DsnEnv(),
+        ).sslKey == ""
+        # An empty sslcert names no certificate, so there is none to refuse.
+        check parseDsnWith(
+          "host=h sslmode=require sslcertmode=disable sslcert=''", DsnEnv()
+        ).sslCert == ""
+        # Neither file is read, as in libpq: a missing one is no fault.
+        let missing = parseDsnWith(
+          "host=h sslmode=" & mode & " sslcertmode=disable sslcert=" &
+            dsnQuote(dir / "none.pem") & " sslkey=" & dsnQuote(dir / "none.key"),
+          DsnEnv(),
+        )
+        check missing.sslCert == ""
+        check missing.sslKey == ""
+      # Nor a key alone in a mode that sends a certificate: libpq reads a key
+      # only with one, so it is dropped unread, not refused as unpaired.
+      let loose = dir / "loose.key"
+      writeFile(loose, "key")
+      setFilePermissions(loose, {fpUserRead, fpUserWrite, fpGroupRead, fpOthersRead})
+      for mode in ["prefer", "require", "verify-full"]:
+        for keyFile in [loose, dir / "none.key"]:
+          check parseDsnWith(
+            "host=h sslmode=" & mode & " sslcertmode=disable sslkey=" & dsnQuote(
+              keyFile
+            ),
+            DsnEnv(),
+          ).sslKey == ""
+
   test "a fault in the string is not blamed on a variable that set another list":
     # The empty host is the string's; the port came from the environment and
     # has nothing to do with it.
@@ -608,6 +695,22 @@ search_path=app
       check cfg.host == "one"
       check cfg.port == 5432
 
+  test "a service's requiressl is rejected, as libpq rejects it":
+    withTempDir:
+      let file = dir / "s.conf"
+      let env = fakeEnv({"PGSERVICEFILE": file, "PGSSLMODE": "verify-full"})
+      for body in [
+        "[a]\nrequiressl=1\n", "[a]\nrequiressl=\n",
+        "[a]\nrequiressl=0\nsslmode=verify-full\n",
+      ]:
+        writeFile(file, body)
+        check parseError("service=a host=h", env) ==
+          "service file \"" & file &
+          "\", line 2: requiressl is not supported in a service file"
+      # The string's requiressl still outranks a service's sslmode.
+      writeFile(file, "[a]\nsslmode=disable\n")
+      check parseDsnWith("service=a host=h requiressl=1", env).sslMode == sslRequire
+
   test "errors name the file and line":
     withTempDir:
       let file = dir / "s.conf"
@@ -617,9 +720,34 @@ search_path=app
         ("[a]\nldap://h/x?y\n", "LDAP lookup is not supported"),
         ("[a]\nport=nope\n", "service file \"" & file & "\", line 2: "),
         ("[a]\nsslcrl=/c\n", "sslcrl is not supported"),
+        ("[a]\ntcp_user_timeout=x\n", "invalid tcp_user_timeout value"),
+        ("[a]\nmax_protocol_version=2.0\n", "invalid max_protocol_version value"),
       ]:
         writeFile(file, body)
         check want in parseError("service=a", fakeEnv({"PGSERVICEFILE": file}))
+
+  test "a service value that asks for no limit is dropped":
+    withTempDir:
+      let file = dir / "s.conf"
+      writeFile(file, "[a]\ntcp_user_timeout=00\n")
+      let cfg = parseDsnWith("service=a", fakeEnv({"PGSERVICEFILE": file}))
+      check cfg.extraParams.len == 0
+
+  test "an empty service value is read as libpq stores it":
+    withTempDir:
+      let file = dir / "s.conf"
+      let env = fakeEnv({"PGSERVICEFILE": file, "PGGSSENCMODE": "disable"})
+      for (body, key) in [
+        ("[a]\ngssencmode=\n", "gssencmode"),
+        ("[a]\nsslcertmode=\n", "sslcertmode"),
+        ("[a]\ntcp_user_timeout=\n", "tcp_user_timeout"),
+      ]:
+        writeFile(file, body)
+        check parseError("service=a host=h", env) ==
+          "service file \"" & file & "\", line 2: invalid " & key & " value (len=0)"
+      # libpq takes an empty one of these as unset.
+      writeFile(file, "[a]\nsslcrl=\nssl_min_protocol_version=\n")
+      check parseDsnWith("service=a host=h", env).extraParams.len == 0
 
   test "lines are trimmed, CRLF too, and a section name matches whole":
     withTempDir:
@@ -661,3 +789,162 @@ search_path=app
       writeFile(file, "[a]\nhost=a,\n")
       check parseError("service=a", fakeEnv({"PGSERVICEFILE": file})) ==
         "service file \"" & file & "\", line 2: Empty host in DSN host list (element #1)"
+
+suite "parseDsn: libpq keywords this client lacks, in the string":
+  test "one whose value already holds is dropped, not sent to the server":
+    for dsn in [
+      "host=h gssencmode=disable krbsrvname=postgres tcp_user_timeout=0",
+      "host=h max_protocol_version=3.0", "host=h max_protocol_version=3.2",
+      "host=h max_protocol_version=latest", "host=h tcp_user_timeout=00",
+      "host=h tcp_user_timeout=+0", "host=h tcp_user_timeout=-1",
+      "host=h tcp_user_timeout=' 0 '", "postgresql://h/db?tcp_user_timeout=00",
+      "host=h fallback_application_name=app sslcertmode=allow",
+      "host=h sslcertmode=disable",
+      "postgresql://h/db?gssencmode=prefer&ssl_min_protocol_version=TLSv1.2",
+      "host=h sslcrl=''",
+    ]:
+      let cfg = parseDsn(dsn, environment = false)
+      check cfg.extraParams.len == 0
+
+  test "one asking for a check this client would not make is rejected":
+    for (dsn, key) in [
+      ("host=h sslcrl=/crl.pem", "sslcrl"),
+      ("host=h requirepeer=postgres", "requirepeer"),
+      ("postgresql://h/db?sslcertmode=require", "sslcertmode"),
+      ("host=h ssl_min_protocol_version=TLSv1.3", "ssl_min_protocol_version"),
+      ("host=h gssencmode=require", "gssencmode"),
+      ("host=h min_protocol_version=3.2", "min_protocol_version"),
+    ]:
+      let msg = parseError(dsn, DsnEnv())
+      check msg == key & " is not supported by this client"
+
+  test "a value libpq refuses too is reported as invalid":
+    for (dsn, key) in [
+      ("host=h tcp_user_timeout=0x0", "tcp_user_timeout"),
+      ("host=h tcp_user_timeout=0_0", "tcp_user_timeout"),
+      ("host=h tcp_user_timeout=' '", "tcp_user_timeout"),
+      ("host=h tcp_user_timeout=-3000000000", "tcp_user_timeout"),
+      ("host=h max_protocol_version=2.0", "max_protocol_version"),
+      ("host=h max_protocol_version=3", "max_protocol_version"),
+      ("host=h max_protocol_version=3.1", "max_protocol_version"),
+      ("host=h sslcertmode=bogus", "sslcertmode"),
+      ("host=h ssl_max_protocol_version=TLSv2", "ssl_max_protocol_version"),
+      # An empty integer or enum in the string, which libpq stores as "".
+      ("host=h sslcertmode=", "sslcertmode"),
+      ("host=h tcp_user_timeout=", "tcp_user_timeout"),
+      ("host=h max_protocol_version=", "max_protocol_version"),
+    ]:
+      let msg = parseError(dsn, DsnEnv())
+      check msg.startsWith("invalid " & key & " value (len=")
+
+  test "tcp_user_timeout is not read without a TCP socket with keepalives":
+    # libpq parses and sets it only there, so any value goes.
+    for dsn in [
+      "host=/run/pg,/tmp tcp_user_timeout=1000", "host=/tmp tcp_user_timeout=abc",
+      "host=/tmp tcp_user_timeout=", "host=h keepalives=0 tcp_user_timeout=30000",
+      "host=h keepalives=0 tcp_user_timeout=abc",
+    ]:
+      let cfg = parseDsn(dsn, environment = false)
+      check cfg.extraParams.len == 0
+      check cfg.tcpUserTimeout == 0
+
+  test "tcp_user_timeout is kept for the socket, not sent to the server":
+    # A Unix socket listed first does not excuse it: the TCP host may be dialed.
+    for dsn in ["host=h tcp_user_timeout=1000", "host=/run/pg,h tcp_user_timeout=1000"]:
+      let cfg = parseDsn(dsn, environment = false)
+      check cfg.tcpUserTimeout == 1000
+      check cfg.extraParams.len == 0
+    # libpq clamps a negative value to 0, its default.
+    check parseDsn("host=h tcp_user_timeout=-1", environment = false).tcpUserTimeout == 0
+    # A malformed value is refused everywhere: libpq parses it first.
+    check parseError("host=h tcp_user_timeout=abc", DsnEnv()) ==
+      "invalid tcp_user_timeout value (len=3)"
+
+  test "fallback_application_name applies when no application_name is set":
+    check parseDsn("host=h fallback_application_name=job", environment = false).applicationName ==
+      "job"
+    check parseDsn(
+      "host=h application_name=app fallback_application_name=job", environment = false
+    ).applicationName == "app"
+    check parseDsn(
+      "host=h application_name='' fallback_application_name=job", environment = false
+    ).applicationName == "job"
+    check parseDsnWith(
+      "host=h fallback_application_name=job", fakeEnv({"PGAPPNAME": "env"})
+    ).applicationName == "env"
+
+  test "a differently cased application_name is the same server setting":
+    # Sent as a startup parameter, it is still application_name to the server,
+    # so neither PGAPPNAME nor a fallback may follow and override it.
+    for env in [fakeEnv({"PGAPPNAME": "env"}), DsnEnv()]:
+      let cfg = parseDsnWith(
+        "host=h Application_Name=billing fallback_application_name=job", env
+      )
+      check cfg.applicationName == "billing"
+      check cfg.extraParams.len == 0
+    # The last spelling wins, and an empty one still takes the fallback.
+    check parseDsn("host=h application_name=a Application_Name=b", environment = false).applicationName ==
+      "b"
+    check parseDsn(
+      "host=h Application_Name='' fallback_application_name=f", environment = false
+    ).applicationName == "f"
+    # A service line in another spelling fills it only when the string has none.
+    withTempDir:
+      let file = dir / "s.conf"
+      writeFile(file, "[a]\nApplication_Name=svc\n")
+      let env = fakeEnv({"PGSERVICEFILE": file})
+      check parseDsnWith("service=a host=h application_name=mine", env).applicationName ==
+        "mine"
+      check parseDsnWith("service=a host=h", env).applicationName == "svc"
+
+  test "a GUC set twice in different case keeps the last value":
+    let cfg = parseDsn("host=h TimeZone=UTC timezone=Asia/Tokyo", environment = false)
+    check cfg.extraParams == @[("timezone", "Asia/Tokyo")]
+
+  test "a keyword in another case is not that keyword":
+    # libpq matches keywords case-sensitively; SSLMODE is a startup parameter.
+    let cfg =
+      parseDsn("host=h sslmode=verify-full SSLMODE=require", environment = false)
+    check cfg.sslMode == sslVerifyFull
+    check cfg.extraParams == @[("SSLMODE", "require")]
+    check parseDsn("host=h user=alice USER=bob", environment = false).user == "alice"
+    # Nor does it keep the environment from setting the keyword.
+    check parseDsnWith("host=h SSLMODE=disable", fakeEnv({"PGSSLMODE": "verify-full"})).sslMode ==
+      sslVerifyFull
+
+  test "a later duplicate of a libpq-only keyword wins, as in libpq":
+    # Only the last occurrence is evaluated, so an earlier one cannot raise.
+    let dup =
+      parseDsn("host=h gssencmode=require gssencmode=disable", environment = false)
+    check dup.extraParams.len == 0
+    check parseDsn("host=h sslcrl=/x sslcrl=", environment = false).extraParams.len == 0
+    # So does any other key: an earlier invalid value is never read.
+    check parseDsn("host=h sslmode=bogus sslmode=require", environment = false).sslMode ==
+      sslRequire
+    check parseDsn("host=h connect_timeout=x connect_timeout=5", environment = false).connectTimeout ==
+      seconds(5)
+    check parseDsn(
+      "host=h ssl_min_protocol_version=TLSv1.3 ssl_min_protocol_version=TLSv1.2",
+      environment = false,
+    ).extraParams.len == 0
+    # The last one can still reject.
+    check parseError("host=h sslcrl= sslcrl=/x", DsnEnv()) ==
+      "sslcrl is not supported by this client"
+    # The last sslcertmode decides whether a variable's certificate is read.
+    withTempDir:
+      let cert = dir / "c.pem"
+      let key = dir / "k.pem"
+      writeFile(cert, "cert")
+      writeFile(key, "key")
+      setFilePermissions(key, {fpUserRead, fpUserWrite})
+      let env = fakeEnv({"PGSSLCERT": cert, "PGSSLKEY": key})
+      check parseDsnWith(
+        "host=h sslmode=require sslcertmode=disable sslcertmode=allow", env
+      ).sslCert.len > 0
+      check parseDsnWith(
+        "host=h sslmode=require sslcertmode=allow sslcertmode=disable", env
+      ).sslCert == ""
+
+  test "a GUC that shares no libpq keyword still goes to the server":
+    let cfg = parseDsn("host=h search_path=app", environment = false)
+    check cfg.extraParams == @[("search_path", "app")]

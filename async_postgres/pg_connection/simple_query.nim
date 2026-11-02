@@ -251,9 +251,11 @@ proc cancelRound(
   var toDial = targets
   if toDial.len == 0:
     toDial = await resolveTargets(side.host, side.port)
-  let dialed = await dialTargets(toDial)
+  # As libpq's cancel: the session's keepalive and tcp_user_timeout too.
+  let dialed = await dialTargets(toDial, dialUserTimeout(side.config))
   side.attachTransport(dialed.stream, dialed.target, sslHost)
   try:
+    configureDialed(dialed, side.config)
     # Only on asyncdispatch, whose `wait` cannot stop a dial that lands late.
     if abandoned[]:
       return

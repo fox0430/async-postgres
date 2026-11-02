@@ -414,6 +414,25 @@ suite "parseDsn":
       else:
         discard
 
+  test "requiressl is read as sslmode, as libpq does":
+    # Deprecated alias: a value starting with "1" means require, else prefer.
+    for (dsn, mode) in [
+      ("host=h requiressl=1", sslRequire),
+      ("host=h requiressl=10", sslRequire),
+      ("host=h requiressl=0", sslPrefer),
+      ("host=h requiressl=disable", sslPrefer),
+      ("postgresql://h/db?requiressl=1", sslRequire),
+      ("postgresql://h/db?requiressl=0", sslPrefer),
+    ]:
+      let cfg = parseDsn(dsn, environment = false)
+      check cfg.sslMode == mode
+      check cfg.extraParams.len == 0
+    # The last setting wins, whichever spelling is used.
+    check parseDsn("host=h sslmode=disable requiressl=1", environment = false).sslMode ==
+      sslRequire
+    check parseDsn("host=h requiressl=1 sslmode=disable", environment = false).sslMode ==
+      sslDisable
+
   test "query param application_name":
     let cfg = parseDsn("postgresql://host/db?application_name=myapp")
     check cfg.applicationName == "myapp"
@@ -693,9 +712,25 @@ suite "parseDsn":
     expect PgError:
       discard parseDsn("postgresql://host/db?connect_timeout=9223372037")
 
-  test "connect_timeout at the largest representable value":
-    let cfg = parseDsn("postgresql://host/db?connect_timeout=9223372036")
-    check cfg.connectTimeout == seconds(9223372036)
+  test "connect_timeout at the largest C int, as libpq bounds it":
+    let cfg = parseDsn("postgresql://host/db?connect_timeout=2147483647")
+    check cfg.connectTimeout == seconds(2147483647)
+    expect PgConfigError:
+      discard parseDsn("postgresql://host/db?connect_timeout=2147483648")
+
+  test "integer keywords take surrounding spaces and a sign, as libpq does":
+    let cfg = parseDsn(
+      "host=h connect_timeout=' 5 ' keepalives=' 1' keepalives_idle=+30",
+      environment = false,
+    )
+    check cfg.connectTimeout == seconds(5)
+    check cfg.keepAlive
+    check cfg.keepAliveIdle == 30
+    expect PgConfigError:
+      discard parseDsn("host=h keepalives_idle=3000000000", environment = false)
+    # This client's own keywords are not bound to a C int.
+    check parseDsn("host=h max_message_size=3000000000", environment = false).maxMessageSize ==
+      3000000000
 
   test "password with @ sign":
     let cfg = parseDsn("postgresql://user:p%40ssword@host/db")
@@ -898,6 +933,17 @@ suite "parseDsn":
 
   test "sslsni=1 enables SNI":
     check parseDsn("postgresql://host/db?sslsni=1").sslSni == true
+
+  test "sslsni is on only for a leading '1', as libpq reads it":
+    for (val, on) in [
+      ("10", true),
+      ("10000000000", true),
+      ("2", false),
+      ("+1", false),
+      ("-1", false),
+      ("%201", false),
+    ]:
+      check parseDsn("postgresql://host/db?sslsni=" & val).sslSni == on
 
   test "error: invalid sslsni":
     expect PgError:
@@ -1787,10 +1833,28 @@ suite "parseDsn keyword=value":
       discard parseDsn("host=h port=0")
     expect PgError:
       discard parseDsn("host=h port=65536")
+    # Past a C int too, it is still a range fault, not a malformed port.
+    try:
+      discard parseDsn("host=h port=99999999999")
+      check false
+    except PgConfigError as e:
+      check e.msg.startsWith("Port out of range")
 
   test "error: invalid sslmode":
     expect PgError:
       discard parseDsn("host=h sslmode=bogus")
+
+  test "initConnConfig takes and validates tcpUserTimeout":
+    check initConnConfig(tcpUserTimeout = 5000).tcpUserTimeout == 5000
+    expect PgConfigError:
+      discard initConnConfig(tcpUserTimeout = -1)
+
+  test "tcpUserTimeout out of range fails validation, not the dial":
+    for v in [-1, int(high(int32)) + 1]:
+      var cfg = parseDsn("host=h", environment = false)
+      cfg.tcpUserTimeout = v
+      expect PgConfigError:
+        validateConnConfig(cfg)
 
   test "sslsni defaults to true (libpq parity)":
     check parseDsn("host=h dbname=d").sslSni == true

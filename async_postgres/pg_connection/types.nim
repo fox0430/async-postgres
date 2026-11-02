@@ -26,6 +26,7 @@ when defined(linux):
     TCP_KEEPIDLE* {.importc, header: "<netinet/tcp.h>".}: cint
     TCP_KEEPINTVL* {.importc, header: "<netinet/tcp.h>".}: cint
     TCP_KEEPCNT* {.importc, header: "<netinet/tcp.h>".}: cint
+    TCP_USER_TIMEOUT* {.importc, header: "<netinet/tcp.h>".}: cint
 elif defined(macosx):
   var TCP_KEEPALIVE* {.importc, header: "<netinet/tcp.h>".}: cint
   const
@@ -296,6 +297,11 @@ type
     keepAliveCount*: int
       ## Number of probes before giving up (0 = OS default; at most 127 on Linux).
       ## POSIX only.
+    tcpUserTimeout*: int
+      ## Milliseconds sent data may stay unacknowledged before the connection
+      ## is dropped (libpq ``tcp_user_timeout``; 0 = OS default). Applied with
+      ## ``keepAlive`` on, and only on Linux, as libpq applies it; it bounds
+      ## the TCP handshake too (with chronos, by a timer of the same length).
     hosts*: seq[HostEntry] ## Multiple hosts for failover (empty = use host/port)
     targetSessionAttrs*: TargetSessionAttrs ## Target server type (default tsaAny)
     loadBalanceHosts*: LoadBalanceHosts
@@ -917,6 +923,11 @@ func effectiveHost*(entry: HostEntry): string {.inline.} =
   ## it may be the default left behind when `hostaddr` is set later, and an
   ## explicit one looks the same.
   if entry.hostaddr.len > 0 and entry.host == DefaultHost: "" else: entry.host
+
+proc isUnixSocket*(host: string): bool {.inline.} =
+  ## True if `host` represents a Unix socket directory (starts with '/').
+  ## Compatible with libpq behavior.
+  host.len > 0 and host[0] == '/'
 
 func dialAddr*(entry: HostEntry): string {.inline.} =
   ## The address actually dialed: `hostaddr` when given, otherwise `host`.

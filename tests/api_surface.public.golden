@@ -407,7 +407,6 @@ async_postgres/pg_client/transaction_helpers.nim	queryInTransaction
 async_postgres/pg_client/transaction_helpers.nim	queryInTransaction#2
 async_postgres/pg_connection.nim	export buffer_io.getHosts
 async_postgres/pg_connection.nim	export buffer_io.isConnected
-async_postgres/pg_connection.nim	export buffer_io.isUnixSocket
 async_postgres/pg_connection.nim	export buffer_io.makeCopyInCallback
 async_postgres/pg_connection.nim	export buffer_io.makeCopyOutCallback
 async_postgres/pg_connection.nim	export buffer_io.socketHasFin
@@ -514,6 +513,7 @@ async_postgres/pg_connection.nim	export types.createdAt
 async_postgres/pg_connection.nim	export types.dialAddr
 async_postgres/pg_connection.nim	export types.displayHost
 async_postgres/pg_connection.nim	export types.host
+async_postgres/pg_connection.nim	export types.isUnixSocket
 async_postgres/pg_connection.nim	export types.listenError
 async_postgres/pg_connection.nim	export types.listenReconnectMaxAttempts
 async_postgres/pg_connection.nim	export types.listenReconnectMaxBackoff
@@ -533,7 +533,6 @@ async_postgres/pg_connection.nim	export types.withConnTracing
 async_postgres/pg_connection.nim	export types.withTracing
 async_postgres/pg_connection/buffer_io.nim	getHosts
 async_postgres/pg_connection/buffer_io.nim	isConnected
-async_postgres/pg_connection/buffer_io.nim	isUnixSocket
 async_postgres/pg_connection/buffer_io.nim	makeCopyInCallback
 async_postgres/pg_connection/buffer_io.nim	makeCopyOutCallback
 async_postgres/pg_connection/buffer_io.nim	socketHasFin
@@ -626,6 +625,7 @@ async_postgres/pg_connection/types.nim	ConnConfig.sslNegotiation
 async_postgres/pg_connection/types.nim	ConnConfig.sslRootCert
 async_postgres/pg_connection/types.nim	ConnConfig.sslSni
 async_postgres/pg_connection/types.nim	ConnConfig.targetSessionAttrs
+async_postgres/pg_connection/types.nim	ConnConfig.tcpUserTimeout
 async_postgres/pg_connection/types.nim	ConnConfig.tracer
 async_postgres/pg_connection/types.nim	ConnConfig.user
 async_postgres/pg_connection/types.nim	ConnCredentials
@@ -815,6 +815,7 @@ async_postgres/pg_connection/types.nim	createdAt
 async_postgres/pg_connection/types.nim	dialAddr
 async_postgres/pg_connection/types.nim	displayHost
 async_postgres/pg_connection/types.nim	host
+async_postgres/pg_connection/types.nim	isUnixSocket
 async_postgres/pg_connection/types.nim	listenError
 async_postgres/pg_connection/types.nim	listenReconnectMaxAttempts
 async_postgres/pg_connection/types.nim	listenReconnectMaxBackoff

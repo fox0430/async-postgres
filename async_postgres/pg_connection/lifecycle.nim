@@ -577,48 +577,22 @@ proc connectToHostImpl(
 
   var conn: PgConnection
 
-  let dialing = dialTargets(toDial)
-
-  when hasChronos:
-    let dialed = await dialing
-    if reached != nil:
-      reached[] = true
-    let transport = dialed.stream
-    when defined(posix):
-      if not isUnix:
-        try:
-          configureTcpNoDelay(posix.SocketHandle(transport.fd))
-          configureKeepalive(posix.SocketHandle(transport.fd), config)
-        except CatchableError as e:
-          try:
-            await noCancel transport.closeWait()
-          except CatchableError:
-            discard
-          raise newException(PgConnectionError, e.msg, e)
-    elif defined(windows):
-      # Keepalive stays POSIX-only (see `ConnConfig.keepAlive`).
-      if not isUnix:
-        configureTcpNoDelay(winlean.SocketHandle(transport.fd))
-    conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(transport, dialed.target, sslHost)
-  elif hasAsyncDispatch:
-    let dialed = await dialing
-    if reached != nil:
-      reached[] = true
-    let sock = dialed.stream
-    when defined(posix):
-      if not isUnix:
-        try:
-          configureTcpNoDelay(sock.posixFd)
-          configureKeepalive(sock.posixFd, config)
-        except CatchableError as e:
-          sock.close()
-          raise e
-    elif defined(windows):
-      if not isUnix:
-        configureTcpNoDelay(sock.getFd())
-    conn = newPgConnection(hostAddr, hostPort, config)
-    conn.attachTransport(sock, dialed.target, sslHost)
+  let dialed = await dialTargets(toDial, dialUserTimeout(config))
+  if reached != nil:
+    reached[] = true
+  try:
+    configureDialed(dialed, config)
+  except CatchableError as e:
+    when hasChronos:
+      try:
+        await noCancel dialed.stream.closeWait()
+      except CatchableError:
+        discard
+    else:
+      dialed.stream.close()
+    raise newException(PgConnectionError, e.msg, e)
+  conn = newPgConnection(hostAddr, hostPort, config)
+  conn.attachTransport(dialed.stream, dialed.target, sslHost)
 
   var scramState: ScramState
   try:
