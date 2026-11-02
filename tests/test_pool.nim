@@ -6021,12 +6021,15 @@ suite "Pool broken connection handling (integration)":
         let ms = startMockServer()
         let firstFut = acceptAndReady(ms)
 
-        let cfg = initPoolConfig(
+        var cfg = initPoolConfig(
           mockConfig(ms.port),
           minSize = 1,
           maxSize = 2,
           maintenanceInterval = milliseconds(20),
         )
+        # Unset, the refill's dial is bounded by maintenanceInterval, too short
+        # for the mock to answer it on a slow runner.
+        cfg.connConfig.connectTimeout = seconds(5)
         let pool = await newPool(cfg)
         let first = await firstFut.wait(seconds(5))
         doAssert pool.idle.len == 1
@@ -6265,6 +6268,9 @@ suite "Pool broken connection handling (integration)":
         let ms = startMockServer()
         let pool = makePool(minSize = 2)
         pool.config.connConfig = mockConfig(ms.port)
+        # Unset, the refill's dial is bounded by maintenanceInterval, too short
+        # for the mock to answer it on a slow runner.
+        pool.config.connConfig.connectTimeout = seconds(5)
         pool.config.maintenanceInterval = milliseconds(20)
         pool.config.pingTimeout = seconds(5)
 
