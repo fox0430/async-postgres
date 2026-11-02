@@ -2994,6 +2994,46 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
+  when hasChronos:
+    test "an expired withSavepointDeadline keeps the outer transaction committable":
+      # The deadline lands while the body sleeps between statements, so the body
+      # unwinds and the savepoint is rolled back on a connection that stays open.
+      proc t() {.async.} =
+        let conn = await connect(plainConfig())
+        discard await conn.exec("DROP TABLE IF EXISTS test_spd_expired")
+        discard await conn.exec(
+          "CREATE TABLE test_spd_expired (id serial PRIMARY KEY, val text)"
+        )
+
+        var raised = false
+        conn.withTransaction:
+          discard
+            await conn.exec("INSERT INTO test_spd_expired (val) VALUES ('before')")
+          try:
+            conn.withSavepointDeadline("sp1", milliseconds(200)):
+              discard
+                await conn.exec("INSERT INTO test_spd_expired (val) VALUES ('sp')")
+              await sleepAsync(seconds(5))
+          except PgTimeoutError:
+            raised = true
+          doAssert conn.state == csReady, "got " & $conn.state
+          doAssert conn.txStatus == tsInTransaction, "got " & $conn.txStatus
+          discard await conn.exec("INSERT INTO test_spd_expired (val) VALUES ('after')")
+
+        doAssert raised
+        doAssert conn.state == csReady, "got " & $conn.state
+        doAssert conn.txStatus == tsIdle, "got " & $conn.txStatus
+        let res = await conn.query("SELECT val FROM test_spd_expired ORDER BY id")
+        var vals: seq[string]
+        for row in res.rows:
+          vals.add row.getStr(0)
+        doAssert vals == @["before", "after"], "got " & $vals
+
+        discard await conn.exec("DROP TABLE test_spd_expired")
+        await conn.close()
+
+      waitFor t()
+
   test "withSavepointDeadline with auto-generated name round-trips":
     proc t() {.async.} =
       let conn = await connect(plainConfig())
