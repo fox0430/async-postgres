@@ -1,10 +1,18 @@
-import std/[unittest, options, tables]
+import std/[unittest, options, tables, os, tempfiles]
 from std/times import dateTime, mJan, mFeb, utc, `==`
-from std/strutils import startsWith
+from std/strutils import startsWith, contains, replace
 
 import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 
 import e2e_common
+import ./clear_pg_env
+
+clearPgEnv()
+
+proc dsnQuote(s: string): string =
+  ## `s` as a quoted DSN value: a Windows path's backslashes would otherwise
+  ## be read as escapes.
+  "'" & s.replace("\\", "\\\\").replace("'", "\\'") & "'"
 
 template withProbeRole(role, rolePassword, setting: string, body: untyped) =
   ## Runs ``body`` with ``cfg`` logging in as ``role`` with ``rolePassword``,
@@ -547,6 +555,31 @@ suite "E2E: DSN Connection":
       doAssert res.rows.len == 1
       doAssert res.rows[0].getStr(0) == "1"
       await conn.close()
+
+    waitFor t()
+
+  test "a DSN without a password takes it from the password file":
+    proc t() {.async.} =
+      let dir = createTempDir("pg_e2e_pass_file_", "")
+      defer:
+        removeDir(dir)
+      let path = dir / "pgpass"
+      let dsn =
+        "host=127.0.0.1 port=15432 user=test dbname=test sslmode=disable passfile=" &
+        dsnQuote(path)
+      writeFile(path, "127.0.0.1:15432:test:test:test\n")
+      setFilePermissions(path, {fpUserRead, fpUserWrite})
+      let conn = await connect(parseDsn(dsn, environment = false))
+      doAssert conn.state == csReady
+      await conn.close()
+      writeFile(path, "127.0.0.1:15432:test:test:wrong\n")
+      var msg = ""
+      try:
+        let refused = await connect(parseDsn(dsn, environment = false))
+        await refused.close()
+      except PgConnectionError as e:
+        msg = e.msg
+      doAssert "password retrieved from file \"" & path & "\"" in msg, msg
 
     waitFor t()
 

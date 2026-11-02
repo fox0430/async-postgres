@@ -11,9 +11,11 @@ import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/ssl {.all.}
 import ../async_postgres/pg_connection/lifecycle {.all.}
 from ../async_postgres/pg_connection/buffer_io import oneLine
+import ./clear_pg_env
 
 import std/importutils
 privateAccess(PgConnection)
+clearPgEnv()
 
 when hasAsyncDispatch and not defined(ssl):
   # `tests/config.nims` defines `ssl` for the asyncdispatch backend. Without it

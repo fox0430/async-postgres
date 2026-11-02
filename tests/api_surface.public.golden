@@ -615,6 +615,7 @@ async_postgres/pg_connection/types.nim	ConnConfig.keepAliveInterval
 async_postgres/pg_connection/types.nim	ConnConfig.loadBalanceHosts
 async_postgres/pg_connection/types.nim	ConnConfig.maxMessageSize
 async_postgres/pg_connection/types.nim	ConnConfig.maxScramIterations
+async_postgres/pg_connection/types.nim	ConnConfig.passFile
 async_postgres/pg_connection/types.nim	ConnConfig.password
 async_postgres/pg_connection/types.nim	ConnConfig.port
 async_postgres/pg_connection/types.nim	ConnConfig.requireAuth

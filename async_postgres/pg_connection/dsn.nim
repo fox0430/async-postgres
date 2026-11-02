@@ -11,31 +11,21 @@
 ##
 ## Only `initConnConfig` / `parseDsn` / `validateConnConfig` are re-exported
 ## through `pg_connection.nim`; the intermediate parsers stay here. Depends
-## only on `types.nim` (does not touch `PgConnection`).
+## only on `types.nim` and `conf_files.nim` (does not touch `PgConnection`).
 ##
 ## Internal module: not part of the public API. Import the `pg_connection` hub instead.
 
-import std/[strutils, options]
-when defined(posix):
-  import std/posix
-elif defined(windows):
-  import std/[oserrors, winlean]
-
-  proc getFileType(
-    h: Handle
-  ): int32 {.stdcall, dynlib: "kernel32", importc: "GetFileType".}
-
-  const
-    FileTypeUnknown = 0'i32
-    FileTypeDisk = 1'i32
+import std/[strutils, options, sequtils]
+from std/os import getEnv
 
 import ../[async_backend, pg_errors]
 from ../pg_types/encoding import hexNibble
-import types
+import types, conf_files
 
-const MaxPemFileBytes = 4 * 1024 * 1024
-  ## Cap for sslrootcert / sslcert / sslkey file reads (DoS bound; cert chains
-  ## fit comfortably under this).
+const RootCertUnderRequireErrorMsg =
+  "sslrootcert with sslmode=require is not supported by this client; use verify-ca"
+  ## A CA under ``require`` cannot be honored: libpq verifies the server against
+  ## it there, this client would accept any certificate.
 
 proc parseSslMode(s: string): SslMode =
   case s
@@ -163,8 +153,25 @@ proc splitList(s: string): seq[string] =
   else:
     s.split(',')
 
+proc withOrigin(e: ref PgConfigError, origin: string): ref PgConfigError =
+  ## `e` prefixed with where its value came from, if anywhere but the string.
+  if origin.len == 0:
+    e
+  else:
+    newException(PgConfigError, origin & ": " & e.msg, e)
+
+proc joinOrigins(origins: openArray[string]): string =
+  ## The distinct origins that apply, for an error about more than one list.
+  origins.filterIt(it.len > 0).deduplicate().join(", ")
+
+type HostOrigins = tuple[host, address, port: string]
+  ## Where each of a connection string's three lists came from: "" for the
+  ## string itself, else a variable name or a service file line.
+
 proc buildHosts(
-    hostList, addrList, portList: seq[string], hostGiven = false
+    hostList, addrList, portList: seq[string],
+    hostGiven = false,
+    origins: HostOrigins = (host: "", address: "", port: ""),
 ): seq[HostEntry] =
   ## Expand host/hostaddr/port lists into HostEntry values following libpq
   ## multi-host rules: the number of entries is set by `hostaddr` when given,
@@ -179,12 +186,17 @@ proc buildHosts(
   ## a spelled-out empty host must not silently become a localhost target.
   ## `applyParam` cannot yet know whether a later `hostaddr` will pair with
   ## it, so the fault is carried to `validateConnConfig` instead.
+  ##
+  ## A fault is blamed on the list it is about, via `origins`: a port that
+  ## will not parse comes from the port list, not from a host list the
+  ## environment happened to supply.
   if hostList.len > 0 and addrList.len > 0 and hostList.len != addrList.len:
     raise newException(
-      PgConfigError,
-      "Could not match " & $hostList.len & " host names to " & $addrList.len &
-        " hostaddr values",
-    )
+        PgConfigError,
+        "Could not match " & $hostList.len & " host names to " & $addrList.len &
+          " hostaddr values",
+      )
+      .withOrigin(joinOrigins([origins.host, origins.address]))
   let explicit = hostGiven or addrList.len > 0
   let count =
     if addrList.len > 0:
@@ -200,9 +212,10 @@ proc buildHosts(
       portList
   if ports.len != 1 and ports.len != count:
     raise newException(
-      PgConfigError,
-      "Could not match " & $ports.len & " port numbers to " & $count & " hosts",
-    )
+        PgConfigError,
+        "Could not match " & $ports.len & " port numbers to " & $count & " hosts",
+      )
+      .withOrigin(origins.port)
   for i in 0 ..< count:
     let h =
       if hostList.len > 0:
@@ -219,23 +232,26 @@ proc buildHosts(
       # non-empty). A '/' value would otherwise select AF_UNIX via `dialAddr`
       # and skip TLS entirely. Unix sockets stay available via `host`.
       raise newException(
-        PgConfigError,
-        "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets) (len=" &
-          $a.len & ")",
-      )
+          PgConfigError,
+          "Invalid hostaddr: must be a numeric IP address, not a Unix socket path (use host for Unix sockets) (len=" &
+            $a.len & ")",
+        )
+        .withOrigin(origins.address)
     let p =
       if ports.len == 1:
         ports[0]
       else:
         ports[i]
+    var port = 5432
+    if p.len > 0:
+      try:
+        port = parsePort(p)
+      except PgConfigError as e:
+        raise e.withOrigin(origins.port)
     result.add HostEntry(
       host: if h.len == 0 and a.len == 0 and not explicit: DefaultHost else: h,
       hostaddr: a,
-      port:
-        if p.len == 0:
-          5432
-        else:
-          parsePort(p),
+      port: port,
     )
 
 proc checkExplicitHosts(
@@ -275,71 +291,10 @@ proc checkExplicitHosts(
       raise
         newException(PgConfigError, "Empty host in DSN host list (element #" & $i & ")")
 
-when defined(posix) or defined(windows):
-  proc notRegularFileError(label, path: string): ref PgConfigError =
-    newException(
-      PgConfigError, label & " file is not a regular file, refusing to use: " & path
-    )
-
-when defined(posix):
-  proc openRegularFile(path, label: string): tuple[f: File, st: Stat] =
-    ## Open `path` as a File, guaranteeing it is a regular file without
-    ## blocking on FIFO/device paths. Opens with `O_NONBLOCK` first (so the
-    ## kernel returns immediately even for a FIFO with no writer), fstats the
-    ## resulting fd to enforce `S_ISREG`, then clears `O_NONBLOCK` on the fd
-    ## before wrapping it in a `File`. Sharing the fd across the type check and
-    ## the read closes the TOCTOU window a separate `stat()`+`open()` would
-    ## leave open when the file lives in an attacker-writable directory.
-    ## Caller must `close(result.f)`.
-    let fd = posix.open(path, O_RDONLY or O_NONBLOCK or O_CLOEXEC)
-    if fd < 0:
-      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
-    if fstat(fd, result.st) != 0:
-      discard close(fd)
-      raise newException(PgConfigError, "Cannot stat " & label & " file: " & path)
-    if not S_ISREG(result.st.st_mode):
-      discard close(fd)
-      raise notRegularFileError(label, path)
-    let flags = fcntl(fd, F_GETFL)
-    if flags == -1 or fcntl(fd, F_SETFL, flags and not O_NONBLOCK) == -1:
-      discard close(fd)
-      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
-    if not open(result.f, fd, fmRead):
-      discard close(fd)
-      raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
-
-proc c_ferror(f: File): cint {.importc: "ferror", header: "<stdio.h>".}
-  ## `readBuffer` shorts on both EOF and read error; only this tells them apart.
-
-proc readCapped(f: File, sizeHint: int64): string =
-  ## Read at most `MaxPemFileBytes + 1` bytes: a regular file may report
-  ## `st_size == 0` and still stream content (procfs/sysfs), so `readAll`
-  ## would grow unbounded. The extra byte makes oversize detectable.
-  ##
-  ## Grows from `sizeHint` rather than starting at the cap: `setLen` shrinks
-  ## the length but not the payload, which would stay resident.
-  const limit = MaxPemFileBytes + 1
-  var cap =
-    if sizeHint <= 0:
-      4096
-    else:
-      int(min(sizeHint + 1, int64(limit)))
-  result = newString(cap)
-  var total = 0
-  while true:
-    if total == cap:
-      if cap == limit:
-        break
-      cap = min(cap * 2, limit)
-      result.setLen(cap)
-    let n = readBuffer(f, addr result[total], cap - total)
-    if n <= 0:
-      if c_ferror(f) != 0:
-        # Truncating would hand the caller a short trust store.
-        raise newException(IOError, "read failed")
-      break
-    total += n
-  result.setLen(total)
+proc notRegularFileError(label, path: string): ref PgConfigError =
+  newException(
+    PgConfigError, label & " file is not a regular file, refusing to use: " & path
+  )
 
 proc rejectRawNulField(field, value: string) =
   ## Raise ``PgConfigError`` if ``value`` holds a raw NUL. The message names the
@@ -353,71 +308,36 @@ proc rejectRawNulField(field, value: string) =
     )
 
 proc readPemFileParam(path, label: string, checkKeyPerms = false): string =
-  ## Read a PEM parameter file (sslrootcert/sslcert/sslkey), wrapping the
-  ## stdlib `IOError` into a `PgConfigError` with the parameter name. An empty file
-  ## is rejected: it would silently fall through the callers' `.len > 0`
-  ## guards. With `checkKeyPerms` (sslkey), any group or world permission bit
-  ## is rejected — intentionally stricter than libpq, which permits `0o640`
-  ## for root-owned keys. No permission check off-POSIX (libpq also skips it
-  ## on Windows).
+  ## Read a PEM parameter file (sslrootcert/sslcert/sslkey) into a
+  ## `PgConfigError` naming the parameter on any failure. An empty file is
+  ## rejected: it would silently fall through the callers' `.len > 0` guards.
+  ## With `checkKeyPerms` (sslkey), any group or world permission bit is
+  ## rejected — intentionally stricter than libpq, which permits `0o640` for
+  ## root-owned keys. No permission check off-POSIX (libpq also skips it on
+  ## Windows).
   # Before the C `open`, which would cut the path at a NUL and read another file.
   rejectRawNulField(label, path)
-  template failRead() =
+  case readConfFile(path, result, checkKeyPerms)
+  of cffNone:
+    discard
+  of cffOpen, cffRead:
     raise newException(PgConfigError, "Cannot read " & label & " file: " & path)
-
-  template failOversize() =
+  of cffStat:
+    raise newException(PgConfigError, "Cannot stat " & label & " file: " & path)
+  of cffNotRegular:
+    raise notRegularFileError(label, path)
+  of cffLoosePerms:
     raise newException(
       PgConfigError,
-      label & " file exceeds size limit (" & $MaxPemFileBytes & " bytes): " & path,
+      label & " file has group or world accessible permissions, refusing to use: " & path,
     )
-
-  when defined(posix):
-    let opened = openRegularFile(path, label)
-    try:
-      if checkKeyPerms and (opened.st.st_mode.int and (S_IRWXG or S_IRWXO).int) != 0:
-        raise newException(
-          PgConfigError,
-          label & " file has group or world accessible permissions, refusing to use: " &
-            path,
-        )
-      if opened.st.st_size > Off(MaxPemFileBytes):
-        failOversize()
-      try:
-        result = readCapped(opened.f, int64(opened.st.st_size))
-      except IOError:
-        failRead()
-    finally:
-      close(opened.f)
-  else:
-    var f: File
-    if not open(f, path, fmRead):
-      failRead()
-    try:
-      when defined(windows):
-        # Check the opened handle: a device name (NUL, CON) or a pipe opens
-        # without blocking — only reading it does — and reparse-point files
-        # (OneDrive placeholders) stay DISK.
-        let fileType = getFileType(Handle(getOsFileHandle(f)))
-        if fileType != FileTypeDisk:
-          # UNKNOWN with an error set is a failed call, not a file kind.
-          if fileType == FileTypeUnknown and osLastError() != OSErrorCode(0):
-            failRead()
-          raise notRegularFileError(label, path)
-      # Capped as well as pre-checked, in case the reported size understates it.
-      try:
-        let size = getFileSize(f)
-        if size > MaxPemFileBytes:
-          failOversize()
-        result = readCapped(f, size)
-      except IOError:
-        failRead()
-    finally:
-      close(f)
+  of cffTooLarge:
+    raise newException(
+      PgConfigError,
+      label & " file exceeds size limit (" & $MaxConfFileBytes & " bytes): " & path,
+    )
   if result.len == 0:
     raise newException(PgConfigError, label & " file is empty: " & path)
-  if result.len > MaxPemFileBytes:
-    # Growth after the pre-check (TOCTOU).
-    failOversize()
 
 proc rawHost(host, hostaddr: string): string =
   ## Inverse of `buildHosts`' defaulting: 127.0.0.1 with no hostaddr can only
@@ -609,6 +529,10 @@ proc applyParam(result: var ConnConfig, key, val: string) =
     result.host = result.hosts[0].displayHost
     result.hostaddr = result.hosts[0].hostaddr
     result.port = result.hosts[0].port
+    # A port leaves the target as it was; `rawHostLists` folds an explicit
+    # 127.0.0.1 away, so the rebuild alone cannot tell.
+    if key == "host" or addrList.len > 0:
+      result.setHostDefaulted(false)
   of "dbname":
     result.database = val
   of "user":
@@ -720,8 +644,62 @@ proc applyParam(result: var ConnConfig, key, val: string) =
         checkOptionsPinnedParams(val)
       result.extraParams.add((key, val))
 
-proc parseKeyValueDsn(dsn: string): ConnConfig =
-  ## Parse a libpq keyword=value connection string into a ConnConfig.
+type
+  DsnItem = object
+    key, val: string
+    origin: string
+      ## Where a value the connection string left out came from (an
+      ## environment variable, a service file line); "" for the string itself.
+
+  DsnFields = object
+    ## A connection string's settings before they are applied, so that the
+    ## service file and the environment can fill in only what it leaves out.
+    items: seq[DsnItem] ## Every key but host, hostaddr and port, in order.
+    hostList, addrList, portList: seq[string]
+    hostGiven, addrGiven, portGiven: bool
+    hostBlank: bool
+      ## A URI authority with no host (``:5433``): libpq stores none, so the
+      ## environment or a service may fill it; unfilled, it is rejected.
+    hostOrigin, addrOrigin, portOrigin: string
+
+proc add(f: var DsnFields, key, val, origin: string) =
+  ## Record a setting. `host`, `hostaddr` and `port` are comma-separated lists
+  ## correlated only once all are seen; a later one replaces an earlier one.
+  case key
+  of "host":
+    f.hostList = splitList(val)
+    f.hostGiven = true
+    f.hostBlank = false
+    f.hostOrigin = origin
+  of "hostaddr":
+    f.addrList = splitList(val)
+    f.addrGiven = true
+    f.addrOrigin = origin
+  of "port":
+    f.portList = splitList(val)
+    f.portGiven = true
+    f.portOrigin = origin
+  else:
+    f.items.add DsnItem(key: key, val: val, origin: origin)
+
+proc has(f: DsnFields, key: string): bool =
+  ## Whether `key` is set, even to "". Other keys are startup parameters,
+  ## whose names the server matches case-insensitively.
+  case key
+  of "host":
+    f.hostGiven and not f.hostBlank
+  of "hostaddr":
+    f.addrGiven
+  of "port":
+    f.portGiven
+  else:
+    for it in f.items:
+      if isGucName(it.key, key):
+        return true
+    false
+
+proc collectKeyValueDsn(dsn: string): DsnFields =
+  ## The settings of a libpq keyword=value connection string.
   ##
   ## Format: ``host=localhost port=5432 dbname=test user=myuser``
   ##
@@ -731,12 +709,7 @@ proc parseKeyValueDsn(dsn: string): ConnConfig =
   ##
   ## `host`, `hostaddr`, and `port` accept comma-separated lists for
   ## multi-host failover (libpq compatible): ``host=h1,h2 port=5433,5434``.
-  result.keepAlive = true
-  result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
-  result.sslSni = true # libpq default
-
   # Tokenize into (key, value) pairs
-  var pairs: seq[(string, string)]
   var i = 0
   while i < dsn.len:
     # Skip whitespace
@@ -809,36 +782,7 @@ proc parseKeyValueDsn(dsn: string): ConnConfig =
           val.add dsn[i]
           inc i
 
-    pairs.add((key, val))
-
-  # host/hostaddr/port accept comma-separated multi-host lists, which can
-  # only be correlated once all parameters are seen — collect them raw and
-  # expand at the end (last occurrence wins, as in libpq).
-  var hostStr, hostaddrStr, portStr: string
-  var hostGiven, addrGiven = false
-  for (key, val) in pairs:
-    case key
-    of "host":
-      hostStr = val
-      hostGiven = true
-    of "hostaddr":
-      hostaddrStr = val
-      addrGiven = true
-    of "port":
-      portStr = val
-    else:
-      result.applyParam(key, val)
-
-  let hostList = splitList(hostStr)
-  let addrList = splitList(hostaddrStr)
-  checkExplicitHosts(hostList, addrList, hostGiven, addrGiven)
-  result.hosts = buildHosts(hostList, addrList, splitList(portStr), hostGiven)
-  # Back-compat: set scalar host/hostaddr/port from the first entry;
-  # `host` falls back to `hostaddr` like libpq's PQhost().
-  result.host = result.hosts[0].displayHost
-  result.hostaddr = result.hosts[0].hostaddr
-  result.port = result.hosts[0].port
-  validateClientCertConfig(result)
+    result.add(key, val, "")
 
 proc pctDecode(s: string, field: string): string =
   ## Percent-decode a URI component following libpq rules: strict ``%XX``
@@ -872,11 +816,10 @@ proc pctDecode(s: string, field: string): string =
       result.add s[i]
       inc i
 
-proc parseUriDsn(dsn: string): ConnConfig =
-  ## Parse a PostgreSQL URI connection string into a ConnConfig.
-  result.keepAlive = true
-  result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
-  result.sslSni = true # libpq default
+proc collectUriDsn(dsn: string): DsnFields =
+  ## The settings of a PostgreSQL URI connection string. As in libpq, an empty
+  ## user, password, authority or database is left unset, and so is the host
+  ## of an authority with only a port.
   let scheme =
     if dsn.startsWith("postgresql://"):
       "postgresql"
@@ -933,19 +876,25 @@ proc parseUriDsn(dsn: string): ConnConfig =
   # Parse user:password
   if userinfo.len > 0:
     let cpos = userinfo.find(':')
-    if cpos >= 0:
-      result.user = pctDecode(userinfo[0 ..< cpos], "userinfo")
-      result.password = pctDecode(userinfo[cpos + 1 .. ^1], "userinfo")
-    else:
-      result.user = pctDecode(userinfo, "userinfo")
+    let (user, password) =
+      if cpos >= 0:
+        (
+          pctDecode(userinfo[0 ..< cpos], "userinfo"),
+          pctDecode(userinfo[cpos + 1 .. ^1], "userinfo"),
+        )
+      else:
+        (pctDecode(userinfo, "userinfo"), "")
+    if user.len > 0:
+      result.add("user", user, "")
+    if password.len > 0:
+      result.add("password", password, "")
 
   # Parse host(s) and port(s) — supports comma-separated multi-host syntax.
   # libpq order: the authority splits on commas *before* percent-decoding
   # (an encoded comma stays inside one host), query parameters decode
   # *before* splitting. Structural separators are matched on the raw text,
   # so encoded ones never split.
-  var hostList, addrList, portList: seq[string]
-  var hostGiven, addrGiven = false
+  var hostList, portList: seq[string]
   template decodeHostElem(s, kind: string, elementIdx: int): string =
     ## Like ``pctDecode``, locating failures by 0-based authority element.
     try:
@@ -998,10 +947,14 @@ proc parseUriDsn(dsn: string): ConnConfig =
         else:
           hostList.add decodeHostElem(part, "host", hidx)
           portList.add ""
-    hostGiven = true
+    result.hostList = hostList
+    result.hostGiven = true
+    result.hostBlank = hostList == @[""]
+    result.portList = portList
+    result.portGiven = portList.anyIt(it.len > 0)
 
   if dbpath.len > 0:
-    result.database = pctDecode(dbpath, "database")
+    result.add("dbname", pctDecode(dbpath, "database"), "")
 
   if queryStr.len > 0:
     let items = queryStr.split('&')
@@ -1034,32 +987,13 @@ proc parseUriDsn(dsn: string): ConnConfig =
       if key.len == 0:
         # A `=value` item has a separator but no name. Like a missing '='
         # it cannot set anything, so reject it instead of storing an
-        # empty-named extra parameter. This mirrors `parseKeyValueDsn`,
+        # empty-named extra parameter. This mirrors `collectKeyValueDsn`,
         # which rejects empty keys as well.
         raise newException(
           PgConfigError,
           "Empty key in URI query parameter (item #" & $idx & ", len=" & $pair.len & ")",
         )
-      case key
-      of "host":
-        hostList = splitList(val)
-        hostGiven = true
-      of "hostaddr":
-        addrList = splitList(val)
-        addrGiven = true
-      of "port":
-        portList = splitList(val)
-      else:
-        result.applyParam(key, val)
-
-  checkExplicitHosts(hostList, addrList, hostGiven, addrGiven)
-  result.hosts = buildHosts(hostList, addrList, portList, hostGiven)
-  # Back-compat: set scalar host/hostaddr/port from the first entry;
-  # `host` falls back to `hostaddr` like libpq's PQhost().
-  result.host = result.hosts[0].displayHost
-  result.hostaddr = result.hosts[0].hostaddr
-  result.port = result.hosts[0].port
-  validateClientCertConfig(result)
+      result.add(key, val, "")
 
 proc rejectRawNul(config: ConnConfig) =
   ## Reject a raw NUL in every value that leaves the process as a C string: a
@@ -1088,6 +1022,7 @@ proc rejectRawNul(config: ConnConfig) =
   rejectRawNulField("sslrootcert", config.sslRootCert)
   rejectRawNulField("sslcert", config.sslCert)
   rejectRawNulField("sslkey", config.sslKey)
+  rejectRawNulField("passfile", config.passFile)
 
 proc validateConnConfig*(config: var ConnConfig) =
   ## Mirror DSN guards for ``initConnConfig`` and the ``connect`` chokepoint
@@ -1105,7 +1040,8 @@ proc validateConnConfig*(config: var ConnConfig) =
   if config.credentialsProvider != nil and config.password.len > 0:
     raise newException(
       PgConfigError,
-      "password and credentialsProvider are both set; clear password to use the provider",
+      "password and credentialsProvider are both set; clear password to use the provider" &
+        " (parseDsn also sets it from PGPASSWORD or a service file)",
     )
   if config.connectTimeout < ZeroDuration:
     config.connectTimeout = ZeroDuration
@@ -1202,9 +1138,12 @@ proc initConnConfig*(
     maxMessageSize = 0,
     maxScramIterations = 0,
     sslNegotiation = sslnPostgres,
+    passFile = "",
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
-  ## For DSN-based configuration, use `parseDsn` instead.
+  ## For DSN-based configuration, use `parseDsn` instead. Unlike `parseDsn`,
+  ## nothing comes from the environment: no password file unless
+  ## ``passFile`` names one, and no OS user for an empty ``user``.
   ##
   ## Validates like DSN parsing; negative ``connectTimeout`` becomes
   ## ``ZeroDuration`` (no timeout). When ``hosts`` is non-empty, scalar
@@ -1238,11 +1177,414 @@ proc initConnConfig*(
     extraParams: extraParams,
     maxMessageSize: maxMessageSize,
     maxScramIterations: maxScramIterations,
+    passFile: passFile,
   )
   validateConnConfig(result)
   validateClientCertConfig(result)
 
-proc parseDsn*(dsn: string): ConnConfig =
+type
+  DsnEnv = object ## What ``parseDsn`` reads besides the string. Tests swap it out.
+    enabled: bool ## Off: the string alone, no variable, file or OS user.
+    get: proc(name: string): string {.gcsafe, raises: [].}
+      ## An environment variable; "" when unset or empty.
+    user: proc(): tuple[name, home: string] {.gcsafe, raises: [].}
+      ## The OS user (`osUserInfo`).
+
+  LibpqOnly = enum
+    loNone ## Not a libpq-only keyword: applied as usual.
+    loIgnore
+    loReject
+    loNoClientCert ## Holds unless a client certificate is set.
+
+const
+  EnvKeywords = [
+    ("PGHOST", "host"),
+    ("PGHOSTADDR", "hostaddr"),
+    ("PGPORT", "port"),
+    ("PGDATABASE", "dbname"),
+    ("PGUSER", "user"),
+    ("PGPASSWORD", "password"),
+    ("PGPASSFILE", "passfile"),
+    ("PGOPTIONS", "options"),
+    ("PGAPPNAME", "application_name"),
+    ("PGCONNECT_TIMEOUT", "connect_timeout"),
+    ("PGCLIENTENCODING", "client_encoding"),
+    ("PGREQUIREAUTH", "require_auth"),
+    ("PGCHANNELBINDING", "channel_binding"),
+    ("PGSSLMODE", "sslmode"),
+    ("PGSSLNEGOTIATION", "sslnegotiation"),
+    ("PGSSLCOMPRESSION", "sslcompression"),
+    ("PGSSLCERT", "sslcert"),
+    ("PGSSLKEY", "sslkey"),
+    ("PGSSLCERTMODE", "sslcertmode"),
+    ("PGSSLROOTCERT", "sslrootcert"),
+    ("PGSSLCRL", "sslcrl"),
+    ("PGSSLCRLDIR", "sslcrldir"),
+    ("PGSSLSNI", "sslsni"),
+    ("PGREQUIREPEER", "requirepeer"),
+    ("PGSSLMINPROTOCOLVERSION", "ssl_min_protocol_version"),
+    ("PGSSLMAXPROTOCOLVERSION", "ssl_max_protocol_version"),
+    ("PGGSSENCMODE", "gssencmode"),
+    ("PGKRBSRVNAME", "krbsrvname"),
+    ("PGGSSLIB", "gsslib"),
+    ("PGGSSDELEGATION", "gssdelegation"),
+    ("PGTARGETSESSIONATTRS", "target_session_attrs"),
+    ("PGLOADBALANCEHOSTS", "load_balance_hosts"),
+    ("PGMINPROTOCOLVERSION", "min_protocol_version"),
+    ("PGMAXPROTOCOLVERSION", "max_protocol_version"),
+    ("PGOAUTHCAFILE", "oauth_ca_file"),
+  ]
+    ## libpq's environment variables for connection keywords, libpq-only
+    ## ones included: `libpqOnly` decides those.
+  EnvStartupParams = [("PGDATESTYLE", "DateStyle"), ("PGGEQO", "geqo")]
+    ## libpq sends these as startup parameters unless set to ``default``.
+    ## ``PGTZ`` is not read: it would move the session ``TimeZone``, and a
+    ## ``DateTime`` parameter bound to ``timestamptz`` is sent as a zoneless
+    ## timestamp, which the server then reads in that zone. A caller that wants
+    ## another zone sets ``TimeZone`` in the string, ``options`` or
+    ## ``extraParams``.
+
+proc libpqOnly(key, val: string): LibpqOnly =
+  ## libpq keywords this client does not implement. Ignoring one that asks
+  ## for a check or a limit would quietly weaken the connection, so those are
+  ## rejected unless the value asks for what already holds (TLS 1.2 or later,
+  ## protocol 3.0, no GSS encryption, a client certificate only if set, or
+  ## none when none is set).
+  result =
+    case key
+    of "sslcrl", "sslcrldir", "requirepeer":
+      loReject
+    of "sslcertmode":
+      case val
+      of "allow": loIgnore
+      of "disable": loNoClientCert
+      else: loReject
+    of "ssl_min_protocol_version":
+      if val.toLowerAscii in ["tlsv1", "tlsv1.1", "tlsv1.2"]: loIgnore else: loReject
+    of "ssl_max_protocol_version":
+      # asyncdispatch may negotiate TLS 1.3, so a lower cap would not hold.
+      if val.toLowerAscii == "tlsv1.3": loIgnore else: loReject
+    of "gssencmode":
+      if val in ["disable", "prefer"]: loIgnore else: loReject
+    of "min_protocol_version":
+      if val == "3.0": loIgnore else: loReject
+    of "max_protocol_version", "krbsrvname", "gsslib", "gssdelegation",
+        "sslcompression", "tcp_user_timeout", "fallback_application_name",
+        "sslpassword", "sslkeylogfile", "oauth_issuer", "oauth_client_id",
+        "oauth_client_secret", "oauth_scope", "oauth_ca_file", "scram_client_key",
+        "scram_server_key":
+      loIgnore
+    else:
+      loNone
+  if result == loReject and val.len == 0:
+    result = loIgnore # unset, as libpq reads an empty value
+
+proc processEnv(): DsnEnv =
+  DsnEnv(
+    enabled: true,
+    get: proc(name: string): string {.gcsafe, raises: [].} =
+      getEnv(name),
+    user: osUserInfo,
+  )
+
+proc libpqUserDir(env: DsnEnv): string =
+  ## Where libpq looks for the user's password and service files: the home
+  ## directory (``$HOME``, else the user database), on Windows
+  ## ``%APPDATA%\postgresql``. "" when unknown, which skips both.
+  when defined(windows):
+    let appData = env.get("APPDATA")
+    if appData.len > 0:
+      appData & "\\postgresql"
+    else:
+      ""
+  else:
+    let home = env.get("HOME")
+    if home.len > 0:
+      home
+    else:
+      env.user().home
+
+proc confPath(dir, name: string): string =
+  when defined(windows):
+    dir & "\\" & name
+  else:
+    dir & "/" & name
+
+proc serviceEntries(
+    path, name: string, required: bool, found: var bool
+): seq[ServiceEntry] =
+  ## Section `name` of the service file at `path`. A file that cannot be
+  ## stat'ed (or is not a regular file) is skipped unless `required`; one that
+  ## can but cannot be opened is an error, as in libpq.
+  found = false
+  rejectRawNulField("service file path", path)
+  if not confFileStats(path):
+    if required:
+      raise newException(PgConfigError, "service file \"" & path & "\" not found")
+    return
+  var content: string
+  case readConfFile(path, content)
+  of cffNone, cffLoosePerms:
+    discard
+  of cffNotRegular:
+    if required:
+      raise notRegularFileError("service", path)
+    return
+  of cffOpen, cffStat, cffRead:
+    # Not skipped: the next file may define the same name for another server.
+    raise newException(PgConfigError, "Cannot read service file: " & path)
+  of cffTooLarge:
+    raise newException(
+      PgConfigError,
+      "service file exceeds size limit (" & $MaxConfFileBytes & " bytes): " & path,
+    )
+  try:
+    parseServiceSection(content, path, name, found)
+  finally:
+    wipe(content) # other services' passwords
+
+proc mergeService(f: var DsnFields, env: DsnEnv) =
+  ## Fill what `f` leaves out from its service (``service``, else
+  ## ``PGSERVICE``), searched as libpq does: ``PGSERVICEFILE`` or the user's
+  ## file, then ``$PGSYSCONFDIR/pg_service.conf``. Files are not merged.
+  var name = ""
+  var given = false
+  for it in f.items:
+    if it.key == "service":
+      name = it.val
+      given = true # even "": libpq looks that up, not PGSERVICE
+  if not given and env.enabled:
+    name = env.get("PGSERVICE")
+    given = name.len > 0
+  if not given:
+    return
+  var found = false
+  var entries: seq[ServiceEntry]
+  var path, searched = ""
+  template search(p: string, required: bool) =
+    if not found and p.len > 0:
+      entries = serviceEntries(p, name, required, found)
+      path = p
+      searched.add((if searched.len > 0: ", \"" else: "\"") & p & "\"")
+
+  if env.enabled:
+    let explicit = env.get("PGSERVICEFILE")
+    if explicit.len > 0:
+      search(explicit, true)
+    else:
+      let dir = libpqUserDir(env)
+      if dir.len > 0:
+        search(confPath(dir, ".pg_service.conf"), false)
+    let sysDir = env.get("PGSYSCONFDIR")
+    if sysDir.len > 0:
+      search(confPath(sysDir, "pg_service.conf"), false)
+  if not found:
+    # The name is a value, which errors never echo.
+    raise newException(
+      PgConfigError,
+      "definition of service not found (len=" & $name.len & ")" &
+        (if searched.len > 0: " in " & searched
+        else: ": no service file to search"),
+    )
+  for e in entries:
+    if not f.has(e.key):
+      f.add(e.key, e.value, "service file \"" & path & "\", line " & $e.line)
+
+proc mergeEnvironment(f: var DsnFields, env: DsnEnv) =
+  ## Fill what `f` still leaves out from libpq's environment variables. An
+  ## empty one counts as unset.
+  for (name, key) in EnvKeywords:
+    if not f.has(key):
+      let val = env.get(name)
+      if val.len > 0:
+        f.add(key, val, name)
+  if not f.has("sslmode"):
+    # Deprecated; libpq still reads one starting with "1" as require.
+    let val = env.get("PGREQUIRESSL")
+    if val.len > 0 and val[0] == '1':
+      f.add("sslmode", "require", "PGREQUIRESSL")
+  # What -c switches in the string's or service's options set. PGOPTIONS's
+  # do not outrank the variables below, which libpq sends after them.
+  var switched: seq[string]
+  for it in f.items:
+    if it.key == "options" and it.origin != "PGOPTIONS":
+      switched.setLen(0)
+      for (name, _) in optionsSettings(it.val):
+        switched.add name
+  for (name, key) in EnvStartupParams:
+    var val = env.get(name)
+    # A -c switch in the string or service outranks the environment, though
+    # the server would apply a startup parameter after it.
+    if val.len == 0 or f.has(key) or switched.anyIt(isGucName(it, key)):
+      continue
+    if cmpIgnoreCase(val, "default") == 0:
+      continue
+    if key == "DateStyle":
+      # The output style is pinned to ISO; keep the field order asked for.
+      let tokens = val.split(',').mapIt(it.strip)
+      val = tokens
+        .filterIt(
+          it.len > 0 and not namesNonIsoDateStyle(it) and cmpIgnoreCase(it, "ISO") != 0
+        )
+        .join(", ")
+      if val.len == 0 and
+          tokens.anyIt(cmpIgnoreCase(it.strip(chars = {'"'}), "German") == 0):
+        val = "DMY" # the server's order for German when none is given
+      if val.len == 0:
+        continue
+    f.add(key, val, name)
+
+proc applyFields(f: DsnFields): ConnConfig =
+  result.keepAlive = true
+  result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
+  result.sslSni = true # libpq default
+  var tlsFiles: seq[DsnItem] # from the environment or a service file
+  var noClientCert = none(string) # where an sslcertmode=disable came from
+  var modeOrigin = ""
+  for it in f.items:
+    case it.key
+    of "service":
+      continue
+    of "sslmode":
+      modeOrigin = it.origin
+    of "passfile":
+      result.passFile = it.val
+      continue
+    of "sslcert", "sslkey", "sslrootcert":
+      if it.origin.len > 0:
+        tlsFiles.add it
+        continue
+    of "client_encoding":
+      # psql's display encoding; this client always speaks UTF8.
+      if it.origin.len > 0:
+        continue
+    else:
+      discard
+    if it.origin.len > 0:
+      case libpqOnly(it.key, it.val)
+      of loIgnore:
+        continue
+      of loReject:
+        raise newException(PgConfigError, it.key & " is not supported by this client")
+          .withOrigin(it.origin)
+      of loNoClientCert:
+        noClientCert = some(it.origin)
+        continue
+      of loNone:
+        discard
+    try:
+      result.applyParam(it.key, it.val)
+    except PgConfigError as e:
+      raise e.withOrigin(it.origin)
+  # Read only if this sslmode uses it, as libpq does: an mTLS shell must not
+  # break a sslmode=disable DSN, nor a missing CA one that verifies nothing,
+  # nor a certificate one with sslcertmode=disable that sends none.
+  # Also as libpq: a missing certificate file means none, and the key is read
+  # only along with a certificate, so the key goes last.
+  let sends = result.sslMode notin {sslDisable, sslAllow}
+  var certOrigin = "" # of a client cert or key taken from tlsFiles
+  for keyPass in [false, true]:
+    for it in tlsFiles:
+      if (it.key == "sslkey") != keyPass:
+        continue
+      if it.key == "sslrootcert" and it.val == "system":
+        # libpq reads this as the system trust store and verify-full; left
+        # unread it would keep sslmode at prefer.
+        raise newException(
+            PgConfigError, "sslrootcert=system is not supported by this client"
+          )
+          .withOrigin(it.origin)
+      if it.key == "sslrootcert" and result.sslMode == sslRequire and
+          confFileStats(it.val):
+        # libpq verifies the server against a CA that is there even under
+        # require; left unread it would accept any certificate.
+        raise newException(PgConfigError, RootCertUnderRequireErrorMsg).withOrigin(
+            it.origin
+          )
+      let used =
+        case it.key
+        of "sslrootcert":
+          result.sslMode in {sslVerifyCa, sslVerifyFull}
+        of "sslcert":
+          sends and noClientCert.isNone and not confFileMissing(it.val)
+        else:
+          sends and result.sslCert.len > 0
+      if used:
+        try:
+          result.applyParam(it.key, it.val)
+        except PgConfigError as e:
+          raise e.withOrigin(it.origin)
+        if it.key != "sslrootcert" and certOrigin.len == 0:
+          certOrigin = it.origin
+  # A CA the string itself names is read whatever the sslmode, so one met by
+  # require would go unread like a variable's; refuse it the same way.
+  if result.sslMode == sslRequire and result.sslRootCert.len > 0:
+    raise
+      newException(PgConfigError, RootCertUnderRequireErrorMsg).withOrigin(modeOrigin)
+  if noClientCert.isSome and result.sslCert.len > 0:
+    raise newException(
+        PgConfigError,
+        "sslcertmode=disable is not supported by this client with a client certificate",
+      )
+      .withOrigin(noClientCert.get)
+  # A spelled-out empty target is a host or address fault, never a port's.
+  try:
+    checkExplicitHosts(f.hostList, f.addrList, f.hostGiven, f.addrGiven)
+  except PgConfigError as e:
+    raise e.withOrigin(joinOrigins([f.hostOrigin, f.addrOrigin]))
+  result.hosts = buildHosts(
+    f.hostList,
+    f.addrList,
+    f.portList,
+    f.hostGiven,
+    (host: f.hostOrigin, address: f.addrOrigin, port: f.portOrigin),
+  )
+  result.setHostDefaulted(not f.hostGiven and not f.addrGiven)
+  # Back-compat: set scalar host/hostaddr/port from the first entry;
+  # `host` falls back to `hostaddr` like libpq's PQhost().
+  result.host = result.hosts[0].displayHost
+  result.hostaddr = result.hosts[0].hostaddr
+  result.port = result.hosts[0].port
+  # A variable's file goes unread under disable/allow, so an sslmode fault
+  # is the string's file meeting that sslmode; a pairing fault is the files'.
+  let paired = (result.sslCert.len > 0) == (result.sslKey.len > 0)
+  try:
+    validateClientCertConfig(result)
+  except PgConfigError as e:
+    raise e.withOrigin(if paired: modeOrigin else: certOrigin)
+
+proc parseDsnWith(dsn: string, env: DsnEnv): ConnConfig =
+  var env = env
+  if env.enabled:
+    # Up to three callers below; without HOME each is a user-database lookup.
+    let lookup = env.user
+    var looked = false
+    var info: tuple[name, home: string]
+    env.user = proc(): tuple[name, home: string] {.gcsafe, raises: [].} =
+      if not looked:
+        info = lookup()
+        looked = true
+      info
+  var f =
+    if dsn.startsWith("postgresql://") or dsn.startsWith("postgres://"):
+      collectUriDsn(dsn)
+    else:
+      collectKeyValueDsn(dsn)
+  mergeService(f, env)
+  if env.enabled:
+    mergeEnvironment(f, env)
+  result = applyFields(f)
+  if env.enabled:
+    if result.user.len == 0:
+      result.user = env.user().name
+    if result.passFile.len == 0:
+      let dir = libpqUserDir(env)
+      if dir.len > 0:
+        result.passFile =
+          confPath(dir, (when defined(windows): "pgpass.conf" else: ".pgpass"))
+  rejectRawNul(result)
+
+proc parseDsn*(dsn: string, environment = true): ConnConfig =
   ## Parse a PostgreSQL connection string into a ConnConfig.
   ##
   ## Supports two formats:
@@ -1254,21 +1596,57 @@ proc parseDsn*(dsn: string): ConnConfig =
   ## percent-encoded, and a raw ``@`` in the database, or in a query with no
   ## path, raises ``PgConfigError`` (``h/db?user=a@b`` is fine).
   ##
+  ## As libpq does, a setting the string leaves out (or, in a URI, leaves
+  ## empty) is taken from its ``service`` (``PGSERVICE``) in the connection
+  ## service file, else from libpq's environment variable (``PGHOST``,
+  ## ``PGUSER``, ``PGPASSWORD``, ``PGSSLMODE``, ...; an empty one counts as
+  ## unset). The service file is ``PGSERVICEFILE`` or ``~/.pg_service.conf``
+  ## (``%APPDATA%\postgresql\.pg_service.conf`` on Windows), then
+  ## ``$PGSYSCONFDIR/pg_service.conf``. An empty ``service`` in the string
+  ## still outranks ``PGSERVICE`` and is not found, as in libpq. A missing
+  ## ``user`` is the OS user, and ``ConnConfig.passFile`` defaults to
+  ## ``~/.pgpass``.
+  ##
+  ## From a variable or the service file, ``sslcert`` and ``sslkey`` are read
+  ## only for an sslmode that sends them (prefer or stronger, and not with
+  ## ``sslcertmode=disable``) and
+  ## ``sslrootcert`` only for verify-ca or verify-full; under require, an
+  ## ``sslrootcert`` file that exists is a ``PgConfigError`` here or in the
+  ## string, since libpq verifies the server against it there and this client
+  ## would accept any certificate. As in libpq, a missing ``sslcert``
+  ## file there means no client certificate, and ``sslkey`` is read only along
+  ## with one (libpq's ``~/.postgresql`` defaults are not read), and
+  ## ``sslrootcert=system`` (libpq's system trust store, which there implies
+  ## verify-full) is a ``PgConfigError``. ``client_encoding`` is
+  ## ignored there and ``PGDATESTYLE`` keeps only its field order (``DMY``,
+  ## ...): the session is UTF8 and ISO regardless. A libpq keyword this
+  ## client does not implement is ignored there, unless it asks for a check
+  ## or a limit this client would not apply (``sslcrl``, ``requirepeer``,
+  ## ``ssl_min_protocol_version=TLSv1.3``, ...), which is a ``PgConfigError``.
+  ## With ``environment = false`` only the string counts: no variable, no
+  ## default file and no OS user; a ``service`` there then finds no file.
+  ##
   ## ``client_encoding`` is always UTF8: another value, directly or via ``-c``
   ## in ``options``, raises ``PgConfigError``. Likewise ``DateStyle`` always
   ## uses the ISO output style: only its field order (``DMY``, ...) may be set.
-  ## ``TimeZone`` is UTC unless set here; see ``ConnConfig.extraParams``.
+  ## ``TimeZone`` is UTC unless set here; ``PGTZ`` is not read, since a session
+  ## zone other than UTC shifts a ``DateTime`` parameter bound to
+  ## ``timestamptz``. Set ``TimeZone`` in the string, ``options`` or
+  ## ``extraParams`` to change it (see ``ConnConfig.extraParams``).
   ##
   ## Security: the DSN is trusted configuration — unknown keys are forwarded
   ## as StartupMessage parameters, so a typo in a security-sensitive key (e.g.
   ## ``sslmde``) is not detected. Do not pass end-user-controlled strings
-  ## without sanitizing. Parse and validation
-  ## failures report lengths and offsets only, never parameter values (a
-  ## malformed DSN may place the password in any field); certificate file I/O
-  ## errors name the path for diagnosis. See ``ConnConfig`` for plaintext
-  ## password handling.
-  if dsn.startsWith("postgresql://") or dsn.startsWith("postgres://"):
-    result = parseUriDsn(dsn)
-  else:
-    result = parseKeyValueDsn(dsn)
-  rejectRawNul(result)
+  ## without sanitizing: a ``service`` with a password in its file sends it to
+  ## whatever ``host`` the string names. Parse and validation failures report
+  ## lengths and offsets only, never parameter values (a malformed DSN may
+  ## place the password in any field), and name the variable or service file
+  ## line a value came from; file I/O errors name the path for diagnosis. See
+  ## ``ConnConfig`` for plaintext password handling.
+  parseDsnWith(
+    dsn,
+    if environment:
+      processEnv()
+    else:
+      DsnEnv(),
+  )
