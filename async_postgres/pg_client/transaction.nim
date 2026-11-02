@@ -547,8 +547,10 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## `ABORT`, `PREPARE TRANSACTION`) inside the body. A transaction the body
   ## ended raises `PgStateError` in place of the COMMIT, and the connection
   ## stays usable. By then the statements after it have run in autocommit, so
-  ## their effects stay. A body that ends the transaction and starts another
-  ## (`BEGIN`, `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN`) is not detected.
+  ## their effects stay. Inside a `withSavepoint`, its RELEASE SAVEPOINT fails
+  ## first with a `PgQueryError` (25P01). A body that ends the transaction and
+  ## starts another (`BEGIN`, `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN`) is not
+  ## detected.
   ##
   ## Usage:
   ##   conn.withTransaction:
