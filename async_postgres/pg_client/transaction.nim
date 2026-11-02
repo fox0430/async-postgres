@@ -199,9 +199,22 @@ proc checkCommitTag(conn: PgConnection, tag: string) =
       err.parent = newPgQueryError(causeFields)
     raise err
 
+proc checkTxNotEndedInBody(conn: PgConnection) =
+  ## Raise when the body itself ended the transaction: COMMIT would only draw
+  ## the server's "no transaction in progress" warning and report success.
+  # A retired connection is left to COMMIT's own `checkReady`.
+  if conn.state == csReady and conn.txStatus == tsIdle:
+    raise newException(
+      PgStateError,
+      "The transaction ended inside the body (COMMIT, ROLLBACK, END, ABORT or " &
+        "PREPARE TRANSACTION); any statements after it ran outside the transaction",
+    )
+
 proc commitTx*(conn: PgConnection, timeout: Duration): Future[void] {.async.} =
   ## COMMIT for the conn/pool/cluster transaction macros. `checkCommitTag` runs
   ## inside the trace, so `onQueryEnd` reports the rollback the caller sees.
+  ## A transaction the body already ended raises `PgStateError` before COMMIT.
+  conn.checkTxNotEndedInBody()
   var tag: string
   tracedSimpleExec(conn, "COMMIT", timeout, "COMMIT timed out", tag):
     conn.checkCommitTag(tag)
@@ -531,9 +544,11 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## does, so later calls on that connection fail.
   ##
   ## Do not issue transaction-control SQL (`COMMIT`, `ROLLBACK`, `END`,
-  ## `ABORT`, `PREPARE TRANSACTION`) inside the body: ending the transaction
-  ## yourself is not detected — later statements run in autocommit and the
-  ## macro still returns success.
+  ## `ABORT`, `PREPARE TRANSACTION`) inside the body. A transaction the body
+  ## ended raises `PgStateError` in place of the COMMIT, and the connection
+  ## stays usable. By then the statements after it have run in autocommit, so
+  ## their effects stay. A body that ends the transaction and starts another
+  ## (`BEGIN`, `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN`) is not detected.
   ##
   ## Usage:
   ##   conn.withTransaction:

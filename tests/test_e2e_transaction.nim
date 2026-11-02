@@ -3550,6 +3550,164 @@ suite "E2E: COMMIT answered with ROLLBACK":
 
     waitFor t()
 
+const bodyEndTable = "test_tx_body_end"
+
+proc commitInBody(conn: PgConnection, n: int) {.async.} =
+  ## End the transaction from a macro's body: row `n` commits with it, and row
+  ## `n + 1` is inserted in autocommit.
+  let insert = "INSERT INTO " & bodyEndTable & " VALUES ($1)"
+  discard await conn.exec(insert, @[toPgParam(n)])
+  discard await conn.exec("COMMIT")
+  discard await conn.exec(insert, @[toPgParam(n + 1)])
+
+proc bodyEndRows(conn: PgConnection): Future[seq[string]] {.async.} =
+  let res = await conn.query("SELECT id FROM " & bodyEndTable & " ORDER BY id")
+  for row in res.rows:
+    result.add(row.getStr(0))
+
+proc commitTracer(): (PgTracer, ref int) =
+  ## Count the COMMITs sent, the body's own included.
+  let commits = new int
+  let tracer = PgTracer()
+  tracer.onQueryStart = proc(
+      conn: PgConnection, data: TraceQueryStartData
+  ): TraceContext {.gcsafe, raises: [].} =
+    if data.sql == "COMMIT":
+      inc commits[]
+    return nil
+  (tracer, commits)
+
+suite "E2E: transaction ended inside the body":
+  test "conn transaction macros raise PgStateError instead of COMMIT":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS " & bodyEndTable)
+      discard await conn.exec("CREATE TABLE " & bodyEndTable & " (id int)")
+      let (tracer, commits) = commitTracer()
+      conn.tracer = tracer
+      let retryOpts = RetryOptions(maxAttempts: 3, baseDelayMs: 1)
+
+      var raised = 0
+      try:
+        conn.withTransaction:
+          await conn.commitInBody(1)
+      except PgStateError:
+        inc raised
+      try:
+        conn.withTransactionRetry(retryOpts):
+          await conn.commitInBody(3)
+      except PgStateError:
+        inc raised
+      try:
+        conn.withTransactionDeadline(seconds(5)):
+          await conn.commitInBody(5)
+      except PgStateError:
+        inc raised
+      try:
+        conn.withTransactionRetryDeadline(retryOpts, seconds(5)):
+          await conn.commitInBody(7)
+      except PgStateError:
+        inc raised
+
+      doAssert raised == 4
+      # Only the bodies' own COMMITs went out, and no body ran twice.
+      doAssert commits[] == 4, "COMMIT sent " & $commits[] & " times"
+      doAssert conn.state == csReady and conn.txStatus == tsIdle
+      conn.tracer = nil
+      doAssert (await conn.bodyEndRows()) == @["1", "2", "3", "4", "5", "6", "7", "8"]
+
+      discard await conn.exec("DROP TABLE " & bodyEndTable)
+      await conn.close()
+
+    waitFor t()
+
+  test "withTransaction raises PgStateError for a body that rolls back":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.exec("DROP TABLE IF EXISTS " & bodyEndTable)
+      discard await conn.exec("CREATE TABLE " & bodyEndTable & " (id int)")
+
+      var raised = false
+      try:
+        conn.withTransaction:
+          discard await conn.exec("INSERT INTO " & bodyEndTable & " VALUES (1)")
+          discard await conn.exec("ROLLBACK")
+      except PgStateError:
+        raised = true
+      doAssert raised
+      doAssert conn.state == csReady and conn.txStatus == tsIdle
+      doAssert (await conn.bodyEndRows()).len == 0
+
+      # The connection takes the next transaction.
+      conn.withTransaction:
+        discard await conn.exec("INSERT INTO " & bodyEndTable & " VALUES (2)")
+      doAssert (await conn.bodyEndRows()) == @["2"]
+
+      discard await conn.exec("DROP TABLE " & bodyEndTable)
+      await conn.close()
+
+    waitFor t()
+
+  test "pool transaction macros raise PgStateError and keep the connection":
+    proc t() {.async.} =
+      let (pool, rollbacks) = await newRollbackTracedPool()
+      discard await pool.exec("DROP TABLE IF EXISTS " & bodyEndTable)
+      discard await pool.exec("CREATE TABLE " & bodyEndTable & " (id int)")
+      let retryOpts = RetryOptions(maxAttempts: 3, baseDelayMs: 1)
+
+      var used: PgConnection = nil
+      var attempts = 0
+      var raised = false
+      try:
+        pool.withTransaction(conn):
+          used = conn
+          await conn.commitInBody(1)
+      except PgStateError:
+        raised = true
+      doAssert raised, "withTransaction"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      raised = false
+      try:
+        pool.withTransactionRetry(retryOpts, conn):
+          inc attempts
+          used = conn
+          await conn.commitInBody(3)
+      except PgStateError:
+        raised = true
+      doAssert raised and attempts == 1, "withTransactionRetry"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      raised = false
+      try:
+        pool.withTransactionDeadline(conn, seconds(5)):
+          used = conn
+          await conn.commitInBody(5)
+      except PgStateError:
+        raised = true
+      doAssert raised, "withTransactionDeadline"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      attempts = 0
+      raised = false
+      try:
+        pool.withTransactionRetryDeadline(retryOpts, conn, seconds(5)):
+          inc attempts
+          used = conn
+          await conn.commitInBody(7)
+      except PgStateError:
+        raised = true
+      doAssert raised and attempts == 1, "withTransactionRetryDeadline"
+      await pool.checkKeptWithoutRollback(used, rollbacks)
+
+      let c = await pool.acquire()
+      doAssert (await c.bodyEndRows()) == @["1", "2", "3", "4", "5", "6", "7", "8"]
+      c.release()
+      discard await pool.exec("DROP TABLE " & bodyEndTable)
+      await pool.close()
+
+    waitFor t()
+
 suite "E2E: execInTransaction / queryInTransaction":
   test "execInTransaction commits successfully":
     proc t() {.async.} =

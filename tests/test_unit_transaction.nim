@@ -1,7 +1,8 @@
 ## Unit tests for `pg_client/transaction` via the mock server.
 ##
 ## PG-less: `withTransaction` commit/rollback, the body-escape compile-time
-## guards, and a body failing on its deadline's tick.
+## guards, a body that ends its own transaction, and a body failing on its
+## deadline's tick.
 
 import std/[unittest, strutils]
 
@@ -118,8 +119,9 @@ suite "transaction: mock round trip":
         let client = await acceptAndReady(ms)
         for _ in 0 ..< 3: # BEGIN, SELECT 1, COMMIT
           queries.add(await readSimpleQuery(client))
+          let tx = if queries[^1] == "COMMIT": 'I' else: 'T'
           await client.sendBytes(
-            buildCommandComplete(queries[^1]) & buildReadyForQuery('I')
+            buildCommandComplete(queries[^1]) & buildReadyForQuery(tx)
           )
         discard await drainFrontendMessage(client)
         await closeClient(client)
@@ -334,6 +336,46 @@ suite "transaction: mock round trip":
         await ms.closeServer()
 
       waitFor t()
+
+template raisesForEndedTx(name: string, scope: untyped) {.dirty.} =
+  ## `scope` runs on `conn`, and its body sends a COMMIT of its own.
+  test name & " raises PgStateError in place of its COMMIT":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let queries = new seq[string]
+      let serverFut = answerSimpleQueries(ms, queries)
+      let conn = await connect(mockConfig(ms.port))
+      var raised = false
+      try:
+        scope
+      except PgStateError:
+        raised = true
+      doAssert raised
+      doAssert queries[] == @["BEGIN", "COMMIT"], "got " & $queries[]
+      doAssert conn.state == csReady and conn.txStatus == tsIdle,
+        "got " & $conn.state & "/" & $conn.txStatus
+      await conn.close()
+      await serverFut
+      await ms.closeServer()
+
+    waitFor t()
+
+suite "transaction: a body that ends its transaction":
+  raisesForEndedTx("withTransaction"):
+    conn.withTransaction:
+      discard await conn.simpleExec("COMMIT")
+
+  raisesForEndedTx("withTransactionRetry"):
+    conn.withTransactionRetry(RetryOptions(maxAttempts: 3)):
+      discard await conn.simpleExec("COMMIT")
+
+  raisesForEndedTx("withTransactionDeadline"):
+    conn.withTransactionDeadline(seconds(5)):
+      discard await conn.simpleExec("COMMIT")
+
+  raisesForEndedTx("withTransactionRetryDeadline"):
+    conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), seconds(5)):
+      discard await conn.simpleExec("COMMIT")
 
 # `Moment.now()` plus the longest `Duration` overflowed with a Defect before
 # the body ran. Capped instead, each statement left a timer queued for good.
