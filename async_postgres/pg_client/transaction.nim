@@ -287,6 +287,17 @@ proc buildSavepointRollbackCleanup(
       except Defect as `cleanupDefectSym`:
         `fireCleanupDefectSym`(`connSym`, `ckSpRollbackSym`, `cleanupDefectSym`)
 
+proc buildUnwoundTimeout(connSym, cleanup: NimNode, reason: string): NimNode =
+  ## The conn deadline macros' timeout arm for a body that unwound: take back a
+  ## connection a scope nested in the body retired on the cancel
+  ## (`reclaimRetiredInScope`), run `cleanup`, then report the timeout.
+  let reclaimSym = bindSym"reclaimRetiredInScope"
+  let reasonLit = newStrLitNode(reason)
+  quote:
+    `reclaimSym`(`connSym`)
+    `cleanup`
+    `connSym`.invalidateOnTimeout(`reasonLit`)
+
 proc buildDeadlineAwaitAndTimeout(
     connSym, bodyFnSym, totalDurSym: NimNode, reason: string, catchableCleanup: NimNode
 ): NimNode =
@@ -311,15 +322,16 @@ proc buildDeadlineAwaitAndTimeout(
   ## withTransactionDeadline.
   ##
   ## Cancel skips cleanup and invalidates (idempotent; chronos can run both
-  ## timeout arms for one deadline).
+  ## timeout arms for one deadline). A body that unwound goes through
+  ## `buildUnwoundTimeout`.
   let bodyFutSym = macroSym(nskLet, "bodyFut")
   let eSym = macroSym(nskLet, "e")
   let cancelSym = macroSym(nskLet, "cancel")
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"waitKeepingOutcome"
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
   let retireSym = bindSym"retireOnTimeout"
-  let timeoutCleanup = catchableCleanup.copyNimTree()
+  let unwound = buildUnwoundTimeout(connSym, catchableCleanup.copyNimTree(), reason)
   let reasonLit = newStrLitNode(reason)
   quote:
     let `bodyFutSym` = `bodyFnSym`()
@@ -331,10 +343,9 @@ proc buildDeadlineAwaitAndTimeout(
       elif not `bodyFutSym`.finished():
         `retireSym`(`connSym`, `reasonLit`)
       else:
-        `timeoutCleanup`
-        `connSym`.invalidateOnTimeout(`reasonLit`)
+        `unwound`
     except CancelledError as `cancelSym`:
-      `invalidateCancelSym`(`connSym`, releaseTransport = false)
+      `invalidateCancelSym`(`connSym`)
       raise `cancelSym`
     except CatchableError as `eSym`:
       `catchableCleanup`
@@ -370,7 +381,7 @@ proc buildRetryTxLoop*(
   let isRetryableSym = bindSym"isRetryableTxError"
   let backoffSym = bindSym"backoffDelayMs"
   let sleepSym = bindSym"sleepMsAsync"
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
 
   let cleanup = buildRollbackCleanup(connSym, txTimeout)
   let commitSym = bindSym"commitTx"
@@ -386,7 +397,7 @@ proc buildRetryTxLoop*(
         break
       except CancelledError as `cancelSym`:
         # Never retry cancel; invalidate and let outer release tear down transport.
-        `invalidateCancelSym`(`connSym`, releaseTransport = false)
+        `invalidateCancelSym`(`connSym`)
         raise `cancelSym`
       except CatchableError as `eSym`:
         `cleanup`
@@ -444,7 +455,7 @@ proc buildRetryDeadlineLoop*(
   let isRetryableSym = bindSym"isRetryableTxError"
   let backoffSym = bindSym"backoffDelayMs"
   let sleepSym = bindSym"sleepMsAsync"
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
   let stateCheck =
     if connForStateCheck == nil:
       newLit(true)
@@ -462,7 +473,7 @@ proc buildRetryDeadlineLoop*(
       newStmtList()
     else:
       quote:
-        `invalidateCancelSym`(`connForStateCheck`, releaseTransport = false)
+        `invalidateCancelSym`(`connForStateCheck`)
   quote:
     var `attemptSym` = 0
     while true:
@@ -551,6 +562,12 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## `csReady` guard prevents a futile cleanup call. Standalone callers must
   ## `await conn.close()` after this error; pooled connections are dropped on
   ## release.
+  ##
+  ## **On cancellation** (chronos): ROLLBACK is skipped and the connection is
+  ## retired (`csClosed`) unless the transaction already ended, even when the
+  ## cancel lands while the body awaits something other than a statement.
+  ## Retiring leaves the socket open: standalone callers `await conn.close()`
+  ## to end the server-side transaction.
   var body: NimNode
   var beginSql: NimNode
   var txTimeout: NimNode
@@ -580,7 +597,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
   let eSym = macroSym(nskLet, "e")
   let dSym = macroSym(nskLet, "d")
   let cancelSym = macroSym(nskLet, "cancel")
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
   let bodyCleanup = buildRollbackCleanup(connSym, txTimeout)
   let commitSym = bindSym"commitTx"
   result = quote:
@@ -592,7 +609,7 @@ macro withTransaction*(conn: PgConnection, args: varargs[untyped]): untyped =
       await `commitSym`(`connSym`, `txTimeout`)
     except CancelledError as `cancelSym`:
       # Skip ROLLBACK on cancel; invalidate instead.
-      `invalidateCancelSym`(`connSym`, releaseTransport = false)
+      `invalidateCancelSym`(`connSym`)
       raise `cancelSym`
     except CatchableError as `eSym`:
       `bodyCleanup`
@@ -708,6 +725,13 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   ## SAVEPOINT, RELEASE SAVEPOINT, and ROLLBACK TO SAVEPOINT only — it does
   ## **not** bound `body` operations. Use `withSavepointDeadline` for a single
   ## wall-clock deadline covering all three plus the body.
+  ##
+  ## **On cancellation** (chronos): ROLLBACK TO SAVEPOINT is skipped and the
+  ## connection is retired (`csClosed`), ending the outer transaction too:
+  ## left open, the savepoint's writes would survive an outer COMMIT. An
+  ## enclosing `conn.with*Deadline` macro whose deadline expired takes the
+  ## connection back once its body unwinds, rolls back, and keeps it; the
+  ## pool's deadline macros do not.
   var body: NimNode
   var spName: NimNode = nil
   var spTimeout: NimNode
@@ -748,7 +772,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
   let cancelSym = macroSym(nskLet, "cancel")
   let spNameSym = macroSym(nskLet, "spName")
   let quoteIdentSym = bindSym"quoteIdentifier"
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
 
   let nameExpr = savepointNameExpr(connSym, spName)
   # Skip ROLLBACK TO SAVEPOINT when the outer transaction has already ended or
@@ -768,7 +792,7 @@ macro withSavepoint*(conn: PgConnection, args: varargs[untyped]): untyped =
       )
     except CancelledError as `cancelSym`:
       # As withTransaction: skip cleanup, invalidate instead.
-      `invalidateCancelSym`(`connSym`, releaseTransport = false)
+      `invalidateCancelSym`(`connSym`)
       raise `cancelSym`
     except CatchableError as `eSym`:
       `spCleanup`
@@ -814,10 +838,12 @@ macro withTransactionDeadline*(conn: PgConnection, args: varargs[untyped]): unty
   ## expired *between* statements: a cancellation landing inside one is caught
   ## by that statement, which invalidates the connection itself, so the cleanup
   ## skips ROLLBACK on a no-longer-`csReady` connection (reported as
-  ## `csrConnInvalidated`). A body that could not be cancelled (asyncdispatch)
-  ## still owns the socket, so `retireOnTimeout` marks `csClosed` with no
-  ## ROLLBACK attempt. Whenever ROLLBACK is skipped the server-side transaction
-  ## lives until the connection closes; the pool drops it on release.
+  ## `csrConnInvalidated`). A savepoint macro nested in the body retires the
+  ## connection on that cancellation, and this macro takes it back for the
+  ## ROLLBACK. A body that could not be cancelled (asyncdispatch) still owns
+  ## the socket, so `retireOnTimeout` marks `csClosed` with no ROLLBACK
+  ## attempt. Whenever ROLLBACK is skipped the server-side transaction lives
+  ## until the connection closes; the pool drops it on release.
   ##
   ## **Standalone connections (not pooled):** callers using `PgConnection`
   ## directly must `await conn.close()` after this error. Otherwise the
@@ -957,16 +983,15 @@ macro withTransactionRetryDeadline*(
   let bodyCleanup = buildRollbackCleanup(connSym, graceSym)
   let commitSym = bindSym"commitTx"
   let retireSym = bindSym"retireOnTimeout"
-  let timeoutCleanup = bodyCleanup.copyNimTree()
   # A body that could not be cancelled still holds the connection, so retire it
   # whatever the wire looks like; one that unwound leaves this scope a ROLLBACK
   # to run first. Without the split, `invalidateOnTimeout` on a settled wire
   # hands back a `csReady` connection with the server transaction still open.
   let timeoutStillRunning = quote:
     `retireSym`(`connSym`, "withTransactionRetryDeadline exceeded")
-  let timeoutUnwound = quote:
-    `timeoutCleanup`
-    `connSym`.invalidateOnTimeout("withTransactionRetryDeadline exceeded")
+  let timeoutUnwound = buildUnwoundTimeout(
+    connSym, bodyCleanup.copyNimTree(), "withTransactionRetryDeadline exceeded"
+  )
   let loop = buildRetryDeadlineLoop(
     newCall(bodyFnSym),
     retryOptsSym,
@@ -1006,13 +1031,14 @@ macro withSavepointDeadline*(conn: PgConnection, args: varargs[untyped]): untype
   ##   conn.withSavepointDeadline("my_sp", seconds(5)):
   ##     await conn.exec(...)
   ##
-  ## **On deadline exceeded:** the connection is invalidated; ROLLBACK TO
-  ## SAVEPOINT is *not* attempted (see `withTransactionDeadline` rationale).
-  ## Because the connection itself becomes `csClosed`, the *outer* transaction
-  ## is voided as well — this macro is not a fine-grained "roll back only the
-  ## savepoint on timeout" primitive. If you need the outer transaction to
-  ## survive a savepoint timeout, use `withSavepoint(timeout = ...)` (per-call
-  ## timeout) instead of this deadline-bounded variant.
+  ## **On deadline exceeded:** `PgTimeoutError` is raised. A body that unwound
+  ## (chronos cancellation) between statements is rolled back with ROLLBACK TO
+  ## SAVEPOINT (`rollbackGrace` per-call timeout); the connection stays
+  ## `csReady` and the outer transaction goes on. Otherwise the connection
+  ## becomes `csClosed`, voiding the outer transaction too: a deadline landing
+  ## inside a statement invalidates it there, and a body that could not be
+  ## cancelled (asyncdispatch) gets no ROLLBACK TO SAVEPOINT attempt (see
+  ## `withTransactionDeadline`).
   ##
   ## **On other body exceptions:** ROLLBACK TO SAVEPOINT runs with
   ## `rollbackGrace` per-call timeout. A `Defect` raised by the body is

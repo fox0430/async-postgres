@@ -832,8 +832,10 @@ proc closeImpl*(conn: PgConnection, byUser: bool): Future[void] {.async.} =
     else:
       await cancelAndWaitPumped(conn.listenTask)
   conn.clearListenTask()
-  # Only send Terminate if we haven't already detected the connection is dead
-  if conn.state != csClosed and conn.isConnected():
+  # Only send Terminate if we haven't already detected the connection is dead.
+  # A scope retired on cancel left the wire settled; without Terminate the
+  # server logs an unexpected EOF for its open transaction.
+  if (conn.state != csClosed or conn.retiredInScope) and conn.isConnected():
     try:
       await conn.sendMsg(encodeTerminate())
     except CatchableError:

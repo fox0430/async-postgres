@@ -2690,7 +2690,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
   let bodyErrSym = macroSym(nskVar, "bodyErr")
   let bodyDefectSym = macroSym(nskVar, "bodyDefect")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
   let bodyCleanup = buildRollbackCleanup(connIdent, txTimeout)
   let commitSym = bindSym"commitTx"
   let releaseCall = quote:
@@ -2709,7 +2709,7 @@ macro withTransaction*(pool: PgPool, args: varargs[untyped]): untyped =
         await `commitSym`(`connIdent`, `txTimeout`)
       except CancelledError as `cancelSym`:
         # Skip ROLLBACK on cancel; invalidate so release() discards.
-        `invalidateCancelSym`(`connIdent`, releaseTransport = false)
+        `invalidateCancelSym`(`connIdent`)
         raise `cancelSym`
       except CatchableError as `eSym`:
         `bodyCleanup`
@@ -2912,7 +2912,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   let releaseErrSym = macroSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let releaseReclaimedSym = bindSym"releaseReclaimed"
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
   let timeoutErrSym = bindSym"AsyncTimeoutError"
   let waitSym = bindSym"waitKeepingOutcome"
   let remainingSym = bindSym"remainingDeadlineDuration"
@@ -2962,7 +2962,7 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
           `bodyDefectSym` = `dSym`
       except CancelledError as `cancelledSym`:
         # Chronos deadline cancel: invalidate so release() discards.
-        `invalidateCancelSym`(`connIdent`, releaseTransport = false)
+        `invalidateCancelSym`(`connIdent`)
         `bodyErrSym` = `cancelledSym`
       except CatchableError as `eSym`:
         `bodyErrSym` = `eSym`
@@ -3105,7 +3105,7 @@ macro withTransactionRetryDeadline*(
   let releaseErrSym = macroSym(nskLet, "releaseErr")
   let resetSessionAndReleaseSym = bindSym"resetSessionAndRelease"
   let releaseReclaimedSym = bindSym"releaseReclaimed"
-  let invalidateCancelSym = bindSym"invalidateOnCancel"
+  let invalidateCancelSym = bindSym"invalidateScopeOnCancel"
   let remainingSym = bindSym"remainingDeadlineDuration"
   let normalizeTimeoutSym = bindSym"normalizeTimeout"
   let deadlineAfterSym = bindSym"deadlineAfter"
@@ -3186,7 +3186,7 @@ macro withTransactionRetryDeadline*(
           `bodyDefectSym` = `dSym`
       except CancelledError as `cancelledSym`:
         # Chronos deadline cancel: invalidate so release() discards.
-        `invalidateCancelSym`(`connIdent`, releaseTransport = false)
+        `invalidateCancelSym`(`connIdent`)
         `bodyErrSym` = `cancelledSym`
       except CatchableError as `eSym`:
         `bodyErrSym` = `eSym`

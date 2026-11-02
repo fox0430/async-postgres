@@ -158,6 +158,8 @@ async_postgres/pg_connection/simple_query.nim	bytesToString
 async_postgres/pg_connection/simple_query.nim	checkReady
 async_postgres/pg_connection/simple_query.nim	checkTxIdle
 async_postgres/pg_connection/simple_query.nim	invalidateOnCancel
+async_postgres/pg_connection/simple_query.nim	invalidateScopeOnCancel
+async_postgres/pg_connection/simple_query.nim	reclaimRetiredInScope
 async_postgres/pg_connection/simple_query.nim	retireOnTimeout
 async_postgres/pg_connection/simple_query.nim	tracedSimpleExec
 async_postgres/pg_connection/simple_query.nim	waitKeepingOutcome
@@ -295,6 +297,7 @@ async_postgres/pg_connection/types.nim	lookupStmtCache
 async_postgres/pg_connection/types.nim	markBusy
 async_postgres/pg_connection/types.nim	markClosed
 async_postgres/pg_connection/types.nim	markReady
+async_postgres/pg_connection/types.nim	markRetiredInScope
 async_postgres/pg_connection/types.nim	markStaged
 async_postgres/pg_connection/types.nim	markState
 async_postgres/pg_connection/types.nim	namesNonIsoDateStyle
@@ -362,6 +365,7 @@ async_postgres/pg_connection/types.nim	requestListenStop
 async_postgres/pg_connection/types.nim	requeueHandoff
 async_postgres/pg_connection/types.nim	requireStaged
 async_postgres/pg_connection/types.nim	resetWireState
+async_postgres/pg_connection/types.nim	retiredInScope
 async_postgres/pg_connection/types.nim	secretKey
 async_postgres/pg_connection/types.nim	sendBuf
 async_postgres/pg_connection/types.nim	sendBufLen

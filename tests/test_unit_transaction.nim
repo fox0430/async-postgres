@@ -19,6 +19,28 @@ proc readSimpleQuery(client: MockClient): Future[string] {.async.} =
   doAssert m.msgType == 'Q'
   queryText(m.body)
 
+proc answerSimpleQueries(
+    ms: MockServer, queries: ref seq[string], terminated: ref bool = nil
+) {.async.} =
+  ## Accept one client and answer each simple query until it hangs up. COMMIT
+  ## and ROLLBACK end the transaction; anything else leaves one open. A
+  ## Terminate sets `terminated` when given.
+  let client = await acceptAndReady(ms)
+  try:
+    while true:
+      let m = await drainFrontendMessage(client)
+      if m.msgType == 'X' and terminated != nil:
+        terminated[] = true
+      if m.msgType != 'Q':
+        continue
+      let q = queryText(m.body)
+      queries[].add(q)
+      let tx = if q in ["COMMIT", "ROLLBACK"]: 'I' else: 'T'
+      await client.sendBytes(buildCommandComplete(q) & buildReadyForQuery(tx))
+  except CatchableError:
+    discard
+  await closeClient(client)
+
 suite "transaction: body-escape guards (compile time)":
   test "withTransaction rejects return at compile time":
     doAssert compiles(
@@ -61,6 +83,31 @@ suite "transaction: body-escape guards (compile time)":
               break
 
     )
+
+when hasChronos:
+  template keepsConnOnExpiredDeadline(name: string, scope: untyped) {.dirty.} =
+    ## `scope` runs on `conn` and must raise `PgTimeoutError` with the
+    ## transaction rolled back and the connection kept.
+    test "an expired " & name & " rolls back past the scopes nested in it":
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let queries = new seq[string]
+        let serverFut = answerSimpleQueries(ms, queries)
+        let conn = await connect(mockConfig(ms.port))
+        var timedOut = false
+        try:
+          scope
+        except PgTimeoutError:
+          timedOut = true
+        doAssert timedOut
+        doAssert conn.state == csReady and conn.txStatus == tsIdle,
+          "got " & $conn.state & "/" & $conn.txStatus & " after " & $queries[]
+        doAssert queries[][^1] == "ROLLBACK", "got " & $queries[]
+        await conn.close()
+        await serverFut
+        await ms.closeServer()
+
+      waitFor t()
 
 suite "transaction: mock round trip":
   test "withTransaction commits":
@@ -147,6 +194,146 @@ suite "transaction: mock round trip":
       await ms.closeServer()
 
     waitFor t()
+
+  # A body raising CancelledError takes the path a chronos cancel between
+  # statements does; asyncdispatch reaches it no other way.
+  test "withTransaction retires the connection when the body is cancelled":
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let queries = new seq[string]
+      let terminated = new bool
+      let serverFut = answerSimpleQueries(ms, queries, terminated)
+      let conn = await connect(mockConfig(ms.port))
+      var caught = false
+      try:
+        conn.withTransaction:
+          if true:
+            raise newException(CancelledError, "body cancelled")
+      except CancelledError:
+        caught = true
+      doAssert caught
+      doAssert conn.state == csClosed, "got " & $conn.state
+      await conn.close()
+      await serverFut
+      doAssert queries[] == @["BEGIN"],
+        "no ROLLBACK may follow a cancel; got " & $queries[]
+      # The wire is settled, so close still ends the session cleanly.
+      doAssert terminated[], "close sent no Terminate"
+      await ms.closeServer()
+
+    waitFor t()
+
+  test "a cancelled withSavepoint keeps the outer transaction from committing":
+    # The caller goes on after the cancel, as after a `wait` timeout: the outer
+    # COMMIT must not keep the savepoint's writes.
+    proc t() {.async.} =
+      let ms = startMockServer()
+      let queries = new seq[string]
+      let serverFut = answerSimpleQueries(ms, queries)
+      let conn = await connect(mockConfig(ms.port))
+      var outerErr = false
+      try:
+        conn.withTransaction:
+          try:
+            conn.withSavepoint("sp1"):
+              discard await conn.simpleExec("INSERT")
+              if true:
+                raise newException(CancelledError, "body cancelled")
+          except CancelledError:
+            discard
+      except CancelledError:
+        doAssert false, "the savepoint's cancel was caught in the body"
+      except CatchableError:
+        outerErr = true
+      doAssert outerErr, "the outer transaction must fail, not commit"
+      doAssert conn.state == csClosed, "got " & $conn.state
+      await conn.close()
+      await serverFut
+      doAssert queries[].len == 3 and queries[][1].startsWith("SAVEPOINT") and
+        queries[][2] == "INSERT", "nothing may follow the cancel; got " & $queries[]
+      await ms.closeServer()
+
+    waitFor t()
+
+  when hasChronos:
+    test "a cancel inside a deadline's body still retires the connection":
+      # The body catches the cancel and goes on, so the INSERT after it must
+      # fail rather than run in the abandoned savepoint.
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let queries = new seq[string]
+        let serverFut = answerSimpleQueries(ms, queries)
+        let conn = await connect(mockConfig(ms.port))
+        proc savepointBody() {.async.} =
+          conn.withSavepoint("sp1"):
+            await sleepAsync(seconds(10))
+
+        var outerErr = false
+        try:
+          conn.withTransactionDeadline(seconds(60)):
+            try:
+              await savepointBody().wait(milliseconds(100))
+            except AsyncTimeoutError:
+              discard
+            discard await conn.simpleExec("INSERT")
+        except CatchableError:
+          outerErr = true
+        doAssert outerErr, "the outer transaction must fail, not commit"
+        doAssert conn.state == csClosed, "got " & $conn.state
+        await conn.close()
+        await serverFut
+        doAssert queries[].len == 2, "nothing may follow the cancel; got " & $queries[]
+        await ms.closeServer()
+
+      waitFor t()
+
+    # The deadline cancels its body while it sleeps in nested scopes. They
+    # retire the connection; the deadline takes it back for its ROLLBACK.
+    keepsConnOnExpiredDeadline("withTransactionDeadline"):
+      conn.withTransactionDeadline(milliseconds(200)):
+        conn.withSavepointDeadline("sp1", seconds(60)):
+          conn.withSavepoint("sp2"):
+            await sleepAsync(seconds(10))
+
+    keepsConnOnExpiredDeadline("withTransactionRetryDeadline"):
+      conn.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), milliseconds(200)):
+        conn.withSavepointDeadline("sp1", seconds(60)):
+          conn.withSavepoint("sp2"):
+            await sleepAsync(seconds(10))
+
+    keepsConnOnExpiredDeadline("withSavepointDeadline"):
+      conn.withTransaction:
+        conn.withSavepointDeadline("sp1", milliseconds(200)):
+          conn.withSavepoint("sp2"):
+            await sleepAsync(seconds(10))
+
+    test "a body swallowing its deadline's cancel commits nothing":
+      # The savepoint is neither released nor rolled back, so a COMMIT would
+      # keep its writes.
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let queries = new seq[string]
+        let serverFut = answerSimpleQueries(ms, queries)
+        let conn = await connect(mockConfig(ms.port))
+        var failed = false
+        try:
+          conn.withTransactionDeadline(milliseconds(200)):
+            try:
+              conn.withSavepoint("sp"):
+                discard await conn.simpleExec("INSERT")
+                await sleepAsync(seconds(10))
+            except CatchableError:
+              discard
+        except CatchableError:
+          failed = true
+        doAssert failed
+        doAssert conn.state == csClosed, "got " & $conn.state
+        doAssert "COMMIT" notin queries[], "got " & $queries[]
+        await conn.close()
+        await serverFut
+        await ms.closeServer()
+
+      waitFor t()
 
 # `Moment.now()` plus the longest `Duration` overflowed with a Defect before
 # the body ran. Capped instead, each statement left a timer queued for good.

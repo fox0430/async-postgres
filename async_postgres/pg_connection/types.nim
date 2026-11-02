@@ -399,6 +399,10 @@ type
     unrecognizedStartupOptions: seq[string]
       ## `_pq_.*` options the server rejected, from `NegotiateProtocolVersion`.
     txStatus: TransactionStatus
+    retiredInScope: bool
+      ## Retired by a transaction or savepoint macro's cancel on a settled wire,
+      ## with no state change since. An expired deadline scope enclosing that
+      ## macro takes the connection back for its own ROLLBACK.
     notifyCallback: NotifyCallback
     noticeCallback: NoticeCallback
     listenChannels: HashSet[string]
@@ -1711,6 +1715,7 @@ proc markState*(conn: PgConnection, next: PgConnState) {.inline, raises: [].} =
   ## is for the states a single owner drives (``csConnecting``,
   ## ``csAuthentication``, ``csListening``, ``csReplicating``).
   conn.state = next
+  conn.retiredInScope = false
 
 proc markReady*(conn: PgConnection) {.inline, raises: [].} =
   ## Give the connection back: no operation owns the wire any more. See
@@ -1726,6 +1731,16 @@ proc markClosed*(conn: PgConnection) {.inline, raises: [].} =
   ## Retire the connection: the wire is unusable, whether the transport is torn
   ## down yet or not.
   conn.markState(csClosed)
+
+proc markRetiredInScope*(conn: PgConnection) {.inline, raises: [].} =
+  ## ``markClosed`` for a scope cancelled between statements. See
+  ## ``retiredInScope``.
+  conn.markClosed()
+  conn.retiredInScope = true
+
+func retiredInScope*(conn: PgConnection): bool {.inline.} =
+  ## See the field.
+  conn.retiredInScope
 
 proc fireCleanupDefect*(conn: PgConnection, kind: CleanupKind, d: ref Defect) =
   ## Swallow a same-frame Defect from a ROLLBACK cleanup so it can't replace the

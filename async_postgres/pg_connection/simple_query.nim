@@ -410,15 +410,36 @@ proc invalidateOnCancel*(conn: PgConnection, releaseTransport = true) =
   ##
   ## ``releaseTransport`` says whether this frame is the last one that knows
   ## about the connection: true for the operation wrappers, which cancellation
-  ## unwinds past, false for the transaction and savepoint macros, whose own
-  ## scope still hands the connection back.
+  ## unwinds past, false for frames that still hand the connection back.
   ##
   ## Whoever runs first decides, not the nesting: a cancellation inside an
   ## awaited operation is claimed by that operation's wrapper, so an enclosing
-  ## macro's call finds the counters zeroed and is a no-op — and its ROLLBACK
-  ## cleanup is then skipped as ``csrConnInvalidated``. The macro's ``false``
-  ## only covers a cancellation landing between operations.
+  ## frame's call finds the counters zeroed and is a no-op. A cancellation
+  ## landing between operations leaves a settled wire, which this keeps; scope
+  ## frames go through ``invalidateScopeOnCancel`` for that case.
   conn.invalidateWire(releaseTransport)
+
+proc invalidateScopeOnCancel*(conn: PgConnection) =
+  ## ``invalidateOnCancel`` for the transaction and savepoint macros, which
+  ## skip the ROLLBACK on cancel. A cancellation landing between statements
+  ## leaves a settled wire inside the scope's transaction, so the connection is
+  ## retired: handed back, it would run the caller's next statements in, or
+  ## commit, the abandoned transaction. That holds for a body that swallows the
+  ## cancel too, so the retirement never waits on who catches it.
+  ##
+  ## An expired deadline scope enclosing the macro takes the connection back
+  ## for its own ROLLBACK (``reclaimRetiredInScope``).
+  conn.invalidateOnCancel(releaseTransport = false)
+  if conn.state == csReady and conn.txStatus != tsIdle:
+    conn.markRetiredInScope()
+
+proc reclaimRetiredInScope*(conn: PgConnection) =
+  ## Undo ``invalidateScopeOnCancel`` for an expired deadline scope whose body
+  ## unwound, right before the scope's ROLLBACK: whatever cancelled the macro
+  ## nested in the body, that ROLLBACK ends the work it abandoned. A connection
+  ## retired for any other reason stays retired.
+  if conn.retiredInScope and not conn.closedByUser and conn.isConnected():
+    conn.markReady()
 
 proc waitKeepingOutcome*[T](fut: Future[T], timeout: Duration): Future[T] =
   ## ``wait`` for callers that still read ``fut`` (``await``, ``completed()``,
