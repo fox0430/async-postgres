@@ -8,9 +8,11 @@ import ../async_postgres/pg_pool_cluster {.all.}
 import ../async_postgres/pg_connection {.all.}
 import ../async_postgres/pg_connection/[buffer_io, simple_query, lifecycle]
 import ../async_postgres/pg_connection/types
+import ./clear_pg_env
 
 import std/importutils
 privateAccess(PgConnection)
+clearPgEnv()
 
 const
   PgHost = "127.0.0.1"

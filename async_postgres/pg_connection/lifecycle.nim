@@ -7,7 +7,7 @@ import std/[options, random, sequtils, strutils, sysrand]
 import ../[async_backend, pg_errors, pg_protocol, pg_auth]
 from ../pg_bytes import readString
 import pkg/nimcrypto/utils as ncutils
-import types, buffer_io, ssl, simple_query, dsn
+import types, buffer_io, ssl, simple_query, dsn, conf_files
 
 when hasChronos:
   when defined(posix):
@@ -33,11 +33,15 @@ type AuthStep = enum
 # Error message helpers
 
 proc startupError(
-    fields: seq[ErrorField], providedCredentials: bool
+    fields: seq[ErrorField], providedCredentials: bool, passFileNote = ""
 ): ref PgConnectionError =
   ## The server refused the session; keep its fields so callers can tell a
-  ## bad password from a server that is still starting up.
-  newStartupError(formatError(fields), newPgQueryError(fields), providedCredentials)
+  ## bad password from a server that is still starting up. A refused password
+  ## also says what the password file had to do with it, as libpq does.
+  var msg = formatError(fields)
+  if passFileNote.len > 0 and getErrorField(fields, 'C') == SqlStateInvalidPassword:
+    msg.add("\n" & passFileNote)
+  newStartupError(msg, newPgQueryError(fields), providedCredentials)
 
 proc foldFailures(
     msg: string, attempts: seq[ref CatchableError], perHost = false
@@ -418,9 +422,34 @@ type AuthCreds = object
   ## which the connection keeps: a provider's password must not end up there.
   user, password: string
   provided: bool ## From ``credentialsProvider``.
+  passFileNote: string ## What the password file did (`PassFileLookup.note`).
 
-func fixedCredentials(config: ConnConfig): AuthCreds =
-  AuthCreds(user: config.user, password: config.password)
+proc passFileHost(config: ConnConfig, entry: HostEntry): string =
+  ## `entry`'s host as the password file names it: libpq's key, except that
+  ## every Unix socket directory is ``localhost``, not only a compiled-in one.
+  if config.hostDefaulted and entry.host == DefaultHost and entry.hostaddr.len == 0:
+    return "localhost" # libpq dials its default socket here
+  let host = entry.displayHost
+  if isUnixSocket(host): "localhost" else: host
+
+proc fixedCredentials(config: ConnConfig, entry: HostEntry): AuthCreds =
+  ## The fixed ``user`` and ``password``, or the password file's for `entry`.
+  result = AuthCreds(user: config.user, password: config.password)
+  if result.password.len == 0 and config.passFile.len > 0:
+    let database =
+      if config.isPhysicalReplication:
+        # As walreceiver, whatever the database: the server ignores it there,
+        # and it may be PGDATABASE's, meant for other connections.
+        "replication"
+      elif config.database.len > 0:
+        config.database
+      else:
+        config.user # the server's default
+    let got = lookupPassFile(
+      config.passFile, passFileHost(config, entry), $entry.port, database, config.user
+    )
+    result.password = got.password
+    result.passFileNote = got.note
 
 proc provideCredentials(
     config: ConnConfig, entry: HostEntry
@@ -454,10 +483,11 @@ proc provideCredentials(
 proc hostCredentials(
     config: ConnConfig, entry: HostEntry
 ): Future[AuthCreds] {.async.} =
-  ## What ``entry`` is authenticated with: the fixed ``user`` and ``password``,
-  ## or ``credentialsProvider``'s within a ``connectTimeout`` of its own.
+  ## What ``entry`` is authenticated with: the fixed ``user`` and ``password``
+  ## (the password file's when ``password`` is empty), or
+  ## ``credentialsProvider``'s within a ``connectTimeout`` of its own.
   if config.credentialsProvider == nil:
-    return fixedCredentials(config)
+    return fixedCredentials(config, entry)
   if config.connectTimeout == default(Duration):
     return await provideCredentials(config, entry)
   try:
@@ -704,7 +734,7 @@ proc connectToHostImpl(
           of bmkAuthenticationSASLFinal:
             discard # verified by advanceAuth
           of bmkErrorResponse:
-            raise startupError(msg.errorFields, creds.provided)
+            raise startupError(msg.errorFields, creds.provided, creds.passFileNote)
           else:
             # As libpq: skipping it would wait for an AuthenticationOk that
             # never comes.
@@ -730,7 +760,7 @@ proc connectToHostImpl(
             conn.markReady()
             break readyLoop
           of bmkErrorResponse:
-            raise startupError(msg.errorFields, creds.provided)
+            raise startupError(msg.errorFields, creds.provided, creds.passFileNote)
           else:
             # Skipping it would wait for a ReadyForQuery that may never come.
             raise newException(
@@ -791,7 +821,8 @@ proc connectToHost*(config: ConnConfig, entry: HostEntry): Future[PgConnection] 
   ## stderr warning is emitted because the client certificate is not sent.
   ## A ``credentialsProvider`` is called without a timeout.
   if config.credentialsProvider == nil:
-    return connectToHostImpl(config, entry, alNone, @[], fixedCredentials(config))
+    return
+      connectToHostImpl(config, entry, alNone, @[], fixedCredentials(config, entry))
   proc withProvider(): Future[PgConnection] {.async.} =
     # Checked before the provider runs, as `connect` does.
     let checkedConfig = hostConfig(config, entry)

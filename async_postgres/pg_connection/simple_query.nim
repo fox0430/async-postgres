@@ -623,15 +623,20 @@ proc probeBool(conn: PgConnection, sql, trueLiteral: string): Future[bool] {.asy
   raise
     newException(PgConnectionError, "probe \"" & sql & "\" returned no usable result")
 
-proc isPhysicalReplicationConn(conn: PgConnection): bool =
-  ## Physical replication cannot run ``SELECT``. ``replication`` is true as the
-  ## server's ``parse_bool`` reads it: any case, a prefix of ``true`` or
-  ## ``yes``, ``on``, ``1``. The last one given wins, as on the server.
-  for (k, v) in conn.config.extraParams:
+proc isPhysicalReplication*(config: ConnConfig): bool =
+  ## Whether ``config`` opens a physical replication connection: its
+  ## ``replication`` is true as the server's ``parse_bool`` reads it (any case,
+  ## a prefix of ``true`` or ``yes``, ``on``, ``1``). The last one given wins,
+  ## as on the server. Sibling-only: the hub does not re-export it.
+  for (k, v) in config.extraParams:
     if k == "replication":
       let b = v.toLowerAscii
       result =
         b.len > 0 and ("true".startsWith(b) or "yes".startsWith(b)) or b in ["on", "1"]
+
+proc isPhysicalReplicationConn(conn: PgConnection): bool =
+  ## Physical replication cannot run ``SELECT``.
+  conn.config.isPhysicalReplication
 
 proc inRecovery(conn: PgConnection): Future[bool] {.async.} =
   ## Recovery state: ``in_hot_standby`` (PG14+) else ``pg_is_in_recovery()``;

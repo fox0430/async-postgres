@@ -536,12 +536,9 @@ suite "Per-address connectTimeout":
       var targets = await resolveTargets("127.0.0.1", silent.port)
       targets.add(await resolveTargets("127.0.0.1", ms.port))
       let cfg = timedConfig(ms.port)
+      let entry = HostEntry(host: "127.0.0.1", port: ms.port)
       let conn = await attemptHostTimed(
-        cfg,
-        HostEntry(host: "127.0.0.1", port: ms.port),
-        tsaAny,
-        targets,
-        fixedCredentials(cfg),
+        cfg, entry, tsaAny, targets, fixedCredentials(cfg, entry)
       )
       let client = await accepted
       result = conn.state
@@ -565,12 +562,9 @@ suite "Per-address connectTimeout":
       # Each address waits out its own budget; nothing here needs it long.
       cfg.connectTimeout = milliseconds(100)
       try:
+        let entry = HostEntry(host: "127.0.0.1", port: a.port)
         discard await attemptHostTimed(
-          cfg,
-          HostEntry(host: "127.0.0.1", port: a.port),
-          tsaAny,
-          targets,
-          fixedCredentials(cfg),
+          cfg, entry, tsaAny, targets, fixedCredentials(cfg, entry)
         )
       except CatchableError as e:
         result = e
@@ -598,12 +592,9 @@ suite "Per-address connectTimeout":
         # Windows retries a refused SYN for about 2s before failing the dial.
         cfg.connectTimeout = seconds(3)
       try:
+        let entry = HostEntry(host: "127.0.0.1", port: silent.port)
         discard await attemptHostTimed(
-          cfg,
-          HostEntry(host: "127.0.0.1", port: silent.port),
-          tsaAny,
-          targets,
-          fixedCredentials(cfg),
+          cfg, entry, tsaAny, targets, fixedCredentials(cfg, entry)
         )
       except CatchableError as e:
         result = e
@@ -640,12 +631,9 @@ suite "Per-address connectTimeout":
       var targets = await resolveTargets("127.0.0.1", refusing.port)
       targets.add(await resolveTargets("127.0.0.1", refusedPort))
       try:
+        let entry = HostEntry(host: "127.0.0.1", port: refusing.port)
         discard await attemptHostTimed(
-          cfg,
-          HostEntry(host: "127.0.0.1", port: refusing.port),
-          tsaAny,
-          targets,
-          fixedCredentials(cfg),
+          cfg, entry, tsaAny, targets, fixedCredentials(cfg, entry)
         )
       except CatchableError as e:
         result = e
@@ -678,12 +666,9 @@ suite "Per-address connectTimeout":
       cfg.connectTimeout = timeout
       var targets = await resolveTargets("127.0.0.1", standby.port)
       targets.add(await resolveTargets("127.0.0.1", refusedPort))
+      let entry = HostEntry(host: "127.0.0.1", port: standby.port)
       let conn = await attemptHostTimed(
-        cfg,
-        HostEntry(host: "127.0.0.1", port: standby.port),
-        tsaPrimary,
-        targets,
-        fixedCredentials(cfg),
+        cfg, entry, tsaPrimary, targets, fixedCredentials(cfg, entry)
       )
       result[0] = conn == nil
       result[1] = await serverFut
@@ -706,12 +691,9 @@ suite "Per-address connectTimeout":
       var targets = await resolveTargets("127.0.0.1", refusedPort)
       targets.add(await resolveTargets("127.0.0.1", ms.port))
       let cfg = mockConfig(refusedPort)
+      let entry = HostEntry(host: "127.0.0.1", port: refusedPort)
       let conn = await attemptHostTimed(
-        cfg,
-        HostEntry(host: "127.0.0.1", port: refusedPort),
-        tsaAny,
-        targets,
-        fixedCredentials(cfg),
+        cfg, entry, tsaAny, targets, fixedCredentials(cfg, entry)
       )
       let client = await accepted
       let cancelSide = ms.accept()

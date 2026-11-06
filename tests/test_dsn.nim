@@ -5,6 +5,9 @@ when defined(posix):
 import ../async_postgres/[async_backend, pg_connection]
 import ../async_postgres/pg_connection/dsn {.all.}
 import ../async_postgres/pg_connection/types
+import ./clear_pg_env
+
+clearPgEnv()
 
 const dummyPem = "-----BEGIN CERTIFICATE-----\ndummy\n-----END CERTIFICATE-----\n"
 
@@ -42,14 +45,14 @@ suite "parseDsn":
     check cfg.database == "d"
 
   test "minimal DSN - scheme only":
-    let cfg = parseDsn("postgresql://")
+    let cfg = parseDsn("postgresql://", environment = false)
     check cfg.host == "127.0.0.1"
     check cfg.port == 5432
     check cfg.user == ""
     check cfg.database == ""
 
   test "host only":
-    let cfg = parseDsn("postgresql://localhost")
+    let cfg = parseDsn("postgresql://localhost", environment = false)
     check cfg.host == "localhost"
     check cfg.port == 5432
     check cfg.user == ""
@@ -374,6 +377,20 @@ suite "parseDsn":
       except PgConfigError as e:
         msg = e.msg
       check "Forbidden zero byte" in msg
+
+  test "error: raw zero byte in a passfile path is rejected":
+    # The path reaches `open` as a C string, like a certificate path.
+    for dsn in [
+      "passfile=/tmp/x\0.pgpass", "postgresql://host/db?passfile=/tmp/x\0.pgpass"
+    ]:
+      var msg = ""
+      try:
+        discard parseDsn(dsn, environment = false)
+      except PgConfigError as e:
+        msg = e.msg
+      check "Forbidden zero byte in passfile" in msg
+    expect PgConfigError:
+      discard initConnConfig(passFile = "/tmp/x\0.pgpass")
 
   test "sslmode defaults to prefer when unspecified (libpq parity)":
     check parseDsn("postgresql://host/db").sslMode == sslPrefer
@@ -1464,7 +1481,7 @@ suite "parseDsn keyword=value":
     check cfg.password == "mypass"
 
   test "minimal - host only":
-    let cfg = parseDsn("host=localhost")
+    let cfg = parseDsn("host=localhost", environment = false)
     check cfg.host == "localhost"
     check cfg.port == 5432
     check cfg.user == ""

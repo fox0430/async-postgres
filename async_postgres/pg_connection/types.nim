@@ -229,6 +229,25 @@ type
       ## empty password, that host fails with ``PgConnectionError`` before any
       ## dial, which ``retryAdvice`` never reads as a stop. A ``28P01`` that
       ## answers its credentials is no refusal either (see ``isLastingRefusal``).
+    passFile*: string
+      ## Password file (libpq ``passfile``, ``.pgpass`` format) looked up for
+      ## each host when ``password`` is empty and no ``credentialsProvider`` is
+      ## set. Empty = none. Read at every connect, so an edit takes effect on
+      ## the next one; a missing or unsafe file (group or world access on
+      ## POSIX) is skipped, noted only if the server then refuses the password.
+      ## A host ``parseDsn`` left unset (``DefaultHost``) is matched as
+      ## ``localhost``, as libpq's default socket is, though it dials
+      ## ``127.0.0.1``; a host given in the string is matched as written, and
+      ## so is ``initConnConfig``'s default host (``127.0.0.1``). A refused
+      ## password from it (``28P01``) is a lasting refusal, as a fixed
+      ## ``password``'s is (see ``isLastingRefusal``). A
+      ## physical replication connection looks up ``replication`` whatever its
+      ## ``database`` (the server ignores it there), as walreceiver does.
+      ## ``parseDsn`` defaults it to ``~/.pgpass``
+      ## (``%APPDATA%\postgresql\pgpass.conf`` on Windows).
+    hostDefaulted: bool
+      ## The single host is ``DefaultHost`` because none was given: the
+      ## password file matches it as ``localhost``, as libpq does.
     database*: string
     sslMode*: SslMode
       ## SSL/TLS negotiation mode. `parseDsn` and `initConnConfig` default this
@@ -880,6 +899,14 @@ proc validateTlsConfig*(
     raise newException(
       PgConfigError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
     )
+
+func hostDefaulted*(config: ConnConfig): bool {.inline.} =
+  ## Sibling-only: the hub does not re-export it.
+  config.hostDefaulted
+
+proc setHostDefaulted*(config: var ConnConfig, value: bool) {.inline.} =
+  ## Sibling-only, like ``hostDefaulted``.
+  config.hostDefaulted = value
 
 # HostEntry accessors
 

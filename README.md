@@ -15,7 +15,7 @@ Async PostgreSQL client in Nim.
 - MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
 - `credentialsProvider` to fetch the user and password per connection (expiring tokens such as AWS RDS IAM or Microsoft Entra ID, rotated secrets)
 - `channel_binding` policy (disable, prefer, require) to harden SCRAM against downgrade
-- DSN connection string parsing
+- DSN connection string parsing, filled in like libpq from `PG*` environment variables, the connection service file (`pg_service.conf`) and the password file (`.pgpass`)
 - Unix socket connection
 - Multi-host failover
 - Target session attributes (any, read-write, read-only, primary, standby, prefer-standby)
