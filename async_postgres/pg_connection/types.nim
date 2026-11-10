@@ -363,6 +363,13 @@ type
   ListenErrorCallback* = proc(err: ref PgListenError) {.gcsafe, raises: [].}
     ## Callback invoked when the listen pump dies permanently.
 
+  ClientCallbacks = object ## The callbacks a pooled connection returns to on release.
+    notify: NotifyCallback
+    notice: NoticeCallback
+    notifyOverflow: NotifyOverflowCallback
+    listenError: ListenErrorCallback
+    reconnect: ReconnectCallback
+
   CachedStmt* = ref object ## Cached prepared statement (LRU).
     name*: string ## Server-side name (``_sc_*``)
     fields*: seq[FieldDescription] ## Describe result
@@ -504,6 +511,9 @@ type
       ## the connection was lost with nothing left to re-subscribe). Lets push
       ## API (`onNotify`) users learn the pump is gone — the pull API surfaces
       ## the same failure through `waitNotification`.
+    poolCallbacks: ClientCallbacks
+      ## What `restoreClientSession` puts back: the callbacks as the pool's
+      ## `afterConnect` left them.
     stmtCache: Table[string, CachedStmt]
     stmtCacheLru: DoublyLinkedList[string] ## LRU order: oldest at head, newest at tail
     stmtCounter: int
@@ -527,15 +537,16 @@ type
       ## but a typed `advisoryUnlock` of a raw-acquired key still decrements
       ## the counter when the server reports the release — under mixed
       ## typed/raw usage the counter therefore *under-reports* the true
-      ## number of tracked locks still held. The pool's reset/discard
+      ## number of tracked locks still held. The pool's unlock/discard
       ## decision and the leak-hook trigger both key off `sessionLockDirty`
       ## instead, so a mis-decremented counter cannot leak a tracked lock
       ## into the next borrower or silence the leak signal.
     sessionLockDirty: bool
       ## Sticky flag: set on any tracked session-level acquire, cleared only
-      ## by `advisoryUnlockAll` or connection reset. Drives the pool's
-      ## reset/discard decision so `pg_advisory_unlock_all` runs whenever a
-      ## tracked acquire ever happened, even if the tracked counter was
+      ## by `advisoryUnlockAll` or connection reset. The default `resetQuery`
+      ## unlocks on every release regardless; the flag makes the pool run
+      ## `pg_advisory_unlock_all` itself under any other (or ""), and discard
+      ## a conn whose reset could not run, even if the tracked counter was
       ## decremented back to zero by a typed unlock of a raw-acquired key.
     connectTimeZone: string
       ## ``TimeZone`` the pool restores on release: the zone the session started
@@ -694,9 +705,10 @@ type
 
   TracePoolCloseErrorData* = object
     ## Data passed to the pool close-error hook. Fired when a pool-initiated
-    ## `conn.close()` raises — these errors are otherwise swallowed because
-    ## close runs from non-async cleanup paths and fire-and-forget tasks,
-    ## making leaks hard to observe without tracing.
+    ## `conn.close()` raises, or when a session reset fails and the pool
+    ## closes the connection over it — these errors are otherwise swallowed
+    ## because they arise in non-async cleanup paths and fire-and-forget
+    ## tasks, making leaks hard to observe without tracing.
     conn*: PgConnection
     err*: ref CatchableError
 
@@ -2683,6 +2695,35 @@ proc dispatchNotice*(conn: PgConnection, msg: BackendMessage) {.raises: [].} =
   let noticeCb = conn.noticeCallback
   if noticeCb != nil:
     noticeCb(Notice(fields: msg.noticeFields))
+
+proc notePoolCallbacks*(conn: PgConnection) =
+  ## Record the current callbacks as the ones `restoreClientSession` puts back.
+  conn.poolCallbacks = ClientCallbacks(
+    notify: conn.notifyCallback,
+    notice: conn.noticeCallback,
+    notifyOverflow: conn.notifyOverflowCallback,
+    listenError: conn.listenErrorCallback,
+    reconnect: conn.reconnectCallback,
+  )
+
+proc restoreClientSession*(conn: PgConnection) {.raises: [].} =
+  ## Undo what a pool borrower left on the client side: its callbacks (back to
+  ## `notePoolCallbacks`), its channels, queued notifications and a parked
+  ## `waitNotification`, which would otherwise see the next borrower's.
+  let cbs = conn.poolCallbacks
+  conn.notifyCallback = cbs.notify
+  conn.noticeCallback = cbs.notice
+  conn.notifyOverflowCallback = cbs.notifyOverflow
+  conn.listenErrorCallback = cbs.listenError
+  conn.reconnectCallback = cbs.reconnect
+  conn.listenChannels.clear()
+  conn.failNotifyWaiter((ref PgStateError)(msg: "Connection was returned to the pool"))
+  conn.notifyWaiter = nil
+  conn.hasNotifyHandoff = false
+  conn.notifyHandoff = Notification()
+  conn.notifyQueue.clear()
+  conn.notifyDropped = 0
+  conn.listenError = nil
 
 # Replication write queue
 #

@@ -14,6 +14,17 @@ import e2e_common
 privateAccess(PgPool)
 privateAccess(PgConnection)
 
+proc settles(pool: PgPool, idle, active: int): Future[bool] {.async.} =
+  ## Whether the counts reach `idle` (negative: any) / `active` within 5 s: a
+  ## release resets in the background before the conn parks.
+  proc done(): bool =
+    (idle < 0 or pool.idleCount == idle) and pool.activeCount == active
+
+  let deadline = Moment.now() + seconds(5)
+  while not done() and Moment.now() < deadline:
+    await sleepAsync(milliseconds(5))
+  return done()
+
 suite "E2E: Connection Pool":
   test "basic acquire and release":
     proc t() {.async.} =
@@ -133,7 +144,7 @@ suite "E2E: Connection Pool":
       c1.release()
       c2.release()
       c3.release()
-      doAssert pool.idleCount == 3
+      doAssert await pool.settles(idle = 3, active = 0)
 
       # Wait for idleTimeout + maintenance cycles
       await sleepAsync(milliseconds(250))
@@ -218,7 +229,8 @@ suite "E2E: Connection Pool":
       let pid1 = conn1.pid
       conn1.release()
 
-      # Immediate re-acquire should return the same connection
+      # Once its reset ends, a re-acquire should return the same connection
+      doAssert await pool.settles(idle = 1, active = 0)
       let conn2 = await pool.acquire()
       doAssert conn2.pid == pid1
       conn2.release()
@@ -250,7 +262,7 @@ suite "E2E: resetQuery timeout":
         discard await conn.simpleQuery("SELECT 1")
       # resetSession hit the timeout, poisoned the connection, and tracedClose
       # discarded it — nothing returned to idle.
-      doAssert pool.idleCount == 0
+      doAssert await pool.settles(idle = 0, active = 0)
       doAssert pool.metrics.closeCount - closeBefore == 1
 
       # A follow-up acquire opens a fresh conn instead of blocking on the
@@ -276,10 +288,141 @@ suite "E2E: resetQuery timeout":
 
       pool.withConnection(conn):
         await conn.advisoryLock(73101'i64)
-      doAssert pool.idleCount == 1
+      doAssert await pool.settles(idle = 1, active = 0)
       # Re-acquire the same conn (minSize=0, maxSize=1) and verify unlock ran.
       pool.withConnection(conn2):
         doAssert conn2.heldSessionLocks == 0
+
+    waitFor t()
+
+suite "E2E: Pool default session reset":
+  proc scalar(conn: PgConnection, sql: string): Future[string] {.async.} =
+    let res = await conn.simpleQuery(sql)
+    return res[0].rows[0][0].get().toString()
+
+  proc dirtySession(conn: PgConnection) {.async.} =
+    ## Leave every kind of state the default reset clears.
+    discard await conn.simpleExec("SET search_path = reset_probe")
+    discard await conn.simpleExec("CREATE TEMP TABLE reset_probe_t (x int)")
+    discard await conn.simpleExec("CREATE TEMP SEQUENCE reset_probe_s")
+    discard await conn.simpleExec("SELECT nextval('reset_probe_s')")
+    discard await conn.simpleExec("LISTEN reset_probe_ch")
+    discard await conn.simpleExec("SELECT pg_advisory_lock(73519)")
+    discard await conn.simpleExec(
+      "BEGIN; DECLARE reset_probe_c CURSOR WITH HOLD FOR SELECT 1; COMMIT"
+    )
+    # Last: the role may lack what the statements above need.
+    discard await conn.simpleExec("SET ROLE pg_read_all_data")
+
+  proc checkClean(conn: PgConnection) {.async.} =
+    doAssert (await conn.scalar("SELECT current_user")) == PgUser
+    doAssert (await conn.scalar("SHOW search_path")) == "\"$user\", public"
+    doAssert (await conn.scalar("SELECT to_regclass('pg_temp.reset_probe_t') IS NULL")) ==
+      "t"
+    doAssert (await conn.scalar("SELECT count(*) FROM pg_listening_channels()")) == "0"
+    doAssert (
+      await conn.scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+      )
+    ) == "0"
+    doAssert (await conn.scalar("SELECT count(*) FROM pg_cursors")) == "0"
+    var lastvalErr: ref PgQueryError
+    try:
+      discard await conn.simpleExec("SELECT lastval()")
+    except PgQueryError as e:
+      lastvalErr = e
+    doAssert lastvalErr != nil, "lastval() must find no sequence used in the session"
+
+  test "a borrower's session state does not reach the next one":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 1))
+      defer:
+        await pool.close()
+
+      pool.withConnection(c1):
+        await c1.dirtySession()
+      pool.withConnection(c2):
+        await c2.checkClean()
+      doAssert pool.metrics.createCount == 1
+      doAssert pool.metrics.closeCount == 0
+
+    waitFor t()
+
+  test "a raw release resets the session too":
+    proc t() {.async.} =
+      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 1))
+      defer:
+        await pool.close()
+
+      let c1 = await pool.acquire()
+      await c1.dirtySession()
+      c1.release()
+      let c2 = await pool.acquire()
+      doAssert c2 == c1
+      await c2.checkClean()
+      await pool.resetSessionAndRelease(c2)
+      doAssert pool.metrics.createCount == 1
+
+    waitFor t()
+
+  test "the reset runs in a read-only session":
+    proc t() {.async.} =
+      var connCfg = plainConfig()
+      connCfg.extraParams.add(("default_transaction_read_only", "on"))
+      let pool = await newPool(initPoolConfig(connCfg, minSize = 0, maxSize = 1))
+      defer:
+        await pool.close()
+
+      pool.withConnection(c1):
+        discard await c1.simpleExec("SET search_path = reset_probe")
+      pool.withConnection(c2):
+        doAssert (await c2.scalar("SHOW search_path")) == "\"$user\", public"
+        doAssert (await c2.scalar("SHOW default_transaction_read_only")) == "on"
+      doAssert pool.metrics.closeCount == 0
+
+    waitFor t()
+
+  test "a search_path shadowing pg_advisory_unlock_all keeps no lock":
+    proc t() {.async.} =
+      let admin = await connect(plainConfig())
+      defer:
+        discard await admin.simpleExec("DROP SCHEMA IF EXISTS reset_shadow CASCADE")
+        await admin.close()
+      discard await admin.simpleExec(
+        "DROP SCHEMA IF EXISTS reset_shadow CASCADE; CREATE SCHEMA reset_shadow; " &
+          "CREATE FUNCTION reset_shadow.pg_advisory_unlock_all() RETURNS void " &
+          "LANGUAGE sql AS ''"
+      )
+      var connCfg = plainConfig()
+      # An explicitly listed pg_catalog is searched in order, after the shadow.
+      connCfg.extraParams.add(("search_path", "reset_shadow, pg_catalog"))
+      for (resetQuery, unlockInBody) in [
+        (DefaultResetQuery, false), ("", false), ("", true)
+      ]:
+        let pool = await newPool(
+          initPoolConfig(connCfg, minSize = 0, maxSize = 1, resetQuery = resetQuery)
+        )
+        try:
+          pool.withConnection(c1):
+            doAssert (
+              await c1.scalar(
+                "SELECT pronamespace::regnamespace FROM pg_proc " &
+                  "WHERE oid = 'pg_advisory_unlock_all()'::regprocedure"
+              )
+            ) == "reset_shadow"
+            await c1.advisoryLock(73520'i64)
+            if unlockInBody:
+              await c1.advisoryUnlockAll()
+          pool.withConnection(c2):
+            doAssert (
+              await c2.scalar(
+                "SELECT count(*) FROM pg_locks " &
+                  "WHERE locktype = 'advisory' AND pid = pg_backend_pid()"
+              )
+            ) == "0", resetQuery & " " & $unlockInBody
+          doAssert pool.metrics.createCount == 1
+        finally:
+          await pool.close()
 
     waitFor t()
 
@@ -288,7 +431,9 @@ suite "E2E: resetQuery and the statement cache":
     # Clearing it after every resetQuery left RESET ALL sessions holding one
     # forgotten server-side statement per release.
     proc t() {.async.} =
-      for (resetQuery, kept) in [("RESET ALL", true), ("DISCARD ALL", false)]:
+      for (resetQuery, kept) in [
+        (DefaultResetQuery, true), ("RESET ALL", true), ("DISCARD ALL", false)
+      ]:
         let pool = await newPool(
           initPoolConfig(
             plainConfig(), minSize = 0, maxSize = 1, resetQuery = resetQuery
@@ -553,7 +698,7 @@ suite "E2E: Pool TimeZone":
         discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
         doAssert conn.timeZoneChanged
       # Reset in place rather than discarded.
-      doAssert pool.idleCount == 1
+      doAssert await pool.settles(idle = 1, active = 0)
       doAssert pool.metrics.closeCount == closeBefore
       pool.withConnection(conn2):
         doAssert conn2.serverParam("TimeZone") == "UTC"
@@ -567,7 +712,10 @@ suite "E2E: Pool TimeZone":
 
   test "an offset-identical zone spelling costs no connection":
     proc t() {.async.} =
-      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 1))
+      # No resetQuery: its RESET ALL would put the startup spelling back.
+      let pool = await newPool(
+        initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, resetQuery = "")
+      )
       defer:
         await pool.close()
 
@@ -579,7 +727,7 @@ suite "E2E: Pool TimeZone":
       # param, so the spelling difference costs no round trip either.
       doAssert pool.idleCount == 1
       doAssert pool.metrics.closeCount == closeBefore
-      # A release that skips resetSession keeps it for the same reason.
+      # A raw release keeps it for the same reason.
       let borrowed = await pool.acquire()
       discard await borrowed.simpleQuery("SET TimeZone = 'Etc/UTC'")
       borrowed.release()
@@ -613,7 +761,7 @@ suite "E2E: Pool TimeZone":
       let closeBefore = pool.metrics.closeCount
       pool.withConnection(conn):
         discard await conn.simpleQuery("SELECT 1")
-      doAssert pool.idleCount == 1
+      doAssert await pool.settles(idle = 1, active = 0)
       doAssert pool.metrics.closeCount == closeBefore
       pool.withConnection(conn2):
         doAssert conn2.serverParam("TimeZone") == "Asia/Tokyo"
@@ -635,7 +783,7 @@ suite "E2E: Pool TimeZone":
         doAssert serverZone.len > 0
         discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
         doAssert conn.timeZoneChanged
-      doAssert pool.idleCount == 1
+      doAssert await pool.settles(idle = 1, active = 0)
       doAssert pool.metrics.closeCount == closeBefore
       pool.withConnection(conn2):
         doAssert conn2.serverParam("TimeZone") == serverZone
@@ -644,18 +792,27 @@ suite "E2E: Pool TimeZone":
 
     waitFor t()
 
-  test "a release that skips resetSession discards a changed TimeZone":
+  test "a raw release resets a changed TimeZone in the background":
     proc t() {.async.} =
-      let pool = await newPool(initPoolConfig(plainConfig(), minSize = 0, maxSize = 1))
-      defer:
+      for resetQuery in [DefaultResetQuery, ""]:
+        let pool = await newPool(
+          initPoolConfig(
+            plainConfig(), minSize = 0, maxSize = 1, resetQuery = resetQuery
+          )
+        )
+        let conn = await pool.acquire()
+        discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
+        conn.release()
+        let deadline = Moment.now() + seconds(5)
+        while pool.idleCount == 0 and Moment.now() < deadline:
+          await sleepAsync(milliseconds(5))
+        doAssert pool.idleCount == 1
+        doAssert pool.metrics.closeCount == 0
+        let again = await pool.acquire()
+        doAssert again == conn
+        doAssert again.serverParam("TimeZone") == "UTC"
+        await pool.resetSessionAndRelease(again)
         await pool.close()
-
-      let closeBefore = pool.metrics.closeCount
-      let conn = await pool.acquire()
-      discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
-      conn.release()
-      doAssert pool.idleCount == 0
-      doAssert pool.metrics.closeCount - closeBefore == 1
 
     waitFor t()
 
@@ -670,43 +827,41 @@ suite "E2E: Pool afterConnect":
     let res = await conn.simpleQuery("SHOW " & name)
     return res[0].rows[0][0].get().toString()
 
-  test "the hook's session setup reaches the borrower, and its TimeZone is restored":
+  test "the reset undoes the hook's SETs before the first borrower, keeping its TimeZone":
     proc t() {.async.} =
-      var cfg = initPoolConfig(plainConfig(), minSize = 1, maxSize = 1)
-      cfg.afterConnect = setupHook()
-      let pool = await newPool(cfg)
-      defer:
+      for resetQuery in [DefaultResetQuery, "RESET ALL"]:
+        var cfg = initPoolConfig(
+          plainConfig(), minSize = 1, maxSize = 1, resetQuery = resetQuery
+        )
+        cfg.afterConnect = setupHook()
+        let pool = await newPool(cfg)
+        pool.withConnection(c1):
+          doAssert (await c1.showSetting("statement_timeout")) == "0"
+          doAssert c1.serverParam("TimeZone") == "Asia/Tokyo"
+          discard await c1.simpleQuery("SET TimeZone = 'America/New_York'")
+        pool.withConnection(c2):
+          doAssert c2.serverParam("TimeZone") == "Asia/Tokyo"
+          doAssert (await c2.showSetting("statement_timeout")) == "0"
+        # The same c1 throughout: neither borrow discarded it.
+        doAssert pool.metrics.createCount == 1
+        doAssert pool.metrics.closeCount == 0
         await pool.close()
-
-      pool.withConnection(conn):
-        doAssert (await conn.showSetting("statement_timeout")) == "4321ms"
-        doAssert conn.serverParam("TimeZone") == "Asia/Tokyo"
-        discard await conn.simpleQuery("SET TimeZone = 'America/New_York'")
-      pool.withConnection(conn2):
-        doAssert conn2.serverParam("TimeZone") == "Asia/Tokyo"
-        doAssert (await conn2.showSetting("statement_timeout")) == "4321ms"
-      # The same conn throughout: neither borrow discarded it.
-      doAssert pool.metrics.createCount == 1
-      doAssert pool.metrics.closeCount == 0
 
     waitFor t()
 
-  test "a RESET ALL resetQuery undoes the hook's SETs but restores its TimeZone":
+  test "an empty resetQuery leaves the hook's SETs to every borrower":
     proc t() {.async.} =
-      var cfg = initPoolConfig(
-        plainConfig(), minSize = 1, maxSize = 1, resetQuery = "RESET ALL"
-      )
+      var cfg = initPoolConfig(plainConfig(), minSize = 1, maxSize = 1, resetQuery = "")
       cfg.afterConnect = setupHook()
       let pool = await newPool(cfg)
       defer:
         await pool.close()
 
-      pool.withConnection(conn):
-        doAssert (await conn.showSetting("statement_timeout")) == "4321ms"
-      pool.withConnection(conn2):
-        doAssert (await conn2.showSetting("statement_timeout")) == "0"
-        doAssert conn2.serverParam("TimeZone") == "Asia/Tokyo"
-      doAssert pool.metrics.createCount == 1
+      pool.withConnection(c1):
+        doAssert (await c1.showSetting("statement_timeout")) == "4321ms"
+      pool.withConnection(c2):
+        doAssert (await c2.showSetting("statement_timeout")) == "4321ms"
+        doAssert c2.serverParam("TimeZone") == "Asia/Tokyo"
 
     waitFor t()
 
@@ -1428,7 +1583,7 @@ suite "E2E: withConnection body-exception release":
         doAssert caught != nil, "body Defect must surface as PgPoolError"
         doAssert caught.parent of Defect,
           "the original Defect must be preserved as parent"
-        doAssert pool.activeCount == 0
+        doAssert await pool.settles(idle = -1, active = 0)
 
     waitFor t()
 
@@ -1457,7 +1612,7 @@ suite "E2E: withConnection body-exception release":
         raised = true
 
       doAssert raised, "body error must propagate despite release failure"
-      doAssert pool.activeCount == 0
+      doAssert await pool.settles(idle = -1, active = 0)
 
     waitFor t()
 
@@ -1488,7 +1643,7 @@ suite "E2E: withConnection body-exception release":
       doAssert caught != nil, "body Defect must propagate despite release failure"
       doAssert caught.parent of Defect,
         "the original Defect must be preserved as parent"
-      doAssert pool.activeCount == 0
+      doAssert await pool.settles(idle = -1, active = 0)
 
     waitFor t()
 
@@ -1552,7 +1707,8 @@ suite "E2E: pipelined dispatch inline-param failure":
       except PgTypeError:
         raised = true
       doAssert raised, "op future must fail with PgTypeError, not hang"
-      doAssert pool.activeCount == 0, "connection must be released after the raise"
+      doAssert await pool.settles(idle = -1, active = 0),
+        "connection must be released after the raise"
 
       let res = await pool.query("SELECT 1")
       doAssert res.rows.len == 1, "pool must remain usable after the raise"
@@ -1577,7 +1733,8 @@ suite "E2E: pipelined dispatch inline-param failure":
       except PgTypeError:
         raised = true
       doAssert raised, "inline-param failure must propagate to the caller"
-      doAssert pool.activeCount == 0, "connection must be released after the raise"
+      doAssert await pool.settles(idle = -1, active = 0),
+        "connection must be released after the raise"
 
       let res = await pool.query("SELECT 1")
       doAssert res.rows.len == 1, "pool must remain usable after the raise"
@@ -1610,7 +1767,8 @@ suite "E2E: pipelined dispatch inline-param failure":
         raised = true
       doAssert raised, "the offending op must fail with PgTypeError"
       discard await f2
-      doAssert pool.activeCount == 0, "connection must be released after the raise"
+      doAssert await pool.settles(idle = 1, active = 0),
+        "connection must be released after the raise"
 
     waitFor t()
 
@@ -1641,7 +1799,8 @@ suite "E2E: pipelined dispatch inline-param failure":
       doAssert raised, "the op with the bad params must fail with PgTypeError"
       let res = await good
       doAssert res.rows.len == 1, "a batch-mate must not inherit the encode failure"
-      doAssert pool.activeCount == 0, "connection must be released after the raise"
+      doAssert await pool.settles(idle = 1, active = 0),
+        "connection must be released after the raise"
 
     waitFor t()
 
@@ -1693,7 +1852,8 @@ suite "E2E: pool dispatch Defect arms":
       except PgPoolError as e:
         kind = e.kind
       doAssert kind == pekDefectWrapped, "body Defect must surface as PgPoolError"
-      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+      doAssert await pool.settles(idle = -1, active = 0),
+        "connection must be released after the Defect"
 
     waitFor t()
 
@@ -1709,7 +1869,8 @@ suite "E2E: pool dispatch Defect arms":
       except PgPoolError as e:
         kind = e.kind
       doAssert kind == pekDefectWrapped, "op future must fail, not hang"
-      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+      doAssert await pool.settles(idle = -1, active = 0),
+        "connection must be released after the Defect"
 
     waitFor t()
 
@@ -1735,7 +1896,8 @@ suite "E2E: pool dispatch Defect arms":
           if e.kind == pekDefectWrapped:
             inc wrapped
       doAssert wrapped == 2, "every op in the batch must fail, got " & $wrapped
-      doAssert pool.activeCount == 0, "connection must be released after the Defect"
+      doAssert await pool.settles(idle = -1, active = 0),
+        "connection must be released after the Defect"
 
     waitFor t()
 
@@ -1767,7 +1929,8 @@ suite "E2E: pool withTransaction body-Defect handling":
       doAssert caught != nil, "body Defect must surface as PgPoolError"
       doAssert caught.parent of Defect,
         "the original Defect must be preserved as parent"
-      doAssert pool.activeCount == 0, "connection must be released after Defect"
+      doAssert await pool.settles(idle = -1, active = 0),
+        "connection must be released after Defect"
 
       # ROLLBACK must have run: the insert must not survive the Defect.
       let leaked =

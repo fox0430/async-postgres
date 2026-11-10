@@ -38,9 +38,10 @@ proc onReconnect*(conn: PgConnection, callback: ReconnectCallback) =
   ## This callback is the only sign of that gap: re-read here whatever the
   ## missed notifications would have announced.
   ##
-  ## The new session is built from ``conn.config`` alone: ``SET`` /
-  ## ``set_config`` changes, temporary tables, prepared statements and session
-  ## advisory locks do not carry over. A ``SET ROLE`` is lost too, so later
+  ## The new session is built from ``conn.config`` alone, as a fresh
+  ## ``connect`` (the session a pool's default ``resetQuery`` returns to):
+  ## ``SET`` / ``set_config`` changes, temporary tables, prepared statements
+  ## and session advisory locks do not carry over. A ``SET ROLE`` is lost too, so later
   ## queries on the connection run with the login role's privileges. Put a
   ## setting that must survive in ``extraParams`` (e.g.
   ## ``("search_path", "app")`` or ``("role", "app_reader")``) instead.

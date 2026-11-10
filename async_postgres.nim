@@ -247,6 +247,7 @@ export pg_pool_cluster, pg_largeobject, pg_advisory_lock, pg_sql, pg_replication
 
 # `pg_pool` — public pool API (internal gauges/helpers stay in the module).
 export pg_pool.PoolConfig
+export pg_pool.DefaultResetQuery
 export pg_pool.PoolMetrics
 export pg_pool.PooledConnHandle
 export pg_pool.PgPool

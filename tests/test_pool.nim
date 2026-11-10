@@ -43,6 +43,8 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
       maxSize: maxSize,
       maxWaiters: -1,
       maintenanceInterval: seconds(30),
+      # Session resets have a suite of their own.
+      resetQuery: "",
     ),
     idle: initDeque[PooledConn](),
     active: 0,
@@ -767,13 +769,16 @@ suite "Pool release":
     check pool.active == 0
     check pool.idle.len == 0
 
-  test "release discards connection holding session advisory locks":
+  test "a release that skips the reset discards a conn holding session advisory locks":
+    # A raw release resets first (test_pool_session_reset); one that does not
+    # must not park the locks.
     let pool = makePool()
     pool.active = 1
-    let conn = mockConn()
+    let conn = mockConn(pool = pool)
+    conn.borrowed = true
     conn.heldSessionLocks = 1
     conn.sessionLockDirty = true
-    pool.release(conn)
+    conn.releaseReclaimed()
     check pool.active == 0
     check pool.idle.len == 0
 
@@ -1033,9 +1038,10 @@ suite "Pool resetSession":
     )
     check cfg.resetQuery == "DISCARD ALL"
 
-  test "resetQuery defaults to empty":
+  test "resetQuery defaults to DefaultResetQuery":
     let cfg = initPoolConfig(ConnConfig(host: "localhost", port: 5432))
-    check cfg.resetQuery == ""
+    check cfg.resetQuery == DefaultResetQuery
+    check PoolConfig().resetQuery == DefaultResetQuery
 
   test "resetQueryTimeout field in initPoolConfig":
     let cfg = initPoolConfig(
@@ -1049,30 +1055,46 @@ suite "Pool resetSession":
     )
     check cfg.resetQueryTimeout == ZeroDuration
 
+proc closeErrorLog(pool: PgPool): ref seq[ref CatchableError] =
+  ## Errors the pool reports to `onPoolCloseError`, recorded on a new tracer.
+  let log = new seq[ref CatchableError]
+  let tracer =
+    if pool.config.tracer != nil:
+      pool.config.tracer
+    else:
+      PgTracer()
+  tracer.onPoolCloseError = proc(data: TracePoolCloseErrorData) {.gcsafe, raises: [].} =
+    log[].add(data.err)
+  pool.config.tracer = tracer
+  log
+
+func hasWrappedDefect(log: seq[ref CatchableError], msg: string): bool =
+  ## Whether `log` holds a `PgPoolError(pekDefectWrapped)` whose parent Defect's
+  ## message starts with `msg` (asyncdispatch appends a traceback).
+  for e in log:
+    if e of PgPoolError and (ref PgPoolError)(e).kind == pekDefectWrapped and
+        e.parent of Defect and e.parent.msg.startsWith(msg):
+      return true
+
 suite "Pool withConnection release-path Defect":
   when hasChronos:
-    test "withConnection wraps a release-path Defect in PgPoolError":
-      # Regression: a Defect raised by the release path (resetSession's
-      # synchronous prelude — here the unlock_all exec) must surface as
-      # PgPoolError instead of escaping raw, since chronos re-raises Defects
-      # eagerly from continuations.
+    test "withConnection reports a release-path Defect to onPoolCloseError":
+      # The background reset (here the unlock_all exec) raises: the caller
+      # gets the body's outcome, and the Defect, wrapped, goes to the tracer.
       proc t() {.async.} =
         let pool = makePool()
+        let errs = pool.closeErrorLog()
         let conn = mockConn()
         conn.ownerPool = pool
         conn.writer = defectWriter()
         conn.sessionLockDirty = true # forces unlock_all through the writer
         pool.idle.addLast(conn.toPooled())
 
-        var caught = false
-        try:
-          pool.withConnection(c):
-            doAssert c == conn
-            doAssert pool.active == 1
-        except PgPoolError:
-          caught = true
+        pool.withConnection(c):
+          doAssert c == conn
+          doAssert pool.active == 1
 
-        doAssert caught
+        doAssert errs[].hasWrappedDefect("boom"), $errs[].len
         # The conn was discarded (session reset failed), so it is not idle.
         doAssert pool.active == 0
         doAssert pool.idle.len == 0
@@ -1140,10 +1162,9 @@ suite "Pool withConnection release-path Defect":
     # through the `onLeakedSessionLocks` tracer hook. The Defect arms are
     # backend-shared and must match the chronos writer-based tests above.
 
-    test "withConnection wraps a release-path Defect in PgPoolError (tracer-raised)":
-      # Regression: a Defect raised by the release path (here via the tracer
-      # hook) must surface as PgPoolError instead of escaping raw, matching
-      # the chronos writer-based arm.
+    test "withConnection reports a tracer-raised release Defect to onPoolCloseError":
+      # Same as the chronos writer-based arm, the Defect raised by the
+      # background reset's tracer hook.
       proc t() {.async.} =
         let pool = makePool()
         let tracer = PgTracer()
@@ -1152,26 +1173,17 @@ suite "Pool withConnection release-path Defect":
         ) {.gcsafe, raises: [].} =
           raise newException(AssertionDefect, "boom")
         pool.config.tracer = tracer
+        let errs = pool.closeErrorLog()
         let conn = mockConn()
         conn.ownerPool = pool
         conn.sessionLockDirty = true # forces the unlock_all path (and the hook)
         pool.idle.addLast(conn.toPooled())
 
-        var caught: ref PgPoolError = nil
-        try:
-          pool.withConnection(c):
-            doAssert c == conn
-            doAssert pool.active == 1
-        except PgPoolError as e:
-          caught = e
+        pool.withConnection(c):
+          doAssert c == conn
+          doAssert pool.active == 1
 
-        doAssert caught != nil, "the release-path Defect must surface as PgPoolError"
-        doAssert caught.kind == pekDefectWrapped
-        doAssert caught.parent of AssertionDefect,
-          "the Defect must be preserved as parent"
-        # asyncdispatch appends an async traceback to the message.
-        doAssert caught.parent.msg.startsWith("boom"),
-          "the Defect must be preserved as parent, got: " & $caught.parent.msg
+        doAssert errs[].hasWrappedDefect("boom"), $errs[].len
         # The conn was discarded (session reset failed while dirty), so it is
         # not idle.
         doAssert pool.active == 0
@@ -1321,7 +1333,9 @@ proc extendedOk(tag: string, rows: openArray[string] = []): seq[byte] =
   result.add(buildReadyForQuery('I'))
 
 proc scriptedPool(ms: MockServer): Future[PgPool] =
-  newPool(initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 1))
+  newPool(
+    initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 0, maxSize = 1)
+  )
 
 suite "Pool transaction and pipeline macros":
   test "withTransaction commits the body and releases the connection":
@@ -2186,6 +2200,23 @@ suite "Pool close":
     check pool.pendingBackgroundTasks.len == 1
     waitFor pool.close()
 
+  test "pruneFinished waits for twice the survivors before sweeping again":
+    var futs: seq[Future[void]]
+    var pruneAt = 0
+    for _ in 0 ..< bgTaskPruneThreshold:
+      futs.add(newFuture[void]("pending"))
+    futs.pruneFinished(pruneAt)
+    check pruneAt == 2 * bgTaskPruneThreshold
+    let done = newFuture[void]("done")
+    done.complete()
+    futs.add(done)
+    futs.pruneFinished(pruneAt)
+    # Below the new mark: no walk, so the finished one stays.
+    check futs.len == bgTaskPruneThreshold + 1
+    for f in futs:
+      if not f.finished:
+        f.complete()
+
   test "pipelined exec on closed pool raises instead of hanging":
     # Regression: the pipelined path used to enqueue the op without checking
     # `closed`. dispatchBatchImpl early-returns on a closed pool without ever
@@ -2662,7 +2693,7 @@ when hasChronos:
 
       waitFor t()
 
-    test "resetSessionAndRelease still releases the conn under cancel":
+    test "resetSessionAndRelease returns while a hung reset holds the slot":
       proc t() {.async.} =
         let pool = makePool()
         pool.config.resetQuery = "DISCARD ALL"
@@ -2674,24 +2705,15 @@ when hasChronos:
         conn.borrowed = true
         pool.active = 1
 
-        let fut = pool.resetSessionAndRelease(conn)
-        await sleepAsync(milliseconds(50))
-        doAssert not fut.finished
-
-        fut.cancelSoon()
-        var raised = false
-        try:
-          await fut
-        except CancelledError:
-          raised = true
-        doAssert raised
-        # release() ran under the inner finally: borrow cleared and active
-        # decremented via releaseCore's discard path (state == csClosed).
+        await pool.resetSessionAndRelease(conn).wait(seconds(5))
         doAssert not conn.borrowed
+        doAssert pool.active == 1
+        doAssert pool.idle.len == 0
+
+        # close() cuts the reset short; the conn is discarded.
+        await pool.close(milliseconds(200))
         doAssert pool.active == 0
         doAssert conn.state == csClosed
-
-        await pool.close(seconds(1))
         await cleanupHanging(server, serverTransport)
 
       waitFor t()
@@ -5713,7 +5735,8 @@ suite "Pool broken connection handling (integration)":
 
       let serverFut = serverHandler()
 
-      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 0, maxSize = 2)
       let pool = await newPool(cfg)
 
       let conn = await pool.acquire()
@@ -5758,7 +5781,8 @@ suite "Pool broken connection handling (integration)":
 
       let serverFut = serverHandler()
 
-      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 0, maxSize = 2)
       let pool = await newPool(cfg)
 
       let broken = await pool.acquire()
@@ -5811,7 +5835,8 @@ suite "Pool broken connection handling (integration)":
 
       let serverFut = serverHandler()
 
-      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 0, maxSize = 2)
       let pool = await newPool(cfg)
 
       let broken = await pool.acquire()
@@ -5899,7 +5924,8 @@ suite "Pool broken connection handling (integration)":
 
         let serverFut = serverHandler()
 
-        let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+        let cfg =
+          initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 0, maxSize = 2)
         let pool = await newPool(cfg)
 
         let broken = await pool.acquire()
@@ -5939,7 +5965,8 @@ suite "Pool broken connection handling (integration)":
       proc testBody() {.async.} =
         let ms = startMockServer()
         let serverFut = acceptAndReady(ms)
-        let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+        let cfg =
+          initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 0, maxSize = 2)
         let pool = await newPool(cfg)
 
         let conn = await pool.acquire()
@@ -5977,7 +6004,8 @@ suite "Pool broken connection handling (integration)":
     proc testBody() {.async.} =
       let ms = startMockServer()
       let serverFut = acceptAndReady(ms)
-      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 0, maxSize = 2)
+      let cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 0, maxSize = 2)
       let pool = await newPool(cfg)
 
       let conn = await pool.acquire()
@@ -6023,6 +6051,7 @@ suite "Pool broken connection handling (integration)":
 
         var cfg = initPoolConfig(
           mockConfig(ms.port),
+          resetQuery = "",
           minSize = 1,
           maxSize = 2,
           maintenanceInterval = milliseconds(20),
@@ -6070,6 +6099,7 @@ suite "Pool broken connection handling (integration)":
 
         let cfg = initPoolConfig(
           mockConfig(ms.port),
+          resetQuery = "",
           minSize = 1,
           maxSize = 2,
           maintenanceInterval = milliseconds(20),
@@ -6774,7 +6804,8 @@ suite "Pool warmup parallelization":
           await closeClient(c)
 
       let serverFut = serverHandler()
-      let cfg = initPoolConfig(mockConfig(ms.port), minSize = 3, maxSize = 5)
+      let cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 3, maxSize = 5)
       let pool = await newPool(cfg)
       idleAfter = pool.idle.len
       createCount = pool.metrics.createCount
@@ -6819,7 +6850,8 @@ suite "Pool warmup parallelization":
   test "newPool closes the conn that came up when another initial connect fails":
     proc t() {.async.} =
       let ms = startMockServer()
-      var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 2)
+      var cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 2, maxSize = 2)
       cfg.connConfig.connectTimeout = seconds(5)
       let poolFut = newPool(cfg)
 
@@ -6884,7 +6916,8 @@ suite "Pool warmup parallelization":
             discard
 
       let serverFut = serverHandler()
-      var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 4)
+      var cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 2, maxSize = 4)
       cfg.connConfig.connectTimeout = milliseconds(500)
       try:
         let pool = await newPool(cfg)
@@ -6905,7 +6938,8 @@ suite "Pool warmup parallelization":
       # be left open, the landed one unparked and the other still dialing.
       proc t() {.async.} =
         let ms = startMockServer()
-        var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 2)
+        var cfg =
+          initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 2, maxSize = 2)
         cfg.connConfig.connectTimeout = seconds(5)
         let poolFut = newPool(cfg)
 
@@ -8431,6 +8465,7 @@ suite "Pool afterConnect":
       let log = HookLog()
       var cfg = initPoolConfig(
         mockConfig(ms.port),
+        resetQuery = "",
         minSize = 2,
         maxSize = 3,
         maintenanceInterval = milliseconds(20),
@@ -8601,7 +8636,8 @@ suite "Pool afterConnect":
       let log = HookLog()
       # A config fault of the hook's own must not read as the pool's.
       let cause = newException(PgConfigError, "hook failed")
-      var cfg = initPoolConfig(mockConfig(ms.port), minSize = 2, maxSize = 2)
+      var cfg =
+        initPoolConfig(mockConfig(ms.port), resetQuery = "", minSize = 2, maxSize = 2)
       cfg.afterConnect = makeAfterConnectHook:
         log.conns.add(conn)
         if log.conns.len == 2:

@@ -15,7 +15,7 @@ template makeAfterConnectHook*(body: untyped): AfterConnectHook =
   ##
   ## .. code-block:: nim
   ##   let hook = makeAfterConnectHook:
-  ##     discard await conn.simpleExec("SET search_path TO app")
+  ##     discard await conn.prepare("user_by_id", "SELECT * FROM users WHERE id = $1")
   ##
   ## Kept module-local: routing this through a shared template with an
   ## `untyped`/`typedesc` param for the parameter type trips asyncdispatch's
@@ -30,6 +30,15 @@ template makeAfterConnectHook*(body: untyped): AfterConnectHook =
       proc(conn {.inject.}: PgConnection) {.async.} =
         body
     )
+
+const DefaultResetQuery* =
+  "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; " &
+  "SELECT pg_catalog.pg_advisory_unlock_all(); DISCARD TEMP; DISCARD SEQUENCES"
+  ## The default `PoolConfig.resetQuery`: `DISCARD ALL` without its
+  ## `DEALLOCATE ALL` and `DISCARD PLANS`, so the statement cache survives.
+  ## Returns the session to how `connect` left it (startup parameters such as
+  ## a `role` or `search_path` in `extraParams` stay) and keeps prepared
+  ## statements, those made with SQL `PREPARE` included.
 
 type
   PoolConfig* = object
@@ -80,27 +89,45 @@ type
       ## depth of `pendingOps` before `pool.exec`/`pool.query` enqueue
       ## (default -1=unlimited, 0=reject immediately). Rejects with
       ## `PgPoolError(pekQueueFull)` when full.
-    resetQuery*: string
-      ## SQL to execute when returning a connection to the pool (default ""=disabled).
-      ## Disabled, the pool clears only typed-API advisory locks and a changed
-      ## `TimeZone`: `SET` / `SET ROLE` / `search_path`, prepared statements,
-      ## temporary tables and `LISTEN` reach the next borrower. Runs from
-      ## `resetSession` (the `with*` macros and the pool's query procs); a raw
-      ## `release` skips it.
-      ## Common values: "DISCARD ALL" (full reset, recommended for PgBouncer),
-      ## "DEALLOCATE ALL" (clear prepared statements only),
-      ## "RESET ALL" (reset session parameters only; `SET ROLE` survives it,
-      ## so use "RESET ALL; RESET ROLE" when borrowers switch roles).
-      ## `DISCARD ALL` and `RESET ROLE` return to a role sent at startup
-      ## (`extraParams`), not to the login role. The statement cache is
-      ## kept unless it drops the prepared statements (DISCARD/DEALLOCATE ALL).
-      ## On failure, the connection is discarded. A `TimeZone` it leaves off
-      ## the connect value is set back afterwards, at the cost of a round trip;
-      ## behind PgBouncer, starting its server connections in the same zone
-      ## (`timezone=` on the `[databases]` entry) avoids that.
+    resetQuery*: string = DefaultResetQuery
+      ## SQL run on each connection returned to the pool, one round trip
+      ## (default `DefaultResetQuery`). Every release runs it in the
+      ## background — a raw `release`, the `with*` macros and the pool's query
+      ## procs alike, none waiting for it — and the connection holds its slot
+      ## until it ends. A connection the pool closes instead skips it.
+      ##
+      ## The default undoes `SET`, `SET ROLE`, `SET SESSION AUTHORIZATION`,
+      ## temporary tables, `LISTEN`, `WITH HOLD` cursors, session advisory
+      ## locks and `currval`, back to the startup parameters: a `SET ROLE`
+      ## returns to a `role` sent in `extraParams`, not to the login role.
+      ## Prepared statements stay:
+      ## the statement cache keeps working, and one made with SQL `PREPARE`
+      ## reaches the next borrower, its text visible in
+      ## `pg_prepared_statements`. "DISCARD ALL" drops those too, and the
+      ## statement cache with them.
+      ##
+      ## "" disables it: the pool then clears only typed-API advisory locks and
+      ## a changed `TimeZone`, and the rest reaches the next borrower. Set it
+      ## behind PgBouncer in transaction mode, RDS Proxy or Supavisor: the
+      ## first proxy needs no reset (a session is not kept between
+      ## transactions), and RDS Proxy pins a session it sees `SET`, `RESET` or
+      ## `DISCARD` on. A non-PostgreSQL server that rejects a statement in the
+      ## default needs its own query, or "": a failed reset closes the
+      ## connection (reported to the tracer's `onPoolCloseError`), so every
+      ## borrow would dial. With `afterConnect` set, the reset that follows
+      ## the hook fails first, and fails the connect: `newPool` and `acquire`
+      ## raise `pekAfterConnectFailed`.
+      ##
+      ## `RESET ALL` returns parameters to the startup values of the server
+      ## connection. Behind PgBouncer, that is the one PgBouncer opened: give
+      ## its `[databases]` entry `datestyle=ISO` and `client_encoding=UTF8`,
+      ## or a reset that lands on another output style or encoding fails as
+      ## above, and `timezone=` with this client's zone, or each release
+      ## costs a second round trip to set the `TimeZone` back.
+      ##
       ## Treat as trusted operator config — do not build from untrusted input
       ## (executed via the simple query protocol, which allows multi-statement).
-    resetQueryTimeout*: Duration
+    resetQueryTimeout*: Duration = seconds(5)
       ## Deadline for each server round-trip in `resetSession` — covers
       ## `pg_advisory_unlock_all` (when session locks are dirty), `resetQuery`
       ## and the `TimeZone` restore (default 5s, ZeroDuration=no timeout). A
@@ -109,31 +136,35 @@ type
     afterConnect*: AfterConnectHook
       ## Runs on each connection the pool opens — `newPool`'s, the maintenance
       ## refill's and an `acquire`'s own dial — before the pool hands it out or
-      ## parks it (default nil=none): `SET`s, `prepare`, `lookupTypeOids`.
-      ## Not run on a reused connection.
+      ## parks it (default nil=none): `prepare`, `lookupTypeOids`, a `TimeZone`
+      ## (the reset below undoes other `SET`s). Not run on a reused connection.
       ##
       ## A hook that raises, or leaves the connection not ready or inside a
-      ## transaction, gets the connection closed and fails the connect:
-      ## `acquire` and `newPool` raise `pekAfterConnectFailed` with the hook's
-      ## error as `parent`, and the maintenance loop backs off as after a
-      ## failed dial. Whatever it raises, neither the pool
+      ## transaction, gets the connection closed and fails the connect, and so
+      ## does a failure of the reset after it (below): `acquire` and `newPool`
+      ## raise `pekAfterConnectFailed` with the error as `parent` (a failed
+      ## reset's wrapped in a `PgError`), and the maintenance loop backs off as
+      ## after a failed dial. Whatever it raises, neither the pool
       ## nor `retryAdvice` takes it for a refusal or a config fault: the pool
       ## never stops dialing over it.
       ##
-      ## An `acquire`'s dial and hook share its `acquireTimeout` budget, and
-      ## the maintenance loop gives the hook `maintenanceInterval`; one cut
-      ## short has its connection closed. `newPool` sets the hook no bound: a
-      ## hung one hangs `newPool`, on asyncdispatch past any `wait` around it,
-      ## so bound the hook's own queries (their `timeout`, or a
-      ## `statement_timeout`).
+      ## An `acquire`'s dial, hook and the reset after it share its
+      ## `acquireTimeout` budget, and the maintenance loop gives the hook and
+      ## reset `maintenanceInterval`; one cut short has its connection closed.
+      ## `newPool` sets the hook no bound: a hung one hangs `newPool`, on
+      ## asyncdispatch past any `wait` around it, so bound the hook's own
+      ## queries (their `timeout`, or a `statement_timeout`).
       ##
-      ## A `TimeZone` the hook sets is the one `resetSession` restores.
-      ## `resetQuery` starts from the session the hook left: "DISCARD ALL" and
-      ## "RESET ALL" undo its `SET`s (send settings as startup `extraParams`
-      ## instead), and "DISCARD ALL" / "DEALLOCATE ALL" drop its prepared
-      ## statements. A session advisory lock it takes through the typed API
-      ## reads as leaked: the first release reports it to `onLeakedSessionLocks`
-      ## and unlocks it (`resetSession`) or closes the connection (`release`).
+      ## Right after the hook, the pool resets the session as a release does
+      ## (`resetSession`), so the first borrower gets the session every later
+      ## one does. The default `resetQuery` thus undoes the hook's `SET`s,
+      ## `SET ROLE` included: send settings as startup `extraParams` instead.
+      ## A `TimeZone` the hook sets is kept (the reset sets it back), and so
+      ## are its prepared statements, unless `resetQuery` drops them ("DISCARD
+      ## ALL", "DEALLOCATE ALL"). A session advisory lock it takes through the
+      ## typed API reads as leaked: the reset reports it to
+      ## `onLeakedSessionLocks` and unlocks it. The callbacks it registers
+      ## (`onNotice`, `onNotify`, ...) are the ones each release puts back.
     tracer*: PgTracer ## Optional tracer for pool-level hooks (acquire/release)
     pipelined*: bool
       ## Enable implicit query batching for pool.exec/query (default false).
@@ -199,14 +230,8 @@ type
     ## return the connection to the pool — typically via `defer: h.release()`.
     ## Forgetting to release leaks the connection until the pool is closed.
     ##
-    ## **No session reset:** unlike `withConnection` / `withReadConnection` /
-    ## `withWriteConnection`, `release(h)` does **not** call `resetSession`,
-    ## so a configured `resetQuery` will not run. A connection that still
-    ## holds session-level advisory locks acquired through the typed API, or
-    ## whose `TimeZone` changed since connect, is closed instead of returning
-    ## to the pool. Use the `with*Connection` templates when you want
-    ## automatic session cleanup, or call `pool.resetSession(h.conn)` yourself
-    ## before `release(h)`.
+    ## `release(h)` resets the session in the background (see
+    ## `release(conn)`), as the `with*Connection` templates do.
     ##
     ## `pool` is the pool the connection was actually borrowed from. For
     ## `PgPoolCluster.readConnection` with `fallbackPrimary`, this can be
@@ -249,6 +274,11 @@ type
       ## Fire-and-forget tasks tracked so `pool.close()` can drain them
       ## before returning. Populated by `closeNoWait` (connection closes)
       ## and the close of a connect an acquire's deadline orphaned.
+    pendingResets: seq[Future[void]]
+      ## Background resets (`resetThenFinishRelease`), kept apart so
+      ## `pool.close()` can cut them short.
+    bgTaskPruneAt, resetPruneAt: int
+      ## Length at which the matching seq is next swept (`pruneFinished`).
     consecutiveConnectFailures: int
       ## Counter for exponential backoff in the maintenance loop. Reset to 0
       ## whenever a connect succeeds (in maintenance or acquire).
@@ -271,8 +301,8 @@ type
       ## dial of its own beside them.
 
 const bgTaskPruneThreshold = 16
-  ## Sweep `pool.pendingBackgroundTasks` for finished futures only once its
-  ## length reaches this threshold, so the O(n) prune is amortized across calls.
+  ## Least length at which `pruneFinished` sweeps, so a few tasks never cost a
+  ## walk.
 
 const pingBudgetFloor = milliseconds(10)
   ## Minimum remaining acquire-deadline budget required to start a
@@ -338,7 +368,7 @@ proc initPoolConfig*(
     pingTimeout = seconds(5),
     acquireTimeout = seconds(30),
     maxWaiters = -1,
-    resetQuery = "",
+    resetQuery = DefaultResetQuery,
     resetQueryTimeout = seconds(5),
     pipelined = false,
     maxPipelineSize = 0,
@@ -349,7 +379,8 @@ proc initPoolConfig*(
   ## Create a pool configuration with sensible defaults.
   ## Maintenance replenishes `size()` toward `minSize`, checked-out
   ## connections included; acquires dial up to `maxSize`.
-  ## Set `resetQuery` to clean session state on release (e.g. "DISCARD ALL" for PgBouncer).
+  ## Each release resets the session with `resetQuery`; set it to "" behind
+  ## PgBouncer in transaction mode or RDS Proxy (see `PoolConfig.resetQuery`).
   ## Set `pipelined` to true to enable implicit query batching for `pool.exec`/`pool.query`.
   ## When the maintenance loop fails to open a connection, subsequent retries
   ## use exponential backoff starting at `connectBackoffInitial`, doubling up to
@@ -446,22 +477,24 @@ proc tracedClose(pool: PgPool, conn: PgConnection, byUser: bool = false) {.async
   except CatchableError as e:
     pool.reportCloseError(conn, e)
 
-proc pruneBackgroundTasks(pool: PgPool) =
-  ## Sweep finished futures out of `pool.pendingBackgroundTasks`. Skipped until
-  ## the seq grows past `bgTaskPruneThreshold` so the O(n) walk is amortized
-  ## across calls. Uses swap-remove (constant-time delete that reorders)
-  ## since order among pending tasks is irrelevant.
-  if pool.pendingBackgroundTasks.len < bgTaskPruneThreshold:
+proc pruneFinished(futs: var seq[Future[void]], pruneAt: var int) =
+  ## Sweep finished futures out of `futs` once it reaches `pruneAt`, then set
+  ## `pruneAt` to twice what is left: the adds since the last sweep pay for
+  ## each walk, however many tasks stay in flight. Uses swap-remove
+  ## (constant-time delete that reorders) since order among pending tasks is
+  ## irrelevant.
+  if futs.len < max(pruneAt, bgTaskPruneThreshold):
     return
-  var n = pool.pendingBackgroundTasks.len
+  var n = futs.len
   var i = 0
   while i < n:
-    if pool.pendingBackgroundTasks[i].finished:
-      pool.pendingBackgroundTasks[i] = pool.pendingBackgroundTasks[n - 1]
+    if futs[i].finished:
+      futs[i] = futs[n - 1]
       dec n
     else:
       inc i
-  pool.pendingBackgroundTasks.setLen(n)
+  futs.setLen(n)
+  pruneAt = 2 * n
 
 proc closeUncounted(pool: PgPool, conn: PgConnection, byUser: bool = false) =
   ## `closeNoWait` without the `closeCount`: for a conn whose `afterConnect`
@@ -469,7 +502,7 @@ proc closeUncounted(pool: PgPool, conn: PgConnection, byUser: bool = false) =
   proc doClose() {.async.} =
     await pool.tracedClose(conn, byUser)
 
-  pool.pruneBackgroundTasks()
+  pool.pendingBackgroundTasks.pruneFinished(pool.bgTaskPruneAt)
   let fut = doClose()
   pool.pendingBackgroundTasks.add(fut)
   asyncSpawn fut
@@ -494,13 +527,72 @@ func canRestoreTimeZone(conn: PgConnection): bool =
   ## reported at startup there is neither, and releaseCore discards the conn.
   conn.timeZoneFollowsServer or conn.connectTimeZone.len > 0
 
+proc needsSessionReset(pool: PgPool, conn: PgConnection): bool =
+  ## Whether `resetSession` has round trips to make: a usable connection not
+  ## bound for discard, with a `resetQuery`, leaked locks or a moved `TimeZone`.
+  conn.state == csReady and conn.txStatus == tsIdle and
+    not (conn.timeZoneChanged and not conn.canRestoreTimeZone) and
+    (pool.config.resetQuery.len > 0 or conn.sessionLockDirty or conn.timeZoneChanged)
+
+proc runSessionReset(pool: PgPool, conn: PgConnection) {.async.} =
+  ## The round trips of `resetSession`, raising what they raise.
+  # The default query unlocks them in the same round trip.
+  let queryUnlocks = pool.config.resetQuery == DefaultResetQuery
+  if conn.sessionLockDirty:
+    let t = pool.config.tracer
+    if t != nil and t.onLeakedSessionLocks != nil:
+      # Fire on the sticky flag rather than the counter so a raw acquire
+      # released through the typed API — which decrements the counter for a
+      # lock it never tracked — cannot silence the leak hook.
+      t.onLeakedSessionLocks(
+        TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
+      )
+    if not queryUnlocks:
+      discard await conn.simpleExec(
+        "SELECT pg_catalog.pg_advisory_unlock_all()",
+        timeout = pool.config.resetQueryTimeout,
+      )
+      conn.clearSessionLocks()
+  if pool.config.resetQuery.len > 0:
+    discard await conn.simpleExec(
+      pool.config.resetQuery, timeout = pool.config.resetQueryTimeout
+    )
+    if queryUnlocks:
+      conn.clearSessionLocks()
+  if conn.timeZoneChanged and conn.canRestoreTimeZone:
+    # The next borrower's DateTime params would shift by the new offset.
+    if conn.timeZoneFollowsServer:
+      # RESET, not SET: which zone it lands on is the server's call, so
+      # re-read what it reports instead of pinning the connect zone.
+      discard
+        await conn.simpleExec("RESET TimeZone", timeout = pool.config.resetQueryTimeout)
+      conn.noteConnectTimeZone(followsServer = true)
+    else:
+      # A SET, as behind PgBouncer RESET restores the server connection's
+      # zone.
+      discard await conn.simpleExec(
+        "SET TimeZone TO " & quoteLiteral(conn.connectTimeZone),
+        timeout = pool.config.resetQueryTimeout,
+      )
+
+proc abandonReset(conn: PgConnection) =
+  ## Send an unfinished reset's conn to releaseCore's discard. Its leaked
+  ## locks were reported as the reset began and the close drops them, so the
+  ## release must not report them again.
+  conn.markClosed()
+  conn.clearSessionLocks()
+
 proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   ## Reset session-affecting state on a connection before returning it to the
   ## pool. Releases any session-level advisory locks acquired through the
   ## typed API, runs the configured `resetQuery` (if any), then sets back a
   ## `TimeZone` changed since connect (with `TimeZone=DEFAULT`, `RESET`s it to
   ## the server's current one). On failure, closes the connection so that
-  ## release() will discard it.
+  ## release() will discard it, and reports the error to the tracer's
+  ## `onPoolCloseError`.
+  ##
+  ## Every release runs it already (`release` in the background), so calling
+  ## it before one costs a second reset.
   ##
   ## Always safe to call: returns immediately when the connection is unusable
   ## (broken / mid-transaction), has nothing to clean up (no `resetQuery`,
@@ -513,64 +605,26 @@ proc resetSession*(pool: PgPool, conn: PgConnection) {.async.} =
   ## `CancelledError` — chronos requires cancellation to propagate. A `Defect`
   ## is re-raised as `PgPoolError` (the Defect as `parent`) after marking
   ## `csClosed` (the reset did not complete). Callers must chain `release()`
-  ## under `try/finally` (or use `resetSessionAndRelease`) to keep pool
-  ## accounting balanced on cancel.
-  if conn.state != csReady or conn.txStatus != tsIdle:
-    return
-  if conn.timeZoneChanged and not conn.canRestoreTimeZone:
-    # releaseCore discards the conn anyway; release() fires the leak hook.
-    return
-  if pool.config.resetQuery.len == 0 and not conn.sessionLockDirty and
-      not conn.timeZoneChanged:
+  ## under `try/finally` to keep pool accounting balanced on cancel.
+  if not pool.needsSessionReset(conn):
     return
   try:
-    if conn.sessionLockDirty:
-      let t = pool.config.tracer
-      if t != nil and t.onLeakedSessionLocks != nil:
-        # Fire on the sticky flag rather than the counter so a raw acquire
-        # released through the typed API — which decrements the counter for a
-        # lock it never tracked — cannot silence the leak hook.
-        t.onLeakedSessionLocks(
-          TraceLeakedSessionLocksData(conn: conn, count: conn.heldSessionLocks)
-        )
-      discard await conn.simpleExec(
-        "SELECT pg_advisory_unlock_all()", timeout = pool.config.resetQueryTimeout
-      )
-      conn.clearSessionLocks()
-    if pool.config.resetQuery.len > 0:
-      discard await conn.simpleExec(
-        pool.config.resetQuery, timeout = pool.config.resetQueryTimeout
-      )
-    if conn.timeZoneChanged and conn.canRestoreTimeZone:
-      # The next borrower's DateTime params would shift by the new offset.
-      if conn.timeZoneFollowsServer:
-        # RESET, not SET: which zone it lands on is the server's call, so
-        # re-read what it reports instead of pinning the connect zone.
-        discard await conn.simpleExec(
-          "RESET TimeZone", timeout = pool.config.resetQueryTimeout
-        )
-        conn.noteConnectTimeZone(followsServer = true)
-      else:
-        # A SET, as behind PgBouncer RESET restores the server connection's
-        # zone.
-        discard await conn.simpleExec(
-          "SET TimeZone TO " & quoteLiteral(conn.connectTimeZone),
-          timeout = pool.config.resetQueryTimeout,
-        )
+    await pool.runSessionReset(conn)
   except CancelledError as e:
     # Split from the generic handler so cancellation propagates. Flip state
     # synchronously so the subsequent release() routes to releaseCore's discard
     # path. The actual socket close is performed by releaseCore's closeNoWait;
     # calling it here as well would double-count metrics.
-    conn.markClosed()
+    conn.abandonReset()
     raise e
-  except CatchableError:
+  except CatchableError as e:
     # Defer close to releaseCore's closeNoWait to avoid double-counting metrics.
-    conn.markClosed()
+    conn.abandonReset()
+    pool.reportCloseError(conn, e)
   except Defect as d:
     # Incomplete reset: mark csClosed so the conn is discarded, then re-raise
     # wrapped (a raw Defect cannot cross a chronos async boundary).
-    conn.markClosed()
+    conn.abandonReset()
     raise newPoolError(pekDefectWrapped, d.msg, d)
 
 proc computeConnectBackoff(initial, maxDelay: Duration, failures: int): Duration =
@@ -757,19 +811,45 @@ func hookError(err: ref CatchableError): ref CatchableError =
   else:
     err
 
+proc runAfterConnect(
+    pool: PgPool, conn: PgConnection, hook: AfterConnectHook
+) {.async.} =
+  ## `hook`, then the reset a release makes, so the first borrower gets the
+  ## session every later one does.
+  await hook(conn)
+  if conn.state != csReady:
+    raise newException(PgStateError, "afterConnect left the connection not ready")
+  if conn.txStatus != tsIdle:
+    raise newException(PgStateError, "afterConnect left a transaction open")
+  if conn.timeZoneChanged:
+    # Otherwise the reset would set the startup zone back over the hook's.
+    conn.noteConnectTimeZone(followsServer = false)
+  if pool.needsSessionReset(conn):
+    try:
+      await pool.runSessionReset(conn)
+    except CancelledError as e:
+      raise e
+    except CatchableError as e:
+      raise (ref PgError)(
+        msg: "session reset after afterConnect failed: " & e.msg, parent: e
+      )
+  conn.notePoolCallbacks()
+
 proc dialConn(
     pool: PgPool, cfg: ConnConfig, hookTimeout = ZeroDuration, sharedWithConnect = false
 ): Future[PgConnection] {.async.} =
-  ## `connect`, then `afterConnect` on the new conn. A hook failure closes the
-  ## conn and raises `AfterConnectFailure`. `hookTimeout` (zero for none)
-  ## bounds the hook alone, or with `sharedWithConnect` the connect and the
-  ## hook together.
+  ## `connect`, then `afterConnect` and a session reset on the new conn. A
+  ## failure of either closes the conn and raises `AfterConnectFailure`.
+  ## `hookTimeout` (zero for none) bounds the hook and reset alone, or with
+  ## `sharedWithConnect` the connect too.
   let start = Moment.now()
   let conn = await connect(cfg)
   # The server took the session, whatever the hook makes of it.
   pool.lastRefusal = nil
   let hook = pool.config.afterConnect
   if hook == nil:
+    # What `connect` left is what each release restores.
+    conn.notePoolCallbacks()
     return conn
   var err: ref CatchableError
   try:
@@ -781,13 +861,9 @@ proc dialConn(
         raise newException(AsyncTimeoutError, "connect left afterConnect no time")
       # On asyncdispatch the hook runs on past the timeout; the close below
       # fails its pending I/O.
-      await hook(conn).wait(left)
+      await pool.runAfterConnect(conn, hook).wait(left)
     else:
-      await hook(conn)
-    if conn.state != csReady:
-      err = newException(PgStateError, "afterConnect left the connection not ready")
-    elif conn.txStatus != tsIdle:
-      err = newException(PgStateError, "afterConnect left a transaction open")
+      await pool.runAfterConnect(conn, hook)
   except CancelledError as e:
     pool.closeUncounted(conn)
     raise e
@@ -803,9 +879,6 @@ proc dialConn(
     conn.invalidateOnCancel(releaseTransport = false)
     pool.closeUncounted(conn)
     raise newException(AfterConnectFailure, "afterConnect failed: " & err.msg, err)
-  if conn.timeZoneChanged:
-    # Otherwise `resetSession` would set the startup zone back over the hook's.
-    conn.noteConnectTimeZone(followsServer = false)
   return conn
 
 proc hasCapacity(pool: PgPool, dial = true): bool =
@@ -1145,6 +1218,9 @@ proc releaseCore(
       conn, byUser = conn.borrowedByUser and pool.closed and not discarded
     )
     return (true, false)
+  # Before any handoff: the next borrower must not reach the last one's
+  # callbacks.
+  conn.restoreClientSession()
   # FIFO handoff: serve the head waiter directly with the released conn.
   # `active` is intentionally not decremented — the conn is still in use, just
   # by a different borrower.
@@ -1155,8 +1231,46 @@ proc releaseCore(
   pool.idle.addLast(PooledConn(conn: conn, lastUsedAt: now))
   return (false, false)
 
-proc releaseImpl(pool: PgPool, conn: PgConnection) =
+proc finishRelease(pool: PgPool, conn: PgConnection, traceCtx: TraceContext) =
+  ## `releaseCore`, then the tracer's `onPoolReleaseEnd`.
+  let (wasClosed, handedToWaiter) = pool.releaseCore(conn)
+  let tracer = pool.config.tracer
+  if tracer != nil and tracer.onPoolReleaseEnd != nil:
+    try:
+      tracer.onPoolReleaseEnd(
+        traceCtx,
+        TracePoolReleaseEndData(wasClosed: wasClosed, handedToWaiter: handedToWaiter),
+      )
+    except CatchableError:
+      discard
+    except Defect:
+      discard
+
+proc resetThenFinishRelease(pool: PgPool, conn: PgConnection, traceCtx: TraceContext) =
+  ## `resetSession` in the background, then `finishRelease`; the slot stays in
+  ## use meanwhile. Tracked in `pendingResets` for `pool.close()`.
+  proc run() {.async.} =
+    try:
+      await pool.resetSession(conn)
+    except CancelledError:
+      # `pool.close()` cut it short; the conn is marked closed.
+      discard
+    except CatchableError as e:
+      # A Defect, wrapped; the conn is marked closed.
+      pool.reportCloseError(conn, e)
+    finally:
+      pool.finishRelease(conn, traceCtx)
+
+  pool.pendingResets.pruneFinished(pool.resetPruneAt)
+  let fut = run()
+  pool.pendingResets.add(fut)
+  asyncSpawn fut
+
+proc releaseImpl(pool: PgPool, conn: PgConnection, resetFirst: bool) =
   ## Implementation of `release(conn)`; called once the owning pool is known.
+  ## With `resetFirst`, a connection `resetSession` has work for is reset in
+  ## the background first (`resetThenFinishRelease`); a caller that never
+  ## lent it out passes false.
   ## `conn.borrowedByUser` decides whether a close during shutdown counts as the
   ## application's (see `releaseCore`), so no call site can get it wrong.
   ## Returns the connection to the pool. If the connection is broken, in a
@@ -1173,11 +1287,10 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
   ## to reset the session, so the connection is closed rather than leaking
   ## transaction state to the next borrower.
   ## Session-level advisory locks (`sessionLockDirty`) likewise force the
-  ## connection to be discarded: callers who route through `resetSession`
-  ## clear them ahead of time, so anything reaching here still dirty has
-  ## bypassed that path and must not return to the idle queue. A `TimeZone`
-  ## changed since connect, or a conn past `maxLifetime`, is discarded the
-  ## same way.
+  ## connection to be discarded: the reset clears them, so anything reaching
+  ## `releaseCore` still dirty has bypassed it (a reset that could not run)
+  ## and must not return to the idle queue. A `TimeZone` changed since
+  ## connect, or a conn past `maxLifetime`, is discarded the same way.
   ##
   ## Double-release guard: a connection that is not currently checked out
   ## (`borrowed == false`) has already been returned to the pool — or never
@@ -1208,7 +1321,12 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
         discard
     return
   conn.borrowed = false
-  if conn.sessionLockDirty and tracer != nil and tracer.onLeakedSessionLocks != nil:
+  let resetInBackground =
+    resetFirst and not pool.closed and pool.needsSessionReset(conn) and
+    not pool.isExpired(conn, Moment.now())
+  # A background reset reports leaked locks itself.
+  if conn.sessionLockDirty and not resetInBackground and tracer != nil and
+      tracer.onLeakedSessionLocks != nil:
     # Fire on the sticky flag rather than the counter so a raw acquire
     # released through the typed API — which decrements the counter for a
     # lock it never tracked — cannot silence the leak hook.
@@ -1222,42 +1340,35 @@ proc releaseImpl(pool: PgPool, conn: PgConnection) =
       discard
     except Defect:
       discard
-  if tracer == nil:
-    discard pool.releaseCore(conn)
-    return
-
   var traceCtx: TraceContext
-  if tracer.onPoolReleaseStart != nil:
+  if tracer != nil and tracer.onPoolReleaseStart != nil:
     try:
       traceCtx = tracer.onPoolReleaseStart(TracePoolReleaseStartData(conn: conn))
     except CatchableError:
       discard
     except Defect:
       discard
-
-  let (wasClosed, handedToWaiter) = pool.releaseCore(conn)
-
-  if tracer.onPoolReleaseEnd != nil:
-    try:
-      tracer.onPoolReleaseEnd(
-        traceCtx,
-        TracePoolReleaseEndData(wasClosed: wasClosed, handedToWaiter: handedToWaiter),
-      )
-    except CatchableError:
-      discard
-    except Defect:
-      discard
+  if resetInBackground:
+    # Before the reset: a NOTIFY or NOTICE it reads must not reach this
+    # borrower's callbacks.
+    conn.restoreClientSession()
+    pool.resetThenFinishRelease(conn, traceCtx)
+  else:
+    pool.finishRelease(conn, traceCtx)
 
 proc release*(conn: PgConnection) =
   ## Return a connection to its owning pool. If the connection is broken, in a
   ## transaction, or past `maxLifetime`, it is closed instead; if waiters are
   ## queued, it is handed directly to the next waiter.
   ##
-  ## **No session reset:** `resetSession` does not run, so `resetQuery` is
-  ## skipped and session state (`SET`, `SET ROLE`, prepared statements, …)
-  ## reaches the next borrower; a connection holding typed-API advisory locks
-  ## or a changed `TimeZone` is closed instead. Use `resetSessionAndRelease`
-  ## or the `with*` macros to clean up.
+  ## **Session reset in the background:** a connection with something to
+  ## reset (`resetQuery`, typed-API advisory locks, a changed `TimeZone`) goes
+  ## through `resetSession` first, without this call waiting for it. It keeps
+  ## its slot until the reset ends: only then is it parked or handed to a
+  ## waiter. `pool.close()` cuts the reset short and closes the connection
+  ## (asyncdispatch, which cannot cancel it, waits for it). Callbacks the
+  ## borrower set on it (`onNotice`, `onNotify`, ...), its channels and queued
+  ## notifications are put back as `afterConnect` left them.
   ##
   ## The owning pool is tracked on `conn.ownerPool`, set automatically when
   ## the connection is acquired from a `PgPool` (including pools inside a
@@ -1271,13 +1382,14 @@ proc release*(conn: PgConnection) =
   ## carries no per-borrow token. Prefer `PooledConnHandle` / `with*`.
   ##
   ## `withConnection`, `withReadConnection`, `withWriteConnection`,
-  ## `withPipeline`, and `withTransaction` call this automatically; direct
-  ## callers only need it when they manage `acquire`/`release` manually.
+  ## `withPipeline`, and `withTransaction` release automatically, the same
+  ## way (`resetSessionAndRelease`); direct callers only need this when they
+  ## manage `acquire`/`release` manually.
   if conn.ownerPool == nil:
     raise newException(
       PgError, "release() called on a standalone connection; use conn.close() instead"
     )
-  PgPool(conn.ownerPool).releaseImpl(conn)
+  PgPool(conn.ownerPool).releaseImpl(conn, resetFirst = true)
 
 proc releaseReclaimed*(conn: PgConnection) =
   ## Internal (exported for `pg_pool_cluster`): return a connection the *pool*
@@ -1291,36 +1403,26 @@ proc releaseReclaimed*(conn: PgConnection) =
   if conn.ownerPool == nil:
     raise newException(PgError, "releaseReclaimed() called on a standalone connection")
   conn.borrowedByUser = false
-  PgPool(conn.ownerPool).releaseImpl(conn)
+  # Fresh from a dial or the idle set: nothing to reset.
+  PgPool(conn.ownerPool).releaseImpl(conn, resetFirst = false)
 
 proc release*(h: PooledConnHandle) =
   ## Return the borrowed connection to its pool. Idempotent — safe to call
   ## twice (e.g. once explicitly and once via `defer`).
   ##
-  ## **Does not run `resetSession`.** Session state (`SET`, `SET ROLE`,
-  ## prepared statements, etc.) on the connection is **not**
-  ## cleared before it returns to the pool, so subsequent borrowers may
-  ## observe it. A connection holding advisory locks acquired via the typed
-  ## API, or whose `TimeZone` changed since connect, is closed instead, at
-  ## the cost of a reconnect. If that matters, use
-  ## `withConnection` / `withReadConnection` / `withWriteConnection` instead,
-  ## or call `await h.pool.resetSession(h.conn)` yourself before `release(h)`.
+  ## Resets the session in the background, as `release(conn)` does.
   if not h.released and h.conn != nil:
     h.released = true
     h.conn.release()
 
 proc resetSessionAndRelease*(pool: PgPool, conn: PgConnection) {.async.} =
-  ## `resetSession` + `release`, wrapped so `release()` still runs when the
-  ## reset propagates `CancelledError` (else a pool slot leaks).
+  ## `release(conn)` as a future, which the `with*` macros and the pool's query
+  ## procs end a borrow with: the reset runs in the background, so the caller
+  ## gets the body's outcome without a round trip, and a cancel or deadline
+  ## landing after the body cannot fail an operation that succeeded.
   ##
-  ## Correct for both application-held and pool-internal borrows. A conn past
-  ## `maxLifetime` skips the reset: `release` closes it, so the round trip would
-  ## be spent on a conn the pool throws away.
-  try:
-    if not pool.isExpired(conn, Moment.now()):
-      await pool.resetSession(conn)
-  finally:
-    conn.release()
+  ## Correct for both application-held and pool-internal borrows.
+  conn.release()
 
 proc settleAbandonedWaiter(pool: PgPool, waiter: Waiter) =
   ## Clean up a waiter whose acquire is being abandoned via timeout or external
@@ -1737,8 +1839,8 @@ proc acquireHandle*(pool: PgPool): Future[PooledConnHandle] {.async.} =
   ##
   ## The caller is responsible for releasing — typically via
   ## `defer: h.release()`. Forgetting to release leaks the connection.
-  ## `release(h)` does **not** run `resetSession`; prefer `withConnection`
-  ## when automatic session cleanup is desired.
+  ## `release(h)` resets the session in the background, as `withConnection`
+  ## does.
   let conn = await pool.acquire()
   return PooledConnHandle(conn: conn, pool: pool)
 
@@ -1757,12 +1859,11 @@ proc runAndReleaseImpl[T](
 ): Future[T] {.async.} =
   ## asyncdispatch-safe `acquire → body → resetSessionAndRelease`: the body
   ## error is captured and the connection released outside `finally`, so a
-  ## failing release can't replace the body's in-flight exception. Release
-  ## failures are reported via `reportCloseError` (the op's result is already
-  ## valid, and a reset-path Defect leaves the connection unusable — the
-  ## reset's send leaves `csBusy`, so `releaseCore` discards it), except a
-  ## release-path `CancelledError`, which is always re-raised: the caller is
-  ## cancelling the whole operation.
+  ## failing release can't replace the body's in-flight exception. The reset
+  ## runs in the background, so the body's outcome is what the caller gets.
+  ## Release failures are reported via `reportCloseError` (the op's result is
+  ## already valid); the release does not wait for the reset, so it fails only
+  ## on misuse or a Defect.
   ## A body Defect is re-raised wrapped in `PgPoolError` (Defect as `parent`),
   ## since chronos re-raises raw Defects from continuations eagerly.
   ##
@@ -1823,8 +1924,8 @@ proc buildReleaseAndReraise*(releaseCall, bodyErrSym, bodyDefectSym: NimNode): N
   ## `resetSessionAndRelease`) outside a `finally`, so a failing release can't
   ## mask the body error. A release failure is re-raised only when the body
   ## succeeded — the body error verbatim, its Defect wrapped in `PgPoolError`
-  ## (the Defect is `parent`). A release-path `CancelledError` is always
-  ## re-raised: the caller is cancelling the whole macro.
+  ## (the Defect is `parent`). The release does not wait for the reset, so it
+  ## fails only on misuse or a Defect.
   let releaseErrSym = macroSym(nskLet, "releaseErr")
   let releaseDefectSym = macroSym(nskLet, "releaseDefect")
   let cancelSym = macroSym(nskLet, "cancel")
@@ -1854,11 +1955,10 @@ proc buildReleaseAndReraise*(releaseCall, bodyErrSym, bodyDefectSym: NimNode): N
 macro withConnection*(pool: PgPool, conn, body: untyped): untyped =
   ## Acquire a connection, execute `body`, then release it back to the pool.
   ## The connection is available as `conn` inside the body.
-  ## `resetSession` runs before release, so a configured `resetQuery` is
-  ## applied and any session-level advisory locks acquired through the typed
-  ## API are released via `pg_advisory_unlock_all`. Without a `resetQuery`,
-  ## other session state (`SET`, `SET ROLE`, prepared statements, …) reaches
-  ## the next borrower.
+  ## The release resets the session in the background, as `release` does: the
+  ## default `resetQuery` undoes `SET`, `SET ROLE`, temporary tables,
+  ## `LISTEN` and session advisory locks before the next borrower gets the
+  ## connection.
   ##
   ## Release runs outside `finally` (a failing `await` in an asyncdispatch
   ## `finally` masks the body error), so `return` / `break` / `continue`
@@ -2839,9 +2939,8 @@ macro withTransactionDeadline*(pool: PgPool, args: varargs[untyped]): untyped =
   ## `acquireTimeout` expires. A connection it still gets goes straight back to
   ## the pool: the body never runs, so a caller that retries does not run it
   ## twice. A deadline that expires after COMMIT, during the pool's session
-  ## reset, raises nothing: the transaction committed. Under chronos the reset
-  ## is cancelled and the connection dropped. Under asyncdispatch the reset
-  ## runs on, bounded only by `resetQueryTimeout`, as on any release.
+  ## reset, raises nothing: the transaction committed. The reset runs on in the
+  ## background, bounded by `resetQueryTimeout`, as on any release.
   ##
   ## This holds for the acquire phase too: a deadline that expires while
   ## waiting for `acquire()` raises `PgTimeoutError`, not
@@ -3271,10 +3370,15 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   ## `ZeroDuration`), close() does not wait for `activeCount()` and the
   ## background drain waits unbounded.
   ##
+  ## A session reset still running from a release is cut short at once, its
+  ## connection closed: the pool would close it once the reset ended anyway.
+  ##
   ## asyncdispatch cannot cancel a future: there the maintenance loop, and
   ## background tasks still running at the deadline, outlive close() until
-  ## their current sleep, connect, ping or close ends. A connection they open
-  ## or ping after close() is closed, not kept.
+  ## their current sleep, connect, ping, reset or close ends. A running reset
+  ## is one of the background tasks drained, each of its round trips bounded
+  ## by `resetQueryTimeout`. A connection they open or ping after close() is
+  ## closed, not kept.
   pool.closed = true
 
   let hasDeadline = timeout > ZeroDuration
@@ -3305,6 +3409,18 @@ proc close*(pool: PgPool, timeout = ZeroDuration): Future[void] {.async.} =
   while pool.pendingOps.len > 0:
     let op = pool.pendingOps.popFirst()
     failPendingOp(op, closeErr)
+
+  # After the waiters are failed, so the slots these free go to no one. A
+  # release from here on skips the reset (`releaseImpl` checks `pool.closed`).
+  let resets = pool.pendingResets
+  pool.pendingResets.setLen(0)
+  var cancels: seq[Future[void]]
+  for f in resets:
+    if not f.finished:
+      cancels.add(cancelAndWaitPumped(f))
+  await allFutures(cancels)
+  # Uncancelled on asyncdispatch: the drain below waits for them.
+  pool.pendingBackgroundTasks.add(resets)
 
   # Wait for activeCount() to drain: borrows, and the dials and pings holding a
   # slot (bounded by closeDeadline; the last poll sleeps only to the deadline)

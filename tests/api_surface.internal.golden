@@ -342,6 +342,7 @@ async_postgres/pg_connection/types.nim	noteCommandTag
 async_postgres/pg_connection/types.nim	noteConnectTimeZone
 async_postgres/pg_connection/types.nim	noteListenPumpStarted
 async_postgres/pg_connection/types.nim	noteNegotiatedProtocol
+async_postgres/pg_connection/types.nim	notePoolCallbacks
 async_postgres/pg_connection/types.nim	noteReplReported
 async_postgres/pg_connection/types.nim	noteReplSentFlush
 async_postgres/pg_connection/types.nim	noteReplWriteFailure
@@ -395,6 +396,7 @@ async_postgres/pg_connection/types.nim	requestListenStop
 async_postgres/pg_connection/types.nim	requeueHandoff
 async_postgres/pg_connection/types.nim	requireStaged
 async_postgres/pg_connection/types.nim	resetWireState
+async_postgres/pg_connection/types.nim	restoreClientSession
 async_postgres/pg_connection/types.nim	retiredInScope
 async_postgres/pg_connection/types.nim	secretKey
 async_postgres/pg_connection/types.nim	sendBuf

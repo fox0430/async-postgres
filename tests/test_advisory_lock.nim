@@ -884,8 +884,15 @@ suite "Advisory Lock: counter accounting":
 
     waitFor t()
 
+proc parks(pool: PgPool): Future[bool] {.async.} =
+  ## Whether a release's background reset parks the conn within 5 s.
+  let deadline = Moment.now() + seconds(5)
+  while (pool.idle.len != 1 or pool.active != 0) and Moment.now() < deadline:
+    await sleepAsync(milliseconds(5))
+  return pool.idle.len == 1 and pool.active == 0
+
 suite "Advisory Lock: pool integration":
-  test "pool discards connection that still holds a session lock":
+  test "a raw release unlocks a held session lock and keeps the connection":
     proc t() {.async.} =
       let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
       let pool = await newPool(cfg)
@@ -896,10 +903,11 @@ suite "Advisory Lock: pool integration":
       await conn.advisoryLock(71001'i64)
       let closeBefore = pool.metrics.closeCount
       conn.release()
-      doAssert pool.idle.len == 0
-      doAssert pool.metrics.closeCount - closeBefore == 1
+      doAssert await pool.parks()
+      doAssert pool.metrics.closeCount == closeBefore
+      doAssert not conn.sessionLockDirty
 
-      # A different session can immediately take the same key.
+      # A different session can take the same key.
       let probe = await connect(plainConfig())
       defer:
         await probe.close()
@@ -909,12 +917,11 @@ suite "Advisory Lock: pool integration":
 
     waitFor t()
 
-  test "explicit unlock alone does not spare direct release from discarding":
-    # advisoryUnlock decrements the counter but not the sticky dirty flag,
-    # so a direct release() (bypassing resetSession) still discards the
-    # connection. Use advisoryUnlockAll or withConnection to keep it.
+  test "an explicit unlock leaves the sticky flag for the release's reset":
+    # advisoryUnlock decrements the counter but not the sticky dirty flag, so
+    # the reset still unlocks everything, even with no resetQuery.
     proc t() {.async.} =
-      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
+      let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1, resetQuery = "")
       let pool = await newPool(cfg)
       defer:
         await pool.close()
@@ -926,8 +933,9 @@ suite "Advisory Lock: pool integration":
       doAssert conn.sessionLockDirty
       let closeBefore = pool.metrics.closeCount
       conn.release()
-      doAssert pool.idle.len == 0
-      doAssert pool.metrics.closeCount - closeBefore == 1
+      doAssert await pool.parks()
+      doAssert pool.metrics.closeCount == closeBefore
+      doAssert not conn.sessionLockDirty
 
     waitFor t()
 
@@ -945,7 +953,7 @@ suite "Advisory Lock: pool integration":
       doAssert conn.heldSessionLocks == 0
       let closeBefore = pool.metrics.closeCount
       conn.release()
-      doAssert pool.idle.len == 1
+      doAssert await pool.parks()
       doAssert pool.metrics.closeCount == closeBefore
 
     waitFor t()
@@ -962,7 +970,7 @@ suite "Advisory Lock: pool integration":
           doAssert conn.heldSessionLocks == 1
         doAssert conn.heldSessionLocks == 0
 
-      doAssert pool.idle.len == 1
+      doAssert await pool.parks()
 
     waitFor t()
 
@@ -977,8 +985,8 @@ suite "Advisory Lock: pool integration":
 
       pool.withConnection(conn):
         await conn.advisoryLock(71006'i64)
-      # resetSession ran (via withConnection) and cleared the counter.
-      doAssert pool.idle.len == 1
+      # The background reset cleared the counter.
+      doAssert await pool.parks()
       let pooled = pool.idle[0]
       doAssert pooled.conn.heldSessionLocks == 0
 
@@ -995,7 +1003,7 @@ suite "Advisory Lock: pool integration":
   test "typed unlock of raw-acquired key does not leak the tracked lock":
     # Mixed-usage regression: raw pg_advisory_lock followed by typed
     # advisoryUnlock decrements the counter but must not clear the sticky
-    # dirty flag, so the still-held tracked lock forces a pool-side cleanup
+    # dirty flag, so the still-held tracked lock gets a pool-side unlock
     # rather than being handed to the next borrower.
     proc t() {.async.} =
       let cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
@@ -1013,10 +1021,10 @@ suite "Advisory Lock: pool integration":
 
       let closeBefore = pool.metrics.closeCount
       conn.release()
-      doAssert pool.idle.len == 0
-      doAssert pool.metrics.closeCount - closeBefore == 1
+      doAssert await pool.parks()
+      doAssert pool.metrics.closeCount == closeBefore
 
-      # K1 is released server-side by the close, so a fresh session can take it.
+      # The reset unlocked K1 server-side, so a fresh session can take it.
       let probe = await connect(plainConfig())
       defer:
         await probe.close()
@@ -1037,7 +1045,7 @@ suite "Advisory Lock: pool integration":
         discard await conn.exec("SELECT pg_advisory_lock(71010)") # raw K2
         discard await conn.advisoryUnlock(71010'i64) # steals counter to 0
       # resetSession keyed off dirty flag → unlock_all cleared K1 too.
-      doAssert pool.idle.len == 1
+      doAssert await pool.parks()
       doAssert not pool.idle[0].conn.sessionLockDirty
       doAssert pool.idle[0].conn.heldSessionLocks == 0
 
@@ -1073,16 +1081,16 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
       pool.withConnection(conn):
         await conn.advisoryLock(72001'i64)
         await conn.advisoryLockShared(72002'i64)
-      # withConnection release → resetSession → onLeakedSessionLocks fires once,
-      # pg_advisory_unlock_all clears the counter, and the connection returns
-      # to the idle queue (no resetQuery configured).
+      # withConnection's background reset fires onLeakedSessionLocks once,
+      # the default resetQuery clears the counter, and the connection returns
+      # to the idle queue.
+      doAssert await pool.parks()
       doAssert log.counts == @[2]
-      doAssert pool.idle.len == 1
       doAssert pool.idle[0].conn.heldSessionLocks == 0
 
     waitFor t()
 
-  test "manual release path fires hook and discards connection":
+  test "manual release path fires the hook once and keeps the connection":
     proc t() {.async.} =
       let log = LeakLog()
       var cfg = initPoolConfig(plainConfig(), minSize = 0, maxSize = 1)
@@ -1094,8 +1102,10 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
       let conn = await pool.acquire()
       await conn.advisoryLock(72003'i64)
       conn.release()
+      # The background reset reports and unlocks it.
+      doAssert await pool.parks()
       doAssert log.counts == @[1]
-      doAssert pool.idle.len == 0
+      doAssert pool.idle[0].conn.heldSessionLocks == 0
 
     waitFor t()
 
@@ -1117,8 +1127,8 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
         await conn.advisoryLock(72004'i64)
         discard await conn.advisoryUnlock(72004'i64)
 
+      doAssert await pool.parks()
       doAssert log.counts == @[0]
-      doAssert pool.idle.len == 1
 
     waitFor t()
 
@@ -1134,8 +1144,8 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
       pool.withConnection(conn):
         discard await conn.exec("SELECT 1")
 
+      doAssert await pool.parks()
       doAssert log.counts.len == 0
-      doAssert pool.idle.len == 1
 
     waitFor t()
 
@@ -1160,8 +1170,8 @@ suite "Advisory Lock: onLeakedSessionLocks tracer hook":
         doAssert conn.sessionLockDirty
         # tracked lock 72005 is still held on the server side.
 
+      doAssert await pool.parks()
       doAssert log.counts == @[0] # dirty-based fire with under-reported count
-      doAssert pool.idle.len == 1
       doAssert pool.idle[0].conn.heldSessionLocks == 0
       doAssert not pool.idle[0].conn.sessionLockDirty
       # Verify the still-held tracked lock was actually cleared by cleanup.

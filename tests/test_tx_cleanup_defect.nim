@@ -4,9 +4,9 @@
 ## A `Defect` raised by the cleanup SQL itself (emulated by a writer whose
 ## `write` raises `AssertionDefect`) must be swallowed and reported via
 ## `onCleanupSkipped(reason = csrCleanupFailed)` — it must never mask the
-## original body error the enclosing `except` arm re-raises. The pool
-## deadline macros must additionally wrap a release-path Defect in
-## `PgPoolError` (the Defect as `parent`).
+## original body error the enclosing `except` arm re-raises. A Defect in the
+## pool deadline macros' release, which resets in the background, reaches
+## `onPoolCloseError` wrapped in `PgPoolError` (the Defect as `parent`).
 ##
 ## The mock server replies `ReadyForQuery('T')` to the BEGIN / SAVEPOINT
 ## query so the cleanup guard admits the ROLLBACK attempt; the failing
@@ -59,6 +59,17 @@ when hasChronos:
       sslMode: sslDisable,
       tracer: tracer,
     )
+
+  proc closeErrors(pool: PgPool): ref seq[ref CatchableError] =
+    ## Errors `pool` reports to `onPoolCloseError`, recorded on a new tracer.
+    let log = new seq[ref CatchableError]
+    let tracer = PgTracer()
+    tracer.onPoolCloseError = proc(
+        data: TracePoolCloseErrorData
+    ) {.gcsafe, raises: [].} =
+      log[].add(data.err)
+    pool.config.tracer = tracer
+    log
 
   proc makePool(
       maxSize: int = 5, resetQuery: string = "", pipelined: bool = false
@@ -215,7 +226,7 @@ when hasChronos:
 
       waitFor t()
 
-    test "pool.withTransactionDeadline: release-path Defect wraps in PgPoolError with the Defect as parent":
+    test "pool.withTransactionDeadline: a release-path Defect reaches onPoolCloseError":
       proc t() {.async.} =
         let ms = startMockServer()
         var serverClient: MockClient
@@ -232,24 +243,22 @@ when hasChronos:
         let origWriter = conn.writer
 
         let pool = makePool()
+        let errs = pool.closeErrors()
         conn.ownerPool = pool
         pool.idle.addLast(conn.toPooled())
 
-        var caught: ref PgPoolError = nil
-        try:
-          pool.withTransactionDeadline(c, seconds(5)):
-            # COMMIT is the first write after the swap; the release-path
-            # unlock_all (session reset) is the second — it raises.
-            c.sessionLockDirty = true
-            c.writer = countingWriter(2)
-        except PgPoolError as e:
-          caught = e
+        pool.withTransactionDeadline(c, seconds(5)):
+          # COMMIT is the first write after the swap; the release-path
+          # unlock_all (session reset) is the second — it raises.
+          c.sessionLockDirty = true
+          c.writer = countingWriter(2)
         await serverFut
 
-        doAssert caught != nil, "the release-path Defect must surface as PgPoolError"
-        doAssert caught.parent of AssertionDefect,
+        doAssert errs[].len == 1, $errs[].len
+        doAssert errs[][0] of PgPoolError
+        doAssert errs[][0].parent of AssertionDefect,
           "the Defect must be preserved as parent"
-        doAssert caught.parent.msg == "boom"
+        doAssert errs[][0].parent.msg == "boom"
         # The conn was discarded (session reset failed while dirty), not parked.
         doAssert pool.idle.len == 0
         doAssert pool.active == 0
@@ -261,7 +270,7 @@ when hasChronos:
 
       waitFor t()
 
-    test "pool.withTransactionRetryDeadline: release-path Defect wraps in PgPoolError and is never retried":
+    test "pool.withTransactionRetryDeadline: a release-path Defect reaches onPoolCloseError, never retried":
       proc t() {.async.} =
         let ms = startMockServer()
         var serverClient: MockClient
@@ -280,24 +289,22 @@ when hasChronos:
         let origWriter = conn.writer
 
         let pool = makePool()
+        let errs = pool.closeErrors()
         conn.ownerPool = pool
         pool.idle.addLast(conn.toPooled())
 
-        var caught: ref PgPoolError = nil
-        try:
-          pool.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), c, seconds(5)):
-            # COMMIT is the first write after the swap; the release-path
-            # unlock_all (session reset) is the second — it raises.
-            c.sessionLockDirty = true
-            c.writer = countingWriter(2)
-        except PgPoolError as e:
-          caught = e
+        pool.withTransactionRetryDeadline(RetryOptions(maxAttempts: 3), c, seconds(5)):
+          # COMMIT is the first write after the swap; the release-path
+          # unlock_all (session reset) is the second — it raises.
+          c.sessionLockDirty = true
+          c.writer = countingWriter(2)
         await serverFut
 
-        doAssert caught != nil, "the release-path Defect must surface as PgPoolError"
-        doAssert caught.parent of AssertionDefect,
+        doAssert errs[].len == 1, $errs[].len
+        doAssert errs[][0] of PgPoolError
+        doAssert errs[][0].parent of AssertionDefect,
           "the Defect must be preserved as parent"
-        doAssert caught.parent.msg == "boom"
+        doAssert errs[][0].parent.msg == "boom"
         doAssert beginCount == 1,
           "a Defect must never be retried (BEGIN ran " & $beginCount & " times)"
         # The conn was discarded (session reset failed while dirty), not parked.
