@@ -48,6 +48,33 @@ suite "TCP_NODELAY":
     waitFor t()
     check noDelay
 
+when defined(linux):
+  suite "configureDialed":
+    test "a dialed stream gets the keepalive options, as connect and cancel use it":
+      var keepAlive, userTimeout: cint
+
+      proc t() {.async.} =
+        let ms = startMockServer()
+        let accepted = ms.accept()
+        var config = ConnConfig(keepAlive: true, tcpUserTimeout: 4321)
+        let dialed = await dialTargets(
+          await resolveTargets("127.0.0.1", ms.port), dialUserTimeout(config)
+        )
+        configureDialed(dialed, config)
+        when hasChronos:
+          let fd = SocketHandle(dialed.stream.fd)
+        elif hasAsyncDispatch:
+          let fd = dialed.stream.getFd()
+        keepAlive = getSockOptInt(fd, SOL_SOCKET, SO_KEEPALIVE).cint
+        userTimeout = getSockOptInt(fd, cint(posix.IPPROTO_TCP), TCP_USER_TIMEOUT).cint
+        await closeClient(dialed.stream)
+        await closeClient(await accepted)
+        await closeServer(ms)
+
+      waitFor t()
+      check keepAlive != 0
+      check userTimeout == 4321
+
 # `configureKeepalive` is posix-only: Windows has no keepalive path at all, so
 # `keepAlive` and its timing options are ignored there (see
 # buffer_io.configureKeepalive).
@@ -106,6 +133,19 @@ when defined(posix):
         check getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPALIVE) == 42
         check getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPINTVL) == 7
         check getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_KEEPCNT) == 3
+
+    when defined(linux):
+      test "tcpUserTimeout sets TCP_USER_TIMEOUT only with keepAlive":
+        for keepAlive in [true, false]:
+          let fd = makeSocket()
+          defer:
+            discard close(fd)
+          var config = ConnConfig()
+          config.keepAlive = keepAlive
+          config.tcpUserTimeout = 30000
+          configureKeepalive(fd, config)
+          check getIntSockOpt(fd, cint(posix.IPPROTO_TCP), TCP_USER_TIMEOUT) ==
+            (if keepAlive: 30000 else: 0)
 
     test "zero values use OS defaults (only SO_KEEPALIVE set)":
       let fd = makeSocket()

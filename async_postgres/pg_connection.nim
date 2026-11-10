@@ -148,7 +148,7 @@ export dsn.parseDsn
 export dsn.validateConnConfig
 
 # `buffer_io` — public connection I/O and keepalive surface.
-export buffer_io.isUnixSocket
+export types.isUnixSocket
 export buffer_io.unixSocketPath
 export buffer_io.getHosts
 export buffer_io.makeCopyOutCallback

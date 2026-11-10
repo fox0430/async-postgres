@@ -117,11 +117,13 @@ async_postgres/pg_connection/buffer_io.nim	IdleProbe.ipQuiet
 async_postgres/pg_connection/buffer_io.nim	RecvWatch
 async_postgres/pg_connection/buffer_io.nim	cancel
 async_postgres/pg_connection/buffer_io.nim	closeTransport
+async_postgres/pg_connection/buffer_io.nim	configureDialed
 async_postgres/pg_connection/buffer_io.nim	configureKeepalive
 async_postgres/pg_connection/buffer_io.nim	configureTcpNoDelay
 async_postgres/pg_connection/buffer_io.nim	configureTcpNoDelay#2
 async_postgres/pg_connection/buffer_io.nim	dialTargets
 async_postgres/pg_connection/buffer_io.nim	dialTargets#2
+async_postgres/pg_connection/buffer_io.nim	dialUserTimeout
 async_postgres/pg_connection/buffer_io.nim	idleProbe
 async_postgres/pg_connection/buffer_io.nim	nextMessage
 async_postgres/pg_connection/buffer_io.nim	oneLine
@@ -220,6 +222,7 @@ async_postgres/pg_connection/types.nim	TCP_KEEPCNT#2
 async_postgres/pg_connection/types.nim	TCP_KEEPIDLE
 async_postgres/pg_connection/types.nim	TCP_KEEPINTVL
 async_postgres/pg_connection/types.nim	TCP_KEEPINTVL#2
+async_postgres/pg_connection/types.nim	TCP_USER_TIMEOUT
 async_postgres/pg_connection/types.nim	`createdAt=`
 async_postgres/pg_connection/types.nim	`host=`
 async_postgres/pg_connection/types.nim	`listenError=`

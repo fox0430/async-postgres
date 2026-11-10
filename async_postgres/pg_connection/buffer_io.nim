@@ -6,7 +6,7 @@
 ## - Background read watch for COPY IN early-error detection (`RecvWatch`)
 ## - Transport teardown (`closeTransport`)
 ## - TCP keepalive / TCP_NODELAY socket options
-## - Host helpers (`isUnixSocket`, `unixSocketPath`, `getHosts`) and dialing
+## - Host helpers (`unixSocketPath`, `getHosts`) and dialing
 ##   (`resolveTargets`, `dialTargets`, `socketError`, `oneLine`); a name is
 ##   looked up on a thread, one per name and port in flight, as `getaddrinfo`
 ##   blocks
@@ -83,11 +83,6 @@ type
     ipDead ## FIN/RST observed
 
 # Host / address helpers
-
-proc isUnixSocket*(host: string): bool {.inline.} =
-  ## True if `host` represents a Unix socket directory (starts with '/').
-  ## Compatible with libpq behavior.
-  host.len > 0 and host[0] == '/'
 
 proc unixSocketPath*(host: string, port: int): string =
   ## Build the libpq-compatible Unix socket file path: ``{dir}/.s.PGSQL.{port}``.
@@ -395,14 +390,32 @@ when hasChronos:
         result.add(ta)
       it = it.ai_next
 
-  proc dialTargets*(targets: seq[DialTarget]): Future[Dialed] {.async.} =
+  proc dialTargets*(
+      targets: seq[DialTarget], userTimeout = 0
+  ): Future[Dialed] {.async.} =
     ## Connect to the first of ``targets`` that accepts, as libpq does.
+    ## ``userTimeout`` (ms, Linux only) bounds each TCP handshake, as
+    ## ``TCP_USER_TIMEOUT`` set before ``connect`` does in libpq.
     if targets.len == 0:
       raise newException(ValueError, "dialTargets: no address to dial")
     var failures: seq[DialFailure]
     for t in targets:
       try:
-        return (stream: await connect(t), target: t)
+        let dialing = connect(t)
+        when defined(linux):
+          # chronos opens the socket inside `connect`, out of reach of
+          # setsockopt; time the handshake out as the kernel would. It checks
+          # only when a SYN retransmit is due, the first after 1s.
+          if userTimeout > 0 and t.family != AddressFamily.Unix:
+            let bound = milliseconds(max(userTimeout, 1000))
+            try:
+              return (stream: await dialing.wait(bound), target: t)
+            except AsyncTimeoutError:
+              let code = OSErrorCode(posix.ETIMEDOUT)
+              let e = (ref TransportOsError)(msg: osErrorMsg(code), code: code)
+              failures.add((t.shown, (ref CatchableError)(e)))
+              continue
+        return (stream: await dialing, target: t)
       except TransportError as e:
         failures.add((t.shown, (ref CatchableError)(e)))
     raise dialError(failures)
@@ -526,8 +539,12 @@ elif hasAsyncDispatch:
         else:
           fut.fail(newOSError(err))
 
-  proc dialTargets*(targets: seq[DialTarget]): Future[Dialed] {.async.} =
+  proc dialTargets*(
+      targets: seq[DialTarget], userTimeout = 0
+  ): Future[Dialed] {.async.} =
     ## Connect to the first of ``targets`` that accepts, as libpq does.
+    ## ``userTimeout`` (ms, Linux only) is set as ``TCP_USER_TIMEOUT`` before
+    ## ``connect``, as libpq does, so it bounds the handshake too.
     if targets.len == 0:
       raise newException(ValueError, "dialTargets: no address to dial")
     var failures: seq[DialFailure]
@@ -549,6 +566,21 @@ elif hasAsyncDispatch:
           sock = newAsyncSocket(
             t.domain, SockType.SOCK_STREAM, Protocol.IPPROTO_TCP, buffered = false
           )
+          when defined(linux):
+            if userTimeout > 0:
+              var v = cint(userTimeout)
+              if setsockopt(
+                sock.posixFd,
+                cint(posix.IPPROTO_TCP),
+                TCP_USER_TIMEOUT,
+                addr v,
+                sizeof(v).SockLen,
+              ) < 0:
+                # A config fault, not this address's: every one would fail.
+                raise newException(
+                  PgConnectionError,
+                  "Failed to set TCP_USER_TIMEOUT: " & $strerror(errno),
+                )
           when defined(posix):
             await sock.connectResolved(t)
           else:
@@ -1221,6 +1253,15 @@ when defined(posix):
     if not config.keepAlive:
       return
     setSockOptInt(fd, SOL_SOCKET, SO_KEEPALIVE, 1, "SO_KEEPALIVE")
+    when defined(linux):
+      if config.tcpUserTimeout > 0:
+        setSockOptInt(
+          fd,
+          cint(posix.IPPROTO_TCP),
+          TCP_USER_TIMEOUT,
+          cint(config.tcpUserTimeout),
+          "TCP_USER_TIMEOUT",
+        )
     when defined(linux) or defined(macosx):
       let ipproto = cint(posix.IPPROTO_TCP)
       if config.keepAliveIdle > 0:
@@ -1255,3 +1296,29 @@ elif defined(windows):
     discard winlean.setsockopt(
       fd, IpprotoTcp, winlean.TCP_NODELAY, addr optval, winlean.SockLen(sizeof(optval))
     )
+
+proc dialUserTimeout*(config: ConnConfig): int =
+  ## ``config``'s ``tcpUserTimeout`` for ``dialTargets``: libpq sets it before
+  ## connect, and only with keepalives on.
+  if config.keepAlive: config.tcpUserTimeout else: 0
+
+proc configureDialed*(dialed: Dialed, config: ConnConfig) =
+  ## ``TCP_NODELAY`` and the keepalive options on a dialed TCP stream; a Unix
+  ## socket is left as it is. Keepalive stays POSIX-only (see
+  ## ``ConnConfig.keepAlive``).
+  when hasChronos:
+    if dialed.target.family == AddressFamily.Unix:
+      return
+    when defined(posix):
+      configureTcpNoDelay(posix.SocketHandle(dialed.stream.fd))
+      configureKeepalive(posix.SocketHandle(dialed.stream.fd), config)
+    elif defined(windows):
+      configureTcpNoDelay(winlean.SocketHandle(dialed.stream.fd))
+  elif hasAsyncDispatch:
+    when defined(posix):
+      if dialed.target.domain == Domain.AF_UNIX:
+        return
+      configureTcpNoDelay(dialed.stream.posixFd)
+      configureKeepalive(dialed.stream.posixFd, config)
+    elif defined(windows):
+      configureTcpNoDelay(dialed.stream.getFd())
