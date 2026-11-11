@@ -4,6 +4,7 @@ async_postgres.nim	export pg_client
 async_postgres.nim	export pg_connection
 async_postgres.nim	export pg_largeobject
 async_postgres.nim	export pg_pool.AfterConnectHook
+async_postgres.nim	export pg_pool.DefaultResetQuery
 async_postgres.nim	export pg_pool.PgPool
 async_postgres.nim	export pg_pool.PoolConfig
 async_postgres.nim	export pg_pool.PoolMetrics
@@ -970,6 +971,7 @@ async_postgres/pg_largeobject.nim	makeLoReadCallback
 async_postgres/pg_largeobject.nim	makeLoWriteCallback
 async_postgres/pg_largeobject.nim	oid
 async_postgres/pg_largeobject.nim	withLargeObject
+async_postgres/pg_pool.nim	DefaultResetQuery
 async_postgres/pg_pool.nim	PgPool
 async_postgres/pg_pool.nim	PoolConfig
 async_postgres/pg_pool.nim	PoolConfig.acquireTimeout

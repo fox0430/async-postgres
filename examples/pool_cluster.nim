@@ -50,7 +50,7 @@ proc main() {.async.} =
   # Handle pattern: use `readConnection` / `writeConnection` when the borrowed
   # connection must outlive a single lexical scope — e.g. selected dynamically,
   # stored on a struct, or threaded through multiple helpers. The caller must
-  # `defer: h.release()`, and `resetSession` is NOT run automatically.
+  # `defer: h.release()`, which resets the session in the background.
   block:
     let useReplica = true
     let h =

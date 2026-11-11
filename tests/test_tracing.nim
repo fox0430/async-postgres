@@ -840,6 +840,11 @@ suite "Tracing: pool acquire/release":
 
       doAssert log.poolReleaseStarts.len == 1
       doAssert log.poolReleaseStarts[0].hasConn
+      # The end fires once the background session reset finishes (on chronos
+      # it can before `release` returns).
+      let deadline = Moment.now() + seconds(5)
+      while log.poolReleaseEnds.len == 0 and Moment.now() < deadline:
+        await sleepAsync(milliseconds(5))
       doAssert log.poolReleaseEnds.len == 1
       doAssert not log.poolReleaseEnds[0].wasClosed
       doAssert not log.poolReleaseEnds[0].handedToWaiter

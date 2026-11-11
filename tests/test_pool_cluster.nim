@@ -31,6 +31,8 @@ proc makePool(minSize: int = 0, maxSize: int = 5): PgPool =
       maxSize: maxSize,
       maxWaiters: -1,
       maintenanceInterval: seconds(30),
+      # Session resets are covered by test_pool_session_reset.
+      resetQuery: "",
     ),
     idle: initDeque[PooledConn](),
     active: 0,
@@ -52,6 +54,24 @@ proc makeCluster(
     fallbackTimeout: fallbackTimeout,
     closed: false,
   )
+
+when hasChronos:
+  proc closeErrors(pool: PgPool): ref seq[ref CatchableError] =
+    ## Errors `pool` reports to `onPoolCloseError`, recorded on a new tracer.
+    let log = new seq[ref CatchableError]
+    let tracer = PgTracer()
+    tracer.onPoolCloseError = proc(
+        data: TracePoolCloseErrorData
+    ) {.gcsafe, raises: [].} =
+      log[].add(data.err)
+    pool.config.tracer = tracer
+    log
+
+  func hasWrappedDefect(log: seq[ref CatchableError]): bool =
+    for e in log:
+      if e of PgPoolError and (ref PgPoolError)(e).kind == pekDefectWrapped and
+          e.parent of Defect:
+        return true
 
 proc mockIdle(pool: PgPool, conn: PgConnection) =
   ## Place a mock connection in the pool's idle queue, wiring `ownerPool`
@@ -251,49 +271,41 @@ suite "Exception safety":
     waitFor t()
 
   when hasChronos:
-    test "withReadConnection wraps a release-path Defect in PgPoolError":
-      # Regression: a Defect raised by the release path (resetSession's
-      # synchronous prelude — here the unlock_all exec) must surface as
-      # PgPoolError instead of escaping raw, since chronos re-raises Defects
-      # eagerly from continuations.
+    test "withReadConnection reports a release-path Defect to onPoolCloseError":
+      # The background reset (here the unlock_all exec) raises: the caller gets
+      # the body's outcome, and the Defect, wrapped, goes to the tracer.
       proc t() {.async.} =
         let cluster = makeCluster()
+        let errs = cluster.replica.closeErrors()
         let conn = mockConn()
         conn.writer = defectWriter()
         conn.sessionLockDirty = true # forces unlock_all through the writer
         cluster.replica.mockIdle(conn)
 
-        var caught = false
-        try:
-          cluster.withReadConnection(c):
-            doAssert cluster.replica.active == 1
-        except PgPoolError:
-          caught = true
+        cluster.withReadConnection(c):
+          doAssert cluster.replica.active == 1
 
-        doAssert caught
+        doAssert errs[].hasWrappedDefect(), $errs[].len
         # The conn was discarded (session reset failed), so it is not idle.
         doAssert cluster.replica.active == 0
         doAssert cluster.replica.idle.len == 0
 
       waitFor t()
 
-    test "withWriteConnection wraps a release-path Defect in PgPoolError":
-      # Regression: same as the withReadConnection case, on the primary pool.
+    test "withWriteConnection reports a release-path Defect to onPoolCloseError":
+      # Same as the withReadConnection case, on the primary pool.
       proc t() {.async.} =
         let cluster = makeCluster()
+        let errs = cluster.primary.closeErrors()
         let conn = mockConn()
         conn.writer = defectWriter()
         conn.sessionLockDirty = true # forces unlock_all through the writer
         cluster.primary.mockIdle(conn)
 
-        var caught = false
-        try:
-          cluster.withWriteConnection(c):
-            doAssert cluster.primary.active == 1
-        except PgPoolError:
-          caught = true
+        cluster.withWriteConnection(c):
+          doAssert cluster.primary.active == 1
 
-        doAssert caught
+        doAssert errs[].hasWrappedDefect(), $errs[].len
         doAssert cluster.primary.active == 0
         doAssert cluster.primary.idle.len == 0
 
@@ -856,10 +868,12 @@ suite "newPoolCluster concurrent warmup":
 
       let primaryFut = primaryHandler()
       let replicaFut = replicaHandler()
-      var pCfg =
-        initPoolConfig(clusterMockConfig(primaryMs.port), minSize = 1, maxSize = 1)
-      var rCfg =
-        initPoolConfig(clusterMockConfig(replicaMs.port), minSize = 1, maxSize = 1)
+      var pCfg = initPoolConfig(
+        clusterMockConfig(primaryMs.port), resetQuery = "", minSize = 1, maxSize = 1
+      )
+      var rCfg = initPoolConfig(
+        clusterMockConfig(replicaMs.port), resetQuery = "", minSize = 1, maxSize = 1
+      )
       pCfg.connConfig.connectTimeout = seconds(1)
       rCfg.connConfig.connectTimeout = seconds(1)
       try:
@@ -909,9 +923,12 @@ suite "newPoolCluster concurrent warmup":
             discard
 
       let serverFut = replicaHandler()
-      var pCfg = initPoolConfig(clusterMockConfig(deadPort), minSize = 1, maxSize = 1)
-      var rCfg =
-        initPoolConfig(clusterMockConfig(replicaMs.port), minSize = 1, maxSize = 1)
+      var pCfg = initPoolConfig(
+        clusterMockConfig(deadPort), resetQuery = "", minSize = 1, maxSize = 1
+      )
+      var rCfg = initPoolConfig(
+        clusterMockConfig(replicaMs.port), resetQuery = "", minSize = 1, maxSize = 1
+      )
       pCfg.connConfig.connectTimeout = milliseconds(300)
       rCfg.connConfig.connectTimeout = seconds(2)
       try:
@@ -954,9 +971,12 @@ suite "newPoolCluster concurrent warmup":
             discard
 
       let serverFut = primaryHandler()
-      var pCfg =
-        initPoolConfig(clusterMockConfig(primaryMs.port), minSize = 1, maxSize = 1)
-      var rCfg = initPoolConfig(clusterMockConfig(deadPort), minSize = 1, maxSize = 1)
+      var pCfg = initPoolConfig(
+        clusterMockConfig(primaryMs.port), resetQuery = "", minSize = 1, maxSize = 1
+      )
+      var rCfg = initPoolConfig(
+        clusterMockConfig(deadPort), resetQuery = "", minSize = 1, maxSize = 1
+      )
       pCfg.connConfig.connectTimeout = seconds(2)
       rCfg.connConfig.connectTimeout = milliseconds(300)
       when defined(windows):
@@ -981,10 +1001,12 @@ suite "newPoolCluster concurrent warmup":
       proc t() {.async.} =
         let primaryMs = startMockServer()
         let replicaMs = startMockServer()
-        var pCfg =
-          initPoolConfig(clusterMockConfig(primaryMs.port), minSize = 1, maxSize = 1)
-        var rCfg =
-          initPoolConfig(clusterMockConfig(replicaMs.port), minSize = 1, maxSize = 1)
+        var pCfg = initPoolConfig(
+          clusterMockConfig(primaryMs.port), resetQuery = "", minSize = 1, maxSize = 1
+        )
+        var rCfg = initPoolConfig(
+          clusterMockConfig(replicaMs.port), resetQuery = "", minSize = 1, maxSize = 1
+        )
         pCfg.connConfig.connectTimeout = seconds(5)
         rCfg.connConfig.connectTimeout = seconds(5)
         let clusterFut = newPoolCluster(pCfg, rCfg)
@@ -1024,7 +1046,9 @@ suite "newPoolCluster validation":
       let deadMs = startMockServer()
       let deadPort = deadMs.port
       await closeServer(deadMs)
-      let cfg = initPoolConfig(clusterMockConfig(deadPort), minSize = 1, maxSize = 1)
+      let cfg = initPoolConfig(
+        clusterMockConfig(deadPort), resetQuery = "", minSize = 1, maxSize = 1
+      )
       try:
         discard await newPoolCluster(
           cfg, cfg, fallback = fallbackPrimary, fallbackTimeout = milliseconds(-1)

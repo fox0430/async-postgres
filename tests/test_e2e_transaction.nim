@@ -47,8 +47,7 @@ const slowResetQuery = "SELECT pg_sleep(1)"
 
 proc resetStartTracer(): (PgTracer, ref Moment, ref bool) =
   ## Records when the pool's resetQuery (`slowResetQuery`) starts — the
-  ## release is the only path that runs it, so a deadline fired during the
-  ## release is distinguishable from one fired during the body.
+  ## release is the only path that runs it.
   let startedAt = new Moment
   let started = new bool
   let tracer = PgTracer()
@@ -60,6 +59,14 @@ proc resetStartTracer(): (PgTracer, ref Moment, ref bool) =
       startedAt[] = Moment.now()
     return nil
   (tracer, startedAt, started)
+
+proc drains(pool: PgPool, within = seconds(5)): Future[bool] {.async.} =
+  ## Whether `activeCount` reaches 0 within `within`: a release resets in the
+  ## background before it frees the slot.
+  let deadline = Moment.now() + within
+  while pool.activeCount != 0 and Moment.now() < deadline:
+    await sleepAsync(milliseconds(5))
+  return pool.activeCount == 0
 
 suite "E2E: Transaction":
   test "withTransaction commits on success":
@@ -2254,6 +2261,7 @@ suite "E2E: Deadline-bounded Transaction":
         "CREATE TABLE test_ptxd_defect (id serial PRIMARY KEY, val text)"
       )
 
+      let closesBefore = pool.metrics.closeCount
       var caught: ref PgPoolError = nil
       try:
         {.push warning[UnreachableCode]: off.} # body always raises
@@ -2269,14 +2277,15 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert caught != nil, "body Defect must surface as PgPoolError"
       doAssert caught.parent of Defect,
         "the original Defect must be preserved as parent"
-      doAssert pool.activeCount == 0, "connection must be released"
+      doAssert await pool.drains(), "connection must be released"
       # The tracer records the ROLLBACK the Defect arm's cleanup issues, so
-      # ROLLBACK execution is observed directly. `idleCount` alone would be
+      # ROLLBACK execution is observed directly. `idleCount` would be
       # indirect: a skipped ROLLBACK discards the conn, but the maintenance
       # loop could replenish to minSize and fake the idle slot.
       doAssert rollbacks[].len == 1,
         "the ROLLBACK cleanup must have run exactly once (was " & $rollbacks[].len & ")"
-      doAssert pool.idleCount == 1, "connection must be reusable after ROLLBACK"
+      doAssert pool.metrics.closeCount == closesBefore,
+        "connection must be reusable after ROLLBACK"
       let res = await pool.query("SELECT val FROM test_ptxd_defect")
       doAssert res.rows.len == 0, "ROLLBACK must have run"
 
@@ -2285,13 +2294,10 @@ suite "E2E: Deadline-bounded Transaction":
 
     waitFor t()
 
-  test "pool.withTransactionDeadline succeeds when the deadline expires in the reset after COMMIT":
-    # The transaction committed: a PgTimeoutError would invite a retry that
-    # commits it again.
-    #
-    # A fast body plus a pg_sleep(1) resetQuery puts the 300ms deadline inside
-    # the reset with a ~280ms margin. `resetStartedAt` pins the firing point,
-    # and returning well before the reset could end shows the deadline fired.
+  test "pool.withTransactionDeadline returns at COMMIT, before a slow reset ends":
+    # The reset runs in the background, so the deadline cannot fire in it: a
+    # PgTimeoutError for the committed transaction would invite a retry that
+    # commits it again. The pg_sleep(1) resetQuery outlasts the 300ms deadline.
     proc t() {.async.} =
       let admin = await connect(plainConfig())
       defer:
@@ -2314,29 +2320,19 @@ suite "E2E: Deadline-bounded Transaction":
 
       doAssert resetStarted[], "the reset must have started before the call returned"
       doAssert resetStartedAt[] < returnedAt
-      doAssert returnedAt - startedAt < seconds(1),
-        "the call must return at the deadline, not after the reset"
+      doAssert returnedAt - startedAt < seconds(1)
+      doAssert pool.activeCount == 1, "the call must return while the reset runs"
       let res = await admin.query("SELECT count(*) FROM test_ptxd_reset")
       doAssert res.rows[0].getStr(0) == "1"
-      when hasChronos:
-        # chronos: the cancelled reset released the conn before `wait` raised.
-        doAssert pool.activeCount == 0
-      else:
-        # asyncdispatch: bodyFn finishes the ~1s reset after the call returns;
-        # 20s poll bound so slow CI does not flake.
-        var released = false
-        for _ in 0 ..< 2000:
-          if pool.activeCount == 0:
-            released = true
-            break
-          await sleepAsync(milliseconds(10))
-        doAssert released, "release must complete within the poll window"
+      # 20s bound so slow CI does not flake.
+      doAssert await pool.drains(seconds(20)),
+        "release must complete within the poll window"
 
       discard await admin.exec("DROP TABLE test_ptxd_reset")
 
     waitFor t()
 
-  test "pool.withTransactionRetryDeadline succeeds when the deadline expires in the reset after COMMIT":
+  test "pool.withTransactionRetryDeadline returns at COMMIT, before a slow reset ends":
     # Same construction as the withTransactionDeadline variant above.
     proc t() {.async.} =
       let admin = await connect(plainConfig())
@@ -2365,21 +2361,12 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert runs == 1
       doAssert resetStarted[], "the reset must have started before the call returned"
       doAssert resetStartedAt[] < returnedAt
-      doAssert returnedAt - startedAt < seconds(1),
-        "the call must return at the deadline, not after the reset"
+      doAssert returnedAt - startedAt < seconds(1)
+      doAssert pool.activeCount == 1, "the call must return while the reset runs"
       let res = await admin.query("SELECT count(*) FROM test_ptxrd_reset")
       doAssert res.rows[0].getStr(0) == "1"
-      when hasChronos:
-        doAssert pool.activeCount == 0
-      else:
-        # asyncdispatch: see the sibling test.
-        var released = false
-        for _ in 0 ..< 2000:
-          if pool.activeCount == 0:
-            released = true
-            break
-          await sleepAsync(milliseconds(10))
-        doAssert released, "release must complete within the poll window"
+      doAssert await pool.drains(seconds(20)),
+        "release must complete within the poll window"
 
       discard await admin.exec("DROP TABLE test_ptxrd_reset")
 
@@ -2656,6 +2643,7 @@ suite "E2E: Deadline-bounded Transaction":
         "CREATE TABLE test_ptrd_defect (id serial PRIMARY KEY, val text)"
       )
 
+      let closesBefore = pool.metrics.closeCount
       var attempts = 0
       var caught: ref PgPoolError = nil
       try:
@@ -2676,13 +2664,14 @@ suite "E2E: Deadline-bounded Transaction":
       doAssert caught.parent of Defect,
         "the original Defect must be preserved as parent"
       doAssert attempts == 1, "a Defect must not be retried"
-      doAssert pool.activeCount == 0, "connection must be released"
+      doAssert await pool.drains(), "connection must be released"
       # See the pool.withTransactionDeadline Defect test: the tracer observes
       # the ROLLBACK the Defect arm's cleanup issues directly, while
-      # `idleCount` alone could be faked by a maintenance-loop replenishment.
+      # `idleCount` could be faked by a maintenance-loop replenishment.
       doAssert rollbacks[].len == 1,
         "the ROLLBACK cleanup must have run exactly once (was " & $rollbacks[].len & ")"
-      doAssert pool.idleCount == 1, "connection must be reusable after ROLLBACK"
+      doAssert pool.metrics.closeCount == closesBefore,
+        "connection must be reusable after ROLLBACK"
       let res = await pool.query("SELECT val FROM test_ptrd_defect")
       doAssert res.rows.len == 0, "ROLLBACK must have run"
 
@@ -3150,7 +3139,7 @@ proc checkKeptWithoutRollback(
   ## a discarded connection would come back as a different ref.
   doAssert used != nil
   doAssert rollbacks[].len == 0, "ROLLBACK sent " & $rollbacks[].len & " time(s)"
-  doAssert pool.activeCount == 0
+  doAssert await pool.drains()
   let c = await pool.acquire()
   doAssert c == used, "the connection must be reused, not replaced"
   doAssert c.state == csReady

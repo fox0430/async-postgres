@@ -265,8 +265,8 @@ proc readConnection*(cluster: PgPoolCluster): Future[PooledConnHandle] {.async.}
   ## primary on fallback), so use it for any pool-level operations on the
   ## borrowed connection.
   ##
-  ## **No session reset on release.** Prefer `withReadConnection` when the
-  ## body is a single block and automatic `resetSession` is desired; use
+  ## `release(h)` resets the session in the background. Prefer
+  ## `withReadConnection` when the body is a single block; use
   ## `readConnection` when the handle must outlive a single lexical scope
   ## (e.g. stored in a struct, passed across `await` boundaries through
   ## multiple helpers, or selected dynamically).
@@ -280,8 +280,8 @@ proc writeConnection*(cluster: PgPoolCluster): Future[PooledConnHandle] {.async.
   ## The caller must release the handle — typically via `defer: h.release()`.
   ## Forgetting to release leaks the connection until the pool is closed.
   ##
-  ## **No session reset on release.** Prefer `withWriteConnection` when the
-  ## body is a single block and automatic `resetSession` is desired; use
+  ## `release(h)` resets the session in the background. Prefer
+  ## `withWriteConnection` when the body is a single block; use
   ## `writeConnection` when the handle must outlive a single lexical scope.
   ## For transactional work, use `cluster.withTransaction` instead — handles
   ## are not transaction-aware.

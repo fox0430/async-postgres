@@ -32,12 +32,15 @@
 ## on the same key follow standard reader/writer semantics — a shared lock
 ## blocks concurrent exclusive acquires but not other shared acquires.
 ##
-## **Pool integration:** Typed acquires set a sticky ``sessionLockDirty``
-## flag; the pool runs ``pg_advisory_unlock_all`` on return based on the
-## flag (not the counter), so a typed ``advisoryUnlock`` of a raw-acquired
-## key cannot forge a lock-free state. Raw-SQL acquires still bypass
-## tracking — callers must release them explicitly or invoke
-## ``advisoryUnlockAll`` before returning the connection.
+## **Pool integration:** The default ``resetQuery`` runs
+## ``pg_advisory_unlock_all`` on every release, raw-SQL acquires included.
+## Typed acquires also set a sticky ``sessionLockDirty`` flag, which the
+## release reports to ``onLeakedSessionLocks``; under any other
+## ``resetQuery`` (or ``""``) the pool runs ``pg_advisory_unlock_all`` itself
+## on the flag (not the counter), so a typed ``advisoryUnlock`` of a
+## raw-acquired key cannot forge a lock-free state. Raw-SQL acquires bypass
+## tracking: under a ``resetQuery`` that does not unlock, release them
+## explicitly or invoke ``advisoryUnlockAll`` before returning the connection.
 ##
 ## **Mixed raw + typed usage:** ``heldSessionLocks`` counts only typed
 ## acquires, but ``advisoryUnlock*`` decrements it whenever the server
@@ -195,7 +198,8 @@ proc advisoryUnlockAll*(
     conn: PgConnection, timeout: Duration = ZeroDuration
 ): Future[void] {.async.} =
   ## Release all session-level advisory locks held by the current session.
-  discard await conn.exec("SELECT pg_advisory_unlock_all()", timeout = timeout)
+  discard
+    await conn.exec("SELECT pg_catalog.pg_advisory_unlock_all()", timeout = timeout)
   conn.clearSessionLocks()
 
 # Transaction-level exclusive locks
