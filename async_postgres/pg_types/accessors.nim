@@ -183,10 +183,15 @@ const dynamicElemOidOnly: array[0, int32] = []
 
 func describeDynamicOid(accessor, kind: string, actual: int32): string =
   ## Error for a catalog-assigned OID, whose layout is server-side only.
-  accessor & ": wire " & kind & "=" & $actual &
+  result =
+    accessor & ": wire " & kind & "=" & $actual &
     " is a user-defined type (domain, enum, composite, range or extension);" &
     " its layout lives only in the server catalog, so a binary read cannot be" &
     " verified — use resultFormat = rfText"
+  # RowDescription reports a domain column as its base type; an array's
+  # header keeps the element domain's own OID.
+  if kind == "elemOid":
+    result.add(" (an array over a domain names the domain as its element type)")
 
 func describeUnknownOid(accessor, kind: string, expected: openArray[int32]): string =
   ## Error for an explicit wire OID 0: drop the OID metadata or use rfText.

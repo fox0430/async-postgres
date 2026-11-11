@@ -42,13 +42,33 @@ macro isCaseObject*(T: typedesc): bool =
     t = derefObjectTy(t[1][0])
   newLit(false)
 
-proc decodeValue[F](row: Row, col: int, _: typedesc[F]): F =
+proc withBoundType[E](r: PgRange[DateTime], _: typedesc[E]): PgRange[E] =
+  ## ``r`` with its bounds converted to ``E``, a ``distinct DateTime``.
+  PgRange[E](
+    isEmpty: r.isEmpty,
+    hasLower: r.hasLower,
+    hasUpper: r.hasUpper,
+    lower: PgRangeBound[E](value: E(r.lower.value), inclusive: r.lower.inclusive),
+    upper: PgRangeBound[E](value: E(r.upper.value), inclusive: r.upper.inclusive),
+  )
+
+proc withBoundType[E](mr: PgMultirange[DateTime], _: typedesc[E]): PgMultirange[E] =
+  # Via the seq: an implicit `items` resolves where the caller instantiates
+  # this, which may not import the multirange one.
+  let src = seq[PgRange[DateTime]](mr)
+  var ranges = newSeqOfCap[PgRange[E]](src.len)
+  for r in src:
+    ranges.add(withBoundType(r, E))
+  PgMultirange[E](ranges)
+
+proc decodeValue[F](row: Row, col: int, _: typedesc[F], api: static string = "to"): F =
+  ## ``api`` names the public caller in the compile error.
   mixin get
   when F is Option:
     if row.isNull(col):
       none(typeof(default(F).get))
     else:
-      some(decodeValue(row, col, typeof(default(F).get)))
+      some(decodeValue(row, col, typeof(default(F).get), api))
   elif compiles(row.get(col, F)):
     row.get(col, F)
   elif F is int:
@@ -93,6 +113,17 @@ proc decodeValue[F](row: Row, col: int, _: typedesc[F]): F =
       row.getTsTzMultirange(col)
     else:
       row.getTsMultirange(col)
+  # Bounds of a domain over a DateTime, which the range writers accept.
+  elif hasDateTimeBounds(F):
+    when F is PgRange:
+      withBoundType(
+        decodeValue(row, col, PgRange[DateTime], api), typeof(default(F).lower.value)
+      )
+    else:
+      withBoundType(
+        decodeValue(row, col, PgMultirange[DateTime], api),
+        typeof(default(F)[0].lower.value),
+      )
   elif F is enum:
     getEnum[F](row, col)
   elif F is seq[enum]:
@@ -102,19 +133,34 @@ proc decodeValue[F](row: Row, col: int, _: typedesc[F]): F =
   elif F is PgArray:
     getArrayND[typeof(default(F).elements[0].get)](row, col)
   # A domain reads as its base, so one over `DateTime` follows the column type
-  # as well. A multirange with no `get` here is not one.
+  # as well. One level at a time, so a `get` for an inner distinct type wins
+  # and an inner multirange stays one; a multirange with no `get` is not one.
   elif F is distinct and F isnot PgMultirange:
-    F(decodeValue(row, col, distinctBase(F)))
+    F(decodeValue(row, col, distinctBase(F, recursive = false), api))
   # Objects need a `get`, which pgComposite declares: a catch-all composite
   # read would also take `Time`, `Table` or a type whose `get` the caller has
   # not imported, and fail only at run time.
   else:
     {.
       error:
-        "to: no reader for " & name(F) &
+        api & ": no reader for " & name(F) &
         "; declare a `get` overload for it (pgComposite does for a composite) " &
-        "in a module imported where `to` is called"
+        "in a module imported where `" & api & "` is called"
     .}
+
+proc getDomain*[T: distinct](row: Row, col: int): T =
+  ## Read a domain column as the distinct type ``T``, the way ``to`` reads a
+  ## field of that type: with a ``get`` overload for ``T`` visible where this
+  ## is called, else as the type ``T`` is declared from, by the same rule.
+  ## A ``get`` for ``T`` must not call this for ``T``: it would call itself.
+  ## PostgreSQL sends a domain column as its base type, so a ``DateTime`` base
+  ## follows the column's type (timestamp, timestamptz or date). An array over
+  ## a domain cannot be read in binary (see ``rfBinary``).
+  decodeValue(row, col, T, "getDomain")
+
+proc getDomainOpt*[T: distinct](row: Row, col: int): Option[T] =
+  ## NULL-safe version of ``getDomain``.
+  decodeValue(row, col, Option[T], "getDomainOpt")
 
 proc fieldContext*(owner, field: string): string =
   ## Error prefix naming the field, or only its owner for a positional one.
@@ -279,7 +325,8 @@ proc to*[T: object | tuple | ref object](row: Row, _: typedesc[T]): T =
   ## ``pgComposite`` declares; either must be visible where ``to`` is called.
   ## Without one: ``Option[F]`` is ``none`` for NULL; ``int`` reads any
   ## integer column; ``DateTime``, ``seq[DateTime]`` and their ranges and
-  ## multiranges follow the column's type (timestamp, timestamptz or date); an
+  ## multiranges, with bounds of a ``distinct DateTime`` too, follow the
+  ## column's type (timestamp, timestamptz or date); an
   ## enum, ``seq`` of one or ``seq[Option]`` of one goes through ``getEnum`` /
   ## ``getEnumArray`` / ``getEnumArrayElemOpt``; ``PgArray[E]`` through
   ## ``getArrayND``; a distinct type (a domain) as its base type. Any other

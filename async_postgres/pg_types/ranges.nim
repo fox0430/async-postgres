@@ -1,4 +1,4 @@
-import std/[options, times]
+import std/[options, times, typetraits]
 
 import ../pg_protocol
 import core, decoding, encoding, accessors
@@ -283,6 +283,11 @@ proc quoteRangeElem(s: string): string =
   result.add('"')
 
 proc `$`*[T](r: PgRange[T]): string =
+  ## The range's text literal. A ``DateTime`` bound is ``times.$`` of the
+  ## value in its own zone, which suits display, but a timestamp or date range
+  ## would read its local wall clock or day. Send one with ``toPgParam``,
+  ## ``toPgTsTzRangeParam``, ``toPgDateRangeParam`` or ``toPgRangeParam``,
+  ## which write UTC.
   if r.isEmpty:
     return "empty"
   result = if r.hasLower and r.lower.inclusive: "[" else: "("
@@ -432,21 +437,37 @@ proc toPgParam*(v: PgRange[PgNumeric]): PgParam =
 
 type DateTimeBoundText =
   proc(v: DateTime): string {.nimcall, gcsafe, raises: [PgTypeError].}
-  ## The scalar text encoder of the range's element type, so bounds get the
-  ## same range check, era and zone handling as a lone value.
+  ## A bound's text encoder: the element type's scalar one where the type is
+  ## known, so bounds get the same range check, era and zone handling as a
+  ## lone value.
 
-proc formatDateTimeRangeText(
-    v: PgRange[DateTime], bound: DateTimeBoundText
+proc formatDateTimeRangeText*[T](
+    v: PgRange[T], bound: DateTimeBoundText
 ): string {.raises: [PgTypeError].} =
+  ## Sibling-only: ``user_types`` writes a composite's range field with it.
+  ## ``T`` is ``DateTime`` or a ``distinct`` of it (a domain).
   if v.isEmpty:
     return "empty"
   result = if v.hasLower and v.lower.inclusive: "[" else: "("
   if v.hasLower:
-    result.add(quoteRangeElem(bound(v.lower.value)))
+    result.add(quoteRangeElem(bound(distinctBase(T)(v.lower.value))))
   result.add(',')
   if v.hasUpper:
-    result.add(quoteRangeElem(bound(v.upper.value)))
+    result.add(quoteRangeElem(bound(distinctBase(T)(v.upper.value))))
   result.add(if v.hasUpper and v.upper.inclusive: "]" else: ")")
+
+proc hasDateTimeBounds*(F: typedesc): bool {.compileTime.} =
+  ## Sibling-only: whether ``F`` is a ``PgRange`` or ``PgMultirange`` over
+  ## ``DateTime`` or a ``distinct`` of it (a domain).
+  when F is PgRange:
+    distinctBase(typeof(default(F).lower.value)) is DateTime
+  elif F is PgMultirange:
+    # Via the seq: the multirange `[]` is declared below, and a caller that
+    # instantiates this may not import it.
+    distinctBase(typeof(default(distinctBase(F, recursive = false))[0].lower.value)) is
+      DateTime
+  else:
+    false
 
 proc toPgParam*(v: PgRange[DateTime]): PgParam =
   PgParam(
@@ -471,8 +492,36 @@ proc toPgDateRangeParam*(v: PgRange[DateTime]): PgParam =
     value: some(toBytes(formatDateTimeRangeText(v, pgDateText))),
   )
 
+proc utcInstantBoundText(v: DateTime): string {.raises: [PgTypeError].} =
+  # pgUtcInstantText's `context` parameter does not fit DateTimeBoundText.
+  pgUtcInstantText(v)
+
+proc dateTimeBoundText(oid: int32): DateTimeBoundText =
+  ## The bound encoder of a ``DateTime`` range or multirange of type ``oid``.
+  # Another OID is a range type of the caller's, whose subtype is not known
+  # here: the UTC instant reads right for timestamp, timestamptz or date.
+  case oid
+  of OidTsRange, OidTsMultirange: pgTimestampText
+  of OidTsTzRange, OidTsTzMultirange: pgTimestampTzText
+  of OidDateRange, OidDateMultirange: pgDateText
+  else: utcInstantBoundText
+
 proc toPgRangeParam*[T](v: PgRange[T], oid: int32): PgParam =
-  PgParam(oid: oid, format: 0, value: some(toBytes($v)))
+  ## Encode ``v`` in text format as the range type ``oid``. ``DateTime`` bounds
+  ## (and those of a ``distinct DateTime``) are written in UTC, as
+  ## ``toPgParam``, ``toPgTsTzRangeParam`` and ``toPgDateRangeParam`` write
+  ## them for those types, and raise ``PgTypeError`` for a bound PostgreSQL
+  ## cannot store.
+  # Effects are inferred: other element types raise what their `$` raises,
+  # as in 0.4.
+  when distinctBase(T) is DateTime:
+    PgParam(
+      oid: oid,
+      format: 0,
+      value: some(toBytes(formatDateTimeRangeText(v, dateTimeBoundText(oid)))),
+    )
+  else:
+    PgParam(oid: oid, format: 0, value: some(toBytes($v)))
 
 # Binary encoding helpers
 
@@ -783,6 +832,8 @@ proc toMultirange*[T](ranges: varargs[PgRange[T]]): PgMultirange[T] =
   PgMultirange[T](@ranges)
 
 proc `$`*[T](mr: PgMultirange[T]): string =
+  ## The multirange's text literal; a ``DateTime`` bound as in ``$`` of a
+  ## range, for display only.
   result = "{"
   let s = seq[PgRange[T]](mr)
   for i, r in s:
@@ -892,30 +943,29 @@ proc toPgParam*(v: PgMultirange[PgNumeric]): PgParam {.raises: [PgTypeError].} =
   checkPgBinLen(s.len, "multirange")
   PgParam(oid: OidNumMultirange, format: 0, value: some(toBytes(s)))
 
+proc formatDateTimeMultirangeText*[T](
+    v: PgMultirange[T], bound: DateTimeBoundText
+): string {.raises: [PgTypeError].} =
+  ## Sibling-only, as ``formatDateTimeRangeText``.
+  result = "{"
+  let ranges = seq[PgRange[T]](v)
+  for i, r in ranges:
+    if i > 0:
+      result.add(',')
+    result.add(formatDateTimeRangeText(r, bound))
+    checkPgBinLen(result.len + 1, "multirange")
+  result.add('}')
+
 proc toPgParam*(v: PgMultirange[DateTime]): PgParam {.raises: [PgTypeError].} =
   ## Encode a ts multirange. DateTime bounds are formatted via UTC so that
   ## zoned values match the scalar ``toPgParam(DateTime)`` path.
-  var s = "{"
-  let ranges = seq[PgRange[DateTime]](v)
-  for i, r in ranges:
-    if i > 0:
-      s.add(',')
-    s.add(formatDateTimeRangeText(r, pgTimestampText))
-    checkPgBinLen(s.len + 1, "multirange")
-  s.add('}')
+  let s = formatDateTimeMultirangeText(v, pgTimestampText)
   PgParam(oid: OidTsMultirange, format: 0, value: some(toBytes(s)))
 
 proc toPgTsTzMultirangeParam*(
     v: PgMultirange[DateTime]
 ): PgParam {.raises: [PgTypeError].} =
-  var s = "{"
-  let ranges = seq[PgRange[DateTime]](v)
-  for i, r in ranges:
-    if i > 0:
-      s.add(',')
-    s.add(formatDateTimeRangeText(r, pgTimestampTzText))
-    checkPgBinLen(s.len + 1, "multirange")
-  s.add('}')
+  let s = formatDateTimeMultirangeText(v, pgTimestampTzText)
   PgParam(oid: OidTsTzMultirange, format: 0, value: some(toBytes(s)))
 
 proc toPgDateMultirangeParam*(
@@ -923,21 +973,19 @@ proc toPgDateMultirangeParam*(
 ): PgParam {.raises: [PgTypeError].} =
   ## Encode a date multirange. DateTime values are formatted as date-only, taking
   ## the UTC calendar day so zoned bounds match the binary ``pgDateDays`` path.
-  var s = "{"
-  let ranges = seq[PgRange[DateTime]](v)
-  for i, r in ranges:
-    if i > 0:
-      s.add(',')
-    s.add(formatDateTimeRangeText(r, pgDateText))
-    checkPgBinLen(s.len + 1, "multirange")
-  s.add('}')
+  let s = formatDateTimeMultirangeText(v, pgDateText)
   PgParam(oid: OidDateMultirange, format: 0, value: some(toBytes(s)))
 
 proc toPgMultirangeParam*[T](
     v: PgMultirange[T], oid: int32
 ): PgParam {.raises: [PgTypeError].} =
-  let s = $v
-  checkPgBinLen(s.len, "multirange")
+  ## Encode ``v`` in text format as the multirange type ``oid``. ``DateTime``
+  ## bounds are written in UTC, as ``toPgRangeParam`` writes them.
+  when distinctBase(T) is DateTime:
+    let s = formatDateTimeMultirangeText(v, dateTimeBoundText(oid))
+  else:
+    let s = $v
+    checkPgBinLen(s.len, "multirange")
   PgParam(oid: oid, format: 0, value: some(toBytes(s)))
 
 # Multirange toPgBinaryParam

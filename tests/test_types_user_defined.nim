@@ -22,6 +22,12 @@ type
   OtherZip = distinct string
   PostalAlias = UsPostalCode
   AliasZip = distinct PostalAlias
+  CountInt = distinct int
+  Amount = distinct PgNumeric
+  Cents = distinct int64
+  NoReader = distinct seq[char]
+  PriceCents = distinct Cents
+  Slots = distinct PgMultirange[int32]
 
 proc `==`(a, b: UsPostalCode): bool {.borrow.}
 proc `==`(a, b: SmallCount): bool {.borrow.}
@@ -32,6 +38,14 @@ proc `==`(a, b: RatioF32): bool {.borrow.}
 proc `$`(v: UsPostalCode): string {.borrow.}
 proc `$`(v: SmallCount): string {.borrow.}
 proc `$`(v: PositiveInt): string {.borrow.}
+proc `==`(a, b: CountInt): bool {.borrow.}
+proc `==`(a, b: Cents): bool {.borrow.}
+proc `$`(v: CountInt): string {.borrow.}
+proc `$`(v: Cents): string {.borrow.}
+
+proc get(row: Row, col: int, T: typedesc[Cents]): Cents =
+  # Stored as whole units; a hand-written reader getDomain must prefer.
+  Cents(row.getInt64(col) * 100)
 
 pgDomain(UsPostalCode, string)
 pgDomain(SmallCount, int16)
@@ -829,6 +843,19 @@ suite "User-defined composite":
     check msgOf(getComposite[PersonRecord](wrongOidRow, 0)) ==
       "Column 0: Composite binary field OID 20 incompatible with Nim int32"
 
+    # A domain attribute keeps the domain's own OID in a binary composite.
+    let domainOid = @[
+      (oid: OidText, data: some(toBytes("Grace"))),
+      (oid: 50001'i32, data: some(@(toBE32(1'i32)))),
+      (oid: OidFloat8, data: some(@(toBE64(cast[int64](1.0'f64))))),
+    ]
+    let domainOidRow =
+      mkRow(@[some(encodeBinaryComposite(domainOid))], @[mkField(50000'i32, 1'i16)])
+    check msgOf(getComposite[PersonRecord](domainOidRow, 0)) ==
+      "Column 0: Composite binary field OID 50001 incompatible with Nim int32" &
+      " (a user-defined type, such as a domain, which a binary composite" &
+      " names by its own OID; use resultFormat = rfText)"
+
   test "NULL composite cells stay single-prefixed":
     let row = mkRow(@[none(seq[byte])], @[mkField(0'i32, 0'i16)])
     check msgOf(getComposite[PointRecord](row, 0)) == "Column 0 is NULL"
@@ -952,6 +979,47 @@ suite "User-defined domain":
     check getDomain[IsActive](rowT, 0) == IsActive(true)
     let rowF = mkRow(@[some(@[0'u8])], fields)
     check getDomain[IsActive](rowF, 0) == IsActive(false)
+
+  test "getDomain reads a DateTime base by the column type":
+    let at = dateTime(2026, mNov, 10, 23, 30, 0, 0, utc())
+    let day = dateTime(2026, mNov, 10, 0, 0, 0, 0, utc())
+    let cases = [
+      (mkField(OidTimestamp, 1'i16), toPgBinaryParam(at).value, at),
+      (mkField(OidTimestampTz, 1'i16), toPgBinaryTimestampTzParam(at).value, at),
+      (mkField(OidDate, 1'i16), toPgBinaryDateParam(day).value, day),
+      (mkField(OidTimestampTz, 0'i16), some(toBytes("2026-11-10 23:30:00+00")), at),
+      (mkField(OidDate, 0'i16), some(toBytes("2026-11-10")), day),
+    ]
+    for (field, cell, want) in cases:
+      let row = mkRow(@[cell], @[field])
+      check DateTime(getDomain[EventAt](row, 0)) == want
+      let opt = getDomainOpt[EventAt](row, 0)
+      check opt.isSome and DateTime(opt.get) == want
+
+  test "getDomain reads any base type a row mapping reads":
+    let n = mkRow(@[some(@(toBE64(5'i64)))], @[mkField(OidInt8, 1'i16)])
+    check getDomain[CountInt](n, 0) == CountInt(5)
+    let num = mkRow(@[some(toBytes("12.50"))], @[mkField(OidNumeric, 0'i16)])
+    check $PgNumeric(getDomain[Amount](num, 0)) == "12.50"
+
+  test "getDomain prefers a get declared for the distinct type":
+    let row = mkRow(@[some(@(toBE64(3'i64)))], @[mkField(OidInt8, 1'i16)])
+    check getDomain[Cents](row, 0) == Cents(300)
+    check getDomainOpt[Cents](row, 0) == some(Cents(300))
+
+  test "getDomain unwraps one distinct level at a time":
+    # The inner distinct type's get applies.
+    let n = mkRow(@[some(@(toBE64(3'i64)))], @[mkField(OidInt8, 1'i16)])
+    check Cents(getDomain[PriceCents](n, 0)) == Cents(300)
+    # An inner multirange reads as one, not as an array of ranges.
+    let mr = toMultirange(rangeOf(1'i32, 3'i32), rangeOf(5'i32, 8'i32))
+    let row = mkRow(@[toPgBinaryParam(mr).value], @[mkField(OidInt4Multirange, 1'i16)])
+    check PgMultirange[int32](getDomain[Slots](row, 0)) == mr
+
+  test "getDomain needs a reader for the base type":
+    let row: Row = @[some(toBytes("x"))]
+    check compiles(getDomain[UsPostalCode](row, 0))
+    check not compiles(getDomain[NoReader](row, 0))
 
   test "getDomain raises on NULL":
     let row: Row = @[none(seq[byte])]

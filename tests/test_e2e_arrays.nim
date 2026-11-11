@@ -1,7 +1,8 @@
 import std/[unittest, options, strutils, tables, net, json, macrocache, macros]
 from std/times import
-  DateTime, dateTime, mMar, mJun, mJan, mDec, utc, year, month, monthday, hour, minute,
-  second, toTime, toUnix, nanosecond
+  DateTime, dateTime, mMar, mJun, mJan, mNov, mDec, utc, year, month, monthday, hour,
+  minute, second, toTime, toUnix, nanosecond, Time, Timezone, ZonedTime, newTimezone,
+  initDuration, `+`, `==`
 
 import ../async_postgres/[async_backend, pg_types, pg_client, pg_connection]
 from ../async_postgres/pg_types/encoding {.all.} import
@@ -38,9 +39,16 @@ type
     age: Option[int32]
     note: Option[string]
 
+  TestSpans = object
+    ts: PgRange[DateTime]
+    tz: PgRange[DateTime]
+    day: PgRange[DateTime]
+    tsm: PgMultirange[DateTime]
+
 pgComposite(TestPoint)
 pgComposite(TestPerson)
 pgComposite(TestNullable)
+pgComposite(TestSpans)
 
 type TestMood = enum
   tmHappy = "happy"
@@ -52,6 +60,21 @@ pgEnum(TestMood)
 type TestPosInt = distinct int32
 
 pgDomain(TestPosInt, int32)
+
+type TestDomainAt = distinct DateTime
+
+proc jstZone(): Timezone =
+  ## A fixed +09:00 zone, whose wall clock and calendar day differ from UTC's.
+  const west = -9 * 3600
+  proc fromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+    ZonedTime(isDst: false, utcOffset: west, time: time)
+
+  proc fromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+    ZonedTime(
+      isDst: false, utcOffset: west, time: adjTime + initDuration(seconds = west)
+    )
+
+  newTimezone("JST+09", fromTime, fromAdj)
 
 suite "E2E: Array Types":
   test "int4 array roundtrip":
@@ -542,6 +565,60 @@ suite "E2E: User-Defined Types":
 
     waitFor t()
 
+  test "getDomain reads timestamptz and date domains in either wire format":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery(
+        "DROP DOMAIN IF EXISTS test_e2e_at_tz, test_e2e_at_date CASCADE;" &
+          "CREATE DOMAIN test_e2e_at_tz AS timestamptz;" &
+          "CREATE DOMAIN test_e2e_at_date AS date"
+      )
+      let at = dateTime(2026, mNov, 10, 23, 30, 0, zone = utc())
+      let day = dateTime(2026, mNov, 10, zone = utc())
+      # rfAuto reads text first, then binary once the statement is cached.
+      for binary in [false, true]:
+        let res = await conn.query(
+          "SELECT '2026-11-10 23:30:00+00'::test_e2e_at_tz, " &
+            "'2026-11-10'::test_e2e_at_date"
+        )
+        doAssert res.rows[0].isBinaryCol(0) == binary
+        doAssert res.rows[0].isBinaryCol(1) == binary
+        doAssert DateTime(getDomain[TestDomainAt](res.rows[0], 0)) == at
+        doAssert DateTime(getDomain[TestDomainAt](res.rows[0], 1)) == day
+
+      discard await conn.simpleQuery("DROP DOMAIN test_e2e_at_tz, test_e2e_at_date")
+      await conn.close()
+
+    waitFor t()
+
+  test "an array over a domain reads as text under rfAuto, not in binary":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery(
+        "DROP DOMAIN IF EXISTS test_e2e_dint CASCADE;" &
+          "CREATE DOMAIN test_e2e_dint AS int4"
+      )
+      let q = "SELECT ARRAY[1, 2]::test_e2e_dint[]"
+      for i in 0 .. 1:
+        let res = await conn.query(q)
+        doAssert not res.rows[0].isBinaryCol(0)
+        doAssert res.rows[0].getIntArray(0) == @[1'i32, 2]
+
+      let bin = await conn.query(q, resultFormat = rfBinary)
+      var msg = ""
+      try:
+        discard bin.rows[0].getIntArray(0)
+      except PgTypeError as e:
+        msg = e.msg
+      doAssert msg.endsWith(
+        "(an array over a domain names the domain as its element type)"
+      ), msg
+
+      discard await conn.simpleQuery("DROP DOMAIN test_e2e_dint CASCADE")
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Network Types":
   test "inet roundtrip IPv4":
     proc t() {.async.} =
@@ -930,6 +1007,101 @@ suite "E2E: Range binary wire format":
     waitFor t()
 
 suite "E2E: Range Types":
+  test "toPgRangeParam writes DateTime bounds in UTC for any range type":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery(
+        "DROP TYPE IF EXISTS test_e2e_r_ts, test_e2e_r_date CASCADE;" &
+          "CREATE TYPE test_e2e_r_ts AS RANGE (subtype = timestamp);" &
+          "CREATE TYPE test_e2e_r_date AS RANGE (subtype = date)"
+      )
+      let oids = await conn.lookupTypeOids(@["test_e2e_r_ts", "test_e2e_r_date"])
+      # 05:00 at +09:00 is still the previous day in UTC.
+      let r = rangeOf(
+        dateTime(2024, mJan, 15, 5, 0, 0, zone = jstZone()),
+        dateTime(2024, mJan, 20, 5, 0, 0, zone = jstZone()),
+      )
+      let mr = toMultirange(r)
+      let cases = [
+        (toPgRangeParam(r, OidTsRange), toPgParam(r)),
+        (toPgRangeParam(r, OidTsTzRange), toPgTsTzRangeParam(r)),
+        (toPgRangeParam(r, OidDateRange), toPgDateRangeParam(r)),
+        (toPgRangeParam(r, oids["test_e2e_r_ts"].oid), toPgParam(r)),
+        (toPgRangeParam(r, oids["test_e2e_r_date"].oid), toPgDateRangeParam(r)),
+        (toPgMultirangeParam(mr, OidTsMultirange), toPgParam(mr)),
+        (toPgMultirangeParam(mr, OidDateMultirange), toPgDateMultirangeParam(mr)),
+      ]
+      for (got, want) in cases:
+        let res = await conn.query("SELECT $1::text, $2::text", @[got, want], rfText)
+        doAssert res.rows[0].getStr(0) == res.rows[0].getStr(1),
+          res.rows[0].getStr(0) & " vs " & res.rows[0].getStr(1)
+
+      let day = await conn.query(
+        "SELECT $1::text", @[toPgRangeParam(r, oids["test_e2e_r_date"].oid)], rfText
+      )
+      doAssert day.rows[0].getStr(0) == "[2024-01-14,2024-01-19)"
+
+      # Only the date window is checked here: date holds this year, and the
+      # server rejects it for timestamp.
+      let far = rangeOf(
+        dateTime(300000, mJan, 1, zone = utc()), dateTime(300000, mJan, 2, zone = utc())
+      )
+      let farDay = await conn.query(
+        "SELECT $1::text", @[toPgRangeParam(far, oids["test_e2e_r_date"].oid)], rfText
+      )
+      doAssert farDay.rows[0].getStr(0) == "[300000-01-01,300000-01-02)"
+      var sqlState = ""
+      try:
+        discard await conn.query(
+          "SELECT $1::text", @[toPgRangeParam(far, oids["test_e2e_r_ts"].oid)], rfText
+        )
+      except PgQueryError as e:
+        sqlState = e.sqlState
+      doAssert sqlState == "22008", sqlState # datetime_field_overflow
+
+      discard await conn.simpleQuery("DROP TYPE test_e2e_r_ts, test_e2e_r_date")
+      await conn.close()
+
+    waitFor t()
+
+  test "pgComposite writes DateTime range fields in UTC":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      discard await conn.simpleQuery(
+        "DROP TYPE IF EXISTS test_e2e_spans CASCADE;" & "CREATE TYPE test_e2e_spans AS " &
+          "(ts tsrange, tz tstzrange, day daterange, tsm tsmultirange)"
+      )
+      # The session zone must not matter: each bound carries its offset.
+      discard await conn.exec("SET TimeZone = 'Asia/Tokyo'")
+      # 05:00 at +09:00 is still the previous day in UTC.
+      let r = rangeOf(
+        dateTime(2024, mJan, 15, 5, 0, 0, zone = jstZone()),
+        dateTime(2024, mJan, 20, 5, 0, 0, zone = jstZone()),
+      )
+      let mr = toMultirange(r)
+      let res = await conn.query(
+        "SELECT (c).ts::text, (c).tz::text, (c).day::text, (c).tsm::text, " &
+          "$2::text, $3::text, $4::text, $5::text FROM (SELECT $1::test_e2e_spans AS c) s",
+        @[
+          toPgParam(TestSpans(ts: r, tz: r, day: r, tsm: mr)),
+          toPgParam(r),
+          toPgTsTzRangeParam(r),
+          toPgDateRangeParam(r),
+          toPgParam(mr),
+        ],
+        rfText,
+      )
+      for i in 0 .. 3:
+        doAssert res.rows[0].getStr(i) == res.rows[0].getStr(i + 4),
+          res.rows[0].getStr(i) & " vs " & res.rows[0].getStr(i + 4)
+      doAssert res.rows[0].getStr(2) == "[2024-01-14,2024-01-19)"
+
+      discard await conn.exec("RESET TimeZone")
+      discard await conn.simpleQuery("DROP TYPE test_e2e_spans")
+      await conn.close()
+
+    waitFor t()
+
   test "int4range roundtrip":
     proc t() {.async.} =
       let conn = await connect(plainConfig())

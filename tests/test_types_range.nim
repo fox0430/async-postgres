@@ -1,3 +1,5 @@
+import narrow_range_import_probe
+
 import std/[unittest, options, strutils, times]
 
 import ../async_postgres/pg_protocol
@@ -7,6 +9,61 @@ import ../async_postgres/pg_types/accessors {.all.}
 import ../async_postgres/pg_types/ranges {.all.}
 
 import types_common
+
+proc jstZone(): Timezone =
+  ## A fixed +09:00 zone, whose wall clock and calendar day differ from UTC's.
+  const west = -9 * 3600
+  proc fromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+    ZonedTime(isDst: false, utcOffset: west, time: time)
+
+  proc fromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+    ZonedTime(
+      isDst: false, utcOffset: west, time: adjTime + initDuration(seconds = west)
+    )
+
+  newTimezone("JST+09", fromTime, fromAdj)
+
+type SpanRecord = object
+  span: PgRange[DateTime]
+  spans: PgMultirange[DateTime]
+  maybe: Option[PgRange[DateTime]]
+  missing: Option[PgMultirange[DateTime]]
+
+pgComposite(SpanRecord)
+
+type
+  EventAt = distinct DateTime
+  EventAtNested = distinct EventAt
+  # Domains over tsrange and over a multirange of a timestamp domain.
+  Period = distinct PgRange[DateTime]
+  EventPeriods = distinct PgMultirange[EventAt]
+
+  EventRecord = object
+    at: EventAt
+    maybe: Option[EventAt]
+    nested: EventAtNested
+    span: PgRange[EventAt]
+    spans: PgMultirange[EventAt]
+    period: Period
+    maybePeriod: Option[Period]
+    periods: EventPeriods
+
+  PlainEventRecord = object
+    at: DateTime
+    maybe: Option[DateTime]
+    nested: DateTime
+    span: PgRange[DateTime]
+    spans: PgMultirange[DateTime]
+    period: PgRange[DateTime]
+    maybePeriod: Option[PgRange[DateTime]]
+    periods: PgMultirange[DateTime]
+
+pgComposite(EventRecord)
+pgComposite(PlainEventRecord)
+
+proc int4RangeParam(): PgParam {.raises: [].} =
+  # Effects follow the element type: only DateTime bounds can raise.
+  toPgRangeParam(rangeOf(1'i32, 5'i32), OidInt4Range)
 
 suite "Range OID constants":
   test "range OID values":
@@ -347,6 +404,161 @@ suite "Range toPgParam":
   test "custom OID via toPgRangeParam":
     let p = toPgRangeParam(rangeOf(1'i32, 10'i32), 99999'i32)
     check p.oid == 99999'i32
+
+  test "toPgRangeParam and toPgMultirangeParam write DateTime bounds in UTC":
+    let jst = jstZone()
+    # 05:00 JST is still the previous day in UTC.
+    let r = rangeOf(
+      dateTime(2024, mJan, 15, 5, 0, 0, 0, jst),
+      dateTime(2024, mJan, 20, 5, 0, 0, 0, jst),
+    )
+    let mr = toMultirange(r)
+    check toPgRangeParam(r, OidTsRange).value == toPgParam(r).value
+    check toPgRangeParam(r, OidTsTzRange).value == toPgTsTzRangeParam(r).value
+    check toPgRangeParam(r, OidDateRange).value == toPgDateRangeParam(r).value
+    check toPgMultirangeParam(mr, OidTsMultirange).value == toPgParam(mr).value
+    check toPgMultirangeParam(mr, OidTsTzMultirange).value ==
+      toPgTsTzMultirangeParam(mr).value
+    check toPgMultirangeParam(mr, OidDateMultirange).value ==
+      toPgDateMultirangeParam(mr).value
+    check toPgRangeParam(r, OidDateRange).value.get.toString == "[2024-01-14,2024-01-19)"
+    # A range type of the caller's gets the UTC instant with its offset.
+    let custom = toPgRangeParam(r, 99999'i32)
+    check custom.oid == 99999'i32
+    check custom.value == toPgTsTzRangeParam(r).value
+    check custom.value.get.toString.startsWith("[\"2024-01-14 20:00:00.000000Z")
+    check toPgMultirangeParam(mr, 99998'i32).value == toPgTsTzMultirangeParam(mr).value
+
+  test "toPgRangeParam and toPgMultirangeParam write distinct DateTime bounds in UTC":
+    # A domain over a timestamp, timestamptz or date reaches here as a
+    # distinct DateTime, with no `$` of its own.
+    let jst = jstZone()
+    let lo = dateTime(2024, mJan, 15, 5, 0, 0, 0, jst)
+    let hi = dateTime(2024, mJan, 20, 5, 0, 0, 0, jst)
+    let r = rangeOf(lo, hi)
+    let dr = rangeOf(EventAt(lo), EventAt(hi))
+    for oid in [OidTsRange, OidTsTzRange, OidDateRange, 99999'i32]:
+      check toPgRangeParam(dr, oid).value == toPgRangeParam(r, oid).value
+    for oid in [OidTsMultirange, OidTsTzMultirange, OidDateMultirange, 99998'i32]:
+      check toPgMultirangeParam(toMultirange(dr), oid).value ==
+        toPgMultirangeParam(toMultirange(r), oid).value
+
+  test "a range type of the caller's checks only the date window":
+    # Its subtype may be a date, which holds years a timestamp cannot; the
+    # server rejects a bound the actual subtype cannot hold.
+    let far = rangeOf(
+      dateTime(300000, mJan, 1, zone = utc()), dateTime(300000, mJan, 2, zone = utc())
+    )
+    let bounds = "\"300000-01-01 00:00:00.000000Z\",\"300000-01-02 00:00:00.000000Z\""
+    check toPgRangeParam(far, 99999'i32).value.get.toString == "[" & bounds & ")"
+    check toPgMultirangeParam(toMultirange(far), 99998'i32).value.get.toString ==
+      "{[" & bounds & ")}"
+    for oid in [OidTsRange, OidTsTzRange]:
+      expect PgTypeError:
+        discard toPgRangeParam(far, oid)
+    let beyond = rangeOf(
+      dateTime(5874898, mJan, 1, zone = utc()), dateTime(5874898, mJan, 2, zone = utc())
+    )
+    expect PgTypeError:
+      discard toPgRangeParam(beyond, 99999'i32)
+    # The window is checked on the UTC day that is written: 05:00 at +09:00 on
+    # PostgreSQL's first date is still the day before in UTC.
+    let early = dateTime(-4713, mNov, 24, 5, 0, 0, 0, jstZone())
+    expect PgTypeError:
+      discard toPgRangeParam(rangeOf(early, early + 1.days), 99999'i32)
+
+  test "pgComposite writes DateTime range fields in UTC":
+    # 05:00 JST is still the previous day in UTC.
+    let r = rangeOf(
+      dateTime(2024, mJan, 15, 5, 0, 0, 0, jstZone()),
+      dateTime(2024, mJan, 20, 5, 0, 0, 0, jstZone()),
+    )
+    let mr = toMultirange(r)
+    let s = toPgParam(SpanRecord(span: r, spans: mr, maybe: some(r))).value.get.toString
+    let tstz = toPgTsTzRangeParam(r).value.get.toString
+    check s ==
+      encodeCompositeText(
+        @[some(tstz), some(toPgTsTzMultirangeParam(mr).value.get.toString), some(tstz)] &
+          none(string)
+      )
+    check "2024-01-14 20:00:00.000000Z" in s
+    let beyond = rangeOf(
+      dateTime(5874898, mJan, 1, zone = utc()), dateTime(5874898, mJan, 2, zone = utc())
+    )
+    try:
+      discard toPgParam(SpanRecord(span: beyond))
+      fail()
+    except PgTypeError as e:
+      check "in composite field" in e.msg
+
+  test "pgComposite writes distinct DateTime fields in UTC":
+    # 05:00 JST is still the previous day in UTC.
+    let lo = dateTime(2024, mJan, 15, 5, 0, 0, 0, jstZone())
+    let hi = dateTime(2024, mJan, 20, 5, 0, 0, 0, jstZone())
+    let r = rangeOf(lo, hi)
+    let dr = rangeOf(EventAt(lo), EventAt(hi))
+    let s = toPgParam(
+      EventRecord(
+        at: EventAt(lo),
+        maybe: some(EventAt(hi)),
+        nested: EventAtNested(EventAt(lo)),
+        span: dr,
+        spans: toMultirange(dr),
+        period: Period(r),
+        maybePeriod: some(Period(r)),
+        periods: EventPeriods(toMultirange(dr)),
+      )
+    ).value.get.toString
+    check s ==
+      toPgParam(
+        PlainEventRecord(
+          at: lo,
+          maybe: some(hi),
+          nested: lo,
+          span: r,
+          spans: toMultirange(r),
+          period: r,
+          maybePeriod: some(r),
+          periods: toMultirange(r),
+        )
+      ).value.get.toString
+    check "2024-01-14 20:00:00.000000Z" in s
+    let early = dateTime(-4713, mNov, 24, 5, 0, 0, 0, jstZone())
+    try:
+      discard toPgParam(EventRecord(at: EventAt(early)))
+      fail()
+    except PgTypeError as e:
+      check "date out of range in composite field" in e.msg
+
+  test "toPgRangeParam raises nothing for an element type that cannot":
+    check int4RangeParam().value.get.toString == "[1,5)"
+
+  test "to reads ranges and multiranges of a distinct DateTime":
+    let fields = @[
+      mkField(OidTsRange, 0'i16),
+      mkField(OidDateMultirange, 0'i16),
+      mkField(OidTsTzRange, 0'i16),
+    ]
+    let row = mkRow(
+      @[
+        some(toBytes("[\"2024-01-14 20:00:00\",\"2024-01-19 20:00:00\")")),
+        some(toBytes("{[2024-01-14,2024-01-19),[2024-02-01,)}")),
+        some(toBytes("(\"2024-01-14 20:00:00+00\",)")),
+      ],
+      fields,
+    )
+    let got =
+      row.to((PgRange[EventAt], PgMultirange[EventAtNested], Option[PgRange[EventAt]]))
+    let want =
+      row.to((PgRange[DateTime], PgMultirange[DateTime], Option[PgRange[DateTime]]))
+    # The writers serve as the comparison: a distinct DateTime has no `==`.
+    check toPgRangeParam(got[0], OidTsRange).value ==
+      toPgRangeParam(want[0], OidTsRange).value
+    check toPgMultirangeParam(got[1], OidDateMultirange).value ==
+      toPgMultirangeParam(want[1], OidDateMultirange).value
+    check got[2].isSome and got[2].get.hasLower and not got[2].get.hasUpper
+    check DateTime(got[2].get.lower.value) == want[2].get.lower.value
+    check DateTime(got[0].lower.value) == dateTime(2024, mJan, 14, 20, 0, 0, 0, utc())
 
   test "Option[PgRange[int32]] some":
     let p = toPgParam(some(rangeOf(1'i32, 10'i32)))

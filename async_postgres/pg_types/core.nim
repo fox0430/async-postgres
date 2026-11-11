@@ -201,7 +201,12 @@ type
       ## non-deterministic across calls; use typed accessors or force
       ## ``rfText`` when reading via ``getStr`` / typed ``string``.
     rfText ## All columns in text format.
-    rfBinary ## All columns in binary format.
+    rfBinary
+      ## All columns in binary format. A domain column arrives as its base
+      ## type, but an array over a domain and a composite with a domain
+      ## attribute name the domain's own OID per element or attribute, a
+      ## layout the typed accessors cannot verify: they raise ``PgTypeError``.
+      ## ``rfAuto`` reads such columns as text.
 
   CommandResult* = object
     ## Result of a command execution, wrapping the PostgreSQL command tag.

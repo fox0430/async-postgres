@@ -63,13 +63,13 @@ proc pgTimestampMicros*(v: DateTime): int64 {.inline, raises: [PgTypeError].} =
 proc pgEpochDays(t: Time): int64 {.inline.} =
   floorDiv(t.toUnix(), 86400'i64) - int64(pgEpochDaysOffset)
 
-proc checkedDate(v: DateTime): Time {.inline, raises: [PgTypeError].} =
+proc checkedDate(v: DateTime, context = ""): Time {.inline, raises: [PgTypeError].} =
   ## ``v`` as a Time, raising ``PgTypeError`` outside PostgreSQL's date range.
-  checkPgDateTime(v)
+  checkPgDateTime(v, context)
   result = v.toTime()
   let days = pgEpochDays(result)
   if days < pgMinDateDays or days >= pgEndDateDays:
-    raise newException(PgTypeError, "date out of range")
+    raise newException(PgTypeError, "date out of range" & context)
 
 proc pgDateDays*(v: DateTime): int32 {.inline, raises: [PgTypeError].} =
   ## Days since the PostgreSQL epoch (2000-01-01) for ``date`` binary format.
@@ -110,6 +110,14 @@ proc pgTimestampTzText*(v: DateTime): string {.raises: [PgTypeError].} =
 proc pgDateText*(v: DateTime): string {.raises: [PgTypeError].} =
   ## Text ``date`` literal of the UTC calendar day, matching ``pgDateDays``.
   pgUtcText(checkedDate(v), "MM-dd")
+
+proc pgUtcInstantText*(v: DateTime, context = ""): string {.raises: [PgTypeError].} =
+  ## Text literal of ``v``'s UTC instant (``Z``) for a slot whose type is not
+  ## known here: a timestamp reads the UTC wall clock, a timestamptz the
+  ## instant and a date the UTC day. Only ``date``'s window, the widest, is
+  ## checked, on the UTC day that is written; the server rejects what the
+  ## actual type cannot hold.
+  pgUtcText(checkedDate(v, context), "MM-dd HH:mm:ss'.'ffffffzzz")
 
 proc textParam(oid: int32, s: string, what: string): PgParam {.inline.} =
   ## Build text-format param. Rejects oversized payload.
