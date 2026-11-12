@@ -1483,7 +1483,7 @@ async_postgres/pg_types.nim	export encoding.writeParamOid
 async_postgres/pg_types.nim	export encoding.writeParamValue
 async_postgres/pg_types.nim	export ranges except formatDateTimeRangeText, formatDateTimeMultirangeText, hasDateTimeBounds
 async_postgres/pg_types.nim	export row_mapping except mapRow, resolveRowColumns, findColumn, fieldContext, isCaseObject
-async_postgres/pg_types.nim	export user_types
+async_postgres/pg_types.nim	export user_types except distinctBaseOnce
 async_postgres/pg_types.nim	get
 async_postgres/pg_types.nim	pgParams
 async_postgres/pg_types/accessors.nim	`$`

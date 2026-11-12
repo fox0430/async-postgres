@@ -408,6 +408,14 @@ proc encodeCompositeText*(fields: seq[Option[string]]): string {.raises: [].} =
       result.add(compositeFieldToText(f.get))
   result.add(')')
 
+macro distinctBaseOnce*(T: typedesc): typedesc =
+  ## Sibling-only: ``distinctBase(T, recursive = false)``. Before Nim 2.2.12
+  ## that gives the bare generic for a ``distinct PgRange[DateTime]``, which is
+  ## no longer a ``PgRange``.
+  let impl = T.getTypeImpl[1].getTypeImpl
+  expectKind impl, nnkDistinctTy
+  impl[0]
+
 proc isCompositeUtcField(T: typedesc): bool {.compileTime.} =
   ## Fields written as UTC instants: the attribute may be a timestamp,
   ## timestamptz or date (or a range of one), which the text form does not say.
@@ -417,7 +425,9 @@ proc isCompositeUtcField(T: typedesc): bool {.compileTime.} =
     hasDateTimeBounds(T)
   # One level at a time: a multirange is itself distinct.
   elif T is distinct:
-    isCompositeUtcField(distinctBase(T, recursive = false))
+    # Via a type: the macro call as the argument crashes the VM (Nim 2.2.14).
+    type Base = distinctBaseOnce(T)
+    isCompositeUtcField(Base)
   else:
     T is DateTime
 
@@ -434,7 +444,7 @@ proc compositeUtcFieldToText[F](v: F): string {.raises: [PgTypeError].} =
   elif F is PgMultirange:
     formatDateTimeMultirangeText(v, compositeDateTimeToText)
   elif F is distinct:
-    compositeUtcFieldToText(distinctBase(F, recursive = false)(v))
+    compositeUtcFieldToText(distinctBaseOnce(F)(v))
   else:
     compositeDateTimeToText(v)
 

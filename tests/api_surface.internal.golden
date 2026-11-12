@@ -612,3 +612,4 @@ async_postgres/pg_types/row_mapping.nim	findColumn
 async_postgres/pg_types/row_mapping.nim	isCaseObject
 async_postgres/pg_types/row_mapping.nim	mapRow
 async_postgres/pg_types/row_mapping.nim	resolveRowColumns
+async_postgres/pg_types/user_types.nim	distinctBaseOnce

@@ -136,7 +136,7 @@ proc decodeValue[F](row: Row, col: int, _: typedesc[F], api: static string = "to
   # as well. One level at a time, so a `get` for an inner distinct type wins
   # and an inner multirange stays one; a multirange with no `get` is not one.
   elif F is distinct and F isnot PgMultirange:
-    F(decodeValue(row, col, distinctBase(F, recursive = false), api))
+    F(decodeValue(row, col, distinctBaseOnce(F), api))
   # Objects need a `get`, which pgComposite declares: a catch-all composite
   # read would also take `Time`, `Table` or a type whose `get` the caller has
   # not imported, and fail only at run time.

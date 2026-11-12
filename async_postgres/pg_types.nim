@@ -13,9 +13,10 @@ export core except
   pgParseInt16, pgParseInt32, pgParseIntView, pgParseUIntField, parsePgBoolText,
   pgTypeErrorOnValueError, withColumnContext
 # `array` (PgArray + shape validation) and `user_types` (enum/composite/domain
-# macros) likewise expose only public API.
+# macros) likewise expose only public API; `distinctBaseOnce` is sibling-only,
+# for `row_mapping`.
 export array
-export user_types
+export user_types except distinctBaseOnce
 
 # `encoding` — typed-parameter encode/decode surface. The registry, bounds
 # guards and raw binary helpers stay in the module; `paramOidOf` and the
