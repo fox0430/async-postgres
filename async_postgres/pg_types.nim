@@ -13,9 +13,10 @@ export core except
   pgParseInt16, pgParseInt32, pgParseIntView, pgParseUIntField, parsePgBoolText,
   pgTypeErrorOnValueError, withColumnContext
 # `array` (PgArray + shape validation) and `user_types` (enum/composite/domain
-# macros) likewise expose only public API.
+# macros) likewise expose only public API; `distinctBaseOnce` is sibling-only,
+# for `row_mapping`.
 export array
-export user_types
+export user_types except distinctBaseOnce
 
 # `encoding` — typed-parameter encode/decode surface. The registry, bounds
 # guards and raw binary helpers stay in the module; `paramOidOf` and the
@@ -85,8 +86,11 @@ export accessors except
   wireOidIsDynamic, colTypeOid
 
 # `ranges` — range/multirange construction and typed parameters; the raw
-# binary decoders were privatised in the module itself.
-export ranges
+# binary decoders were privatised in the module itself. The DateTime range
+# text writers are sibling-only, for `user_types`' composite fields, as is
+# `hasDateTimeBounds`, shared with `row_mapping`.
+export ranges except
+  formatDateTimeRangeText, formatDateTimeMultirangeText, hasDateTimeBounds
 
 # `row_mapping` — `to(row, T)` and its field pragmas. `mapRow` and
 # `resolveRowColumns` (the column cache behind `to(QueryResult, seq[T])`) are

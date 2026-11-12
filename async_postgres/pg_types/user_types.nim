@@ -1,7 +1,7 @@
 import std/[options, macros, strutils, typetraits, times]
 
 import ../pg_protocol
-import core, decoding, encoding, accessors
+import core, decoding, encoding, accessors, ranges
 
 # User-defined enum type support
 #
@@ -408,12 +408,45 @@ proc encodeCompositeText*(fields: seq[Option[string]]): string {.raises: [].} =
       result.add(compositeFieldToText(f.get))
   result.add(')')
 
-proc compositeDateTimeToText(dt: DateTime): string =
+macro distinctBaseOnce*(T: typedesc): typedesc =
+  ## Sibling-only: ``distinctBase(T, recursive = false)``. Before Nim 2.2.12
+  ## that gives the bare generic for a ``distinct PgRange[DateTime]``, which is
+  ## no longer a ``PgRange``.
+  let impl = T.getTypeImpl[1].getTypeImpl
+  expectKind impl, nnkDistinctTy
+  impl[0]
+
+proc isCompositeUtcField(T: typedesc): bool {.compileTime.} =
+  ## Fields written as UTC instants: the attribute may be a timestamp,
+  ## timestamptz or date (or a range of one), which the text form does not say.
+  ## A ``distinct`` type is a domain over its base; ``$`` would write its local
+  ## wall clock. ``compositeUtcFieldToText`` follows the same branches.
+  when T is PgRange or T is PgMultirange:
+    hasDateTimeBounds(T)
+  # One level at a time: a multirange is itself distinct.
+  elif T is distinct:
+    # Via a type: the macro call as the argument crashes the VM (Nim 2.2.14).
+    type Base = distinctBaseOnce(T)
+    isCompositeUtcField(Base)
+  else:
+    T is DateTime
+
+proc compositeDateTimeToText(dt: DateTime): string {.raises: [PgTypeError].} =
   ## Text form of a composite DateTime field. The UTC offset is mandatory:
   ## without it a timestamptz field is reinterpreted in the session TimeZone.
-  # Window check only: the field may be a date, whose range is wider.
-  checkPgDateTime(dt, " in composite field")
-  pgUtcText(dt.toTime(), "MM-dd HH:mm:ss'.'ffffffzzz")
+  pgUtcInstantText(dt, " in composite field")
+
+proc compositeUtcFieldToText[F](v: F): string {.raises: [PgTypeError].} =
+  ## A field for which ``isCompositeUtcField`` holds. A range's bounds are
+  ## written as lone fields.
+  when F is PgRange:
+    formatDateTimeRangeText(v, compositeDateTimeToText)
+  elif F is PgMultirange:
+    formatDateTimeMultirangeText(v, compositeDateTimeToText)
+  elif F is distinct:
+    compositeUtcFieldToText(distinctBaseOnce(F)(v))
+  else:
+    compositeDateTimeToText(v)
 
 proc compositeFieldFromText[T](s: string): T =
   ## Parse a single composite text field to the target type.
@@ -461,9 +494,16 @@ template checkFieldOid(actual: int32, allowed: openArray[int32], typeName: strin
   # checkFieldLen alone lets them silently misdecode. actual == 0 → unknown/
   # polymorphic column; fall back to the length guard.
   if actual != 0'i32 and actual notin allowed:
+    let hint =
+      if wireOidIsDynamic(actual):
+        " (a user-defined type, such as a domain, which a binary composite" &
+          " names by its own OID; use resultFormat = rfText)"
+      else:
+        ""
     raise newException(
       PgTypeError,
-      "Composite binary field OID " & $actual & " incompatible with Nim " & typeName,
+      "Composite binary field OID " & $actual & " incompatible with Nim " & typeName &
+        hint,
     )
 
 template decodeBinaryField(val, buf: untyped, fOid: int32, fOff, fEnd, fLen: int) =
@@ -580,6 +620,9 @@ macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
   ## composite type. Each field is sent as text inside the composite text
   ## format; ``get`` reads with ``getComposite``, so ``row.get(col, T)``,
   ## ``queryValue`` and ``to`` read ``T``.
+  ## A ``DateTime`` field, and each bound of a ``DateTime`` range or
+  ## multirange field, is sent as its UTC instant, which a timestamp,
+  ## timestamptz or date attribute reads right.
   ## Fields map by position, in both directions: the object's field order must
   ## match the composite's attribute order. Neither wire format carries names,
   ## so a swap of same-typed fields is not detected.
@@ -598,14 +641,14 @@ macro pgComposite*(T: typedesc, oid: int32 = 0'i32): untyped =
       for _, val in v.fieldPairs:
         when typeof(val) is Option:
           if val.isSome:
-            when typeof(val.get) is DateTime:
-              fields.add(some(compositeDateTimeToText(val.get)))
+            when isCompositeUtcField(typeof(val.get)):
+              fields.add(some(compositeUtcFieldToText(val.get)))
             else:
               fields.add(some($val.get))
           else:
             fields.add(none(string))
-        elif typeof(val) is DateTime:
-          fields.add(some(compositeDateTimeToText(val)))
+        elif isCompositeUtcField(typeof(val)):
+          fields.add(some(compositeUtcFieldToText(val)))
         else:
           fields.add(some($val))
       PgParam(
@@ -661,35 +704,3 @@ macro pgDomain*(T: typedesc, Base: typedesc, oid: int32 = 0'i32): untyped =
       result = toPgParam(`bSym`(v))
       if `oid` != 0'i32:
         result.oid = `oid`
-
-proc getDomain*[T: distinct](row: Row, col: int): T =
-  ## Read a PostgreSQL domain column as a Nim distinct type.
-  ## The base type determines which row accessor is used.
-  when distinctBase(T) is string:
-    T(row.getStr(col))
-  elif distinctBase(T) is int16:
-    T(row.getInt16(col))
-  elif distinctBase(T) is int32:
-    T(row.getInt(col))
-  elif distinctBase(T) is int64:
-    T(row.getInt64(col))
-  elif distinctBase(T) is float64:
-    T(row.getFloat(col))
-  elif distinctBase(T) is float32:
-    T(row.getFloat32(col))
-  elif distinctBase(T) is bool:
-    T(row.getBool(col))
-  elif distinctBase(T) is DateTime:
-    T(row.getTimestamp(col))
-  else:
-    {.
-      error:
-        "Unsupported domain base type: use string, int16, int32, int64, float32, float64, bool, or DateTime"
-    .}
-
-proc getDomainOpt*[T: distinct](row: Row, col: int): Option[T] =
-  ## NULL-safe version of ``getDomain``.
-  if row.isNull(col):
-    none(T)
-  else:
-    some(getDomain[T](row, col))

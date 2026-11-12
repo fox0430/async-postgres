@@ -1440,6 +1440,7 @@ suite "wire OID policy: a binary read needs an exact built-in match":
       msg = e.msg
     check msg.startsWith("getInt4Range: wire colOid=20001 is a user-defined type")
     check "resultFormat = rfText" in msg
+    check "array over a domain" notin msg
 
   test "a range getter still rejects a mismatched built-in range":
     let p = toPgBinaryParam(rangeOf(1'i32, 10'i32))
@@ -1484,6 +1485,7 @@ suite "wire OID policy: a binary read needs an exact built-in match":
     check msg.startsWith(
       "Column 0: getIntArray: wire elemOid=20003 is a user-defined type"
     )
+    check msg.endsWith("(an array over a domain names the domain as its element type)")
     msg = ""
     try:
       discard getArrayND[int32](row, 0)

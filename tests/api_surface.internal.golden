@@ -601,10 +601,15 @@ async_postgres/pg_types/encoding.nim	pgTimestampMicros
 async_postgres/pg_types/encoding.nim	pgTimestampMicros#2
 async_postgres/pg_types/encoding.nim	pgTimestampText
 async_postgres/pg_types/encoding.nim	pgTimestampTzText
+async_postgres/pg_types/encoding.nim	pgUtcInstantText
 async_postgres/pg_types/encoding.nim	pgUtcText
 async_postgres/pg_types/encoding.nim	writePointAt
+async_postgres/pg_types/ranges.nim	formatDateTimeMultirangeText
+async_postgres/pg_types/ranges.nim	formatDateTimeRangeText
+async_postgres/pg_types/ranges.nim	hasDateTimeBounds
 async_postgres/pg_types/row_mapping.nim	fieldContext
 async_postgres/pg_types/row_mapping.nim	findColumn
 async_postgres/pg_types/row_mapping.nim	isCaseObject
 async_postgres/pg_types/row_mapping.nim	mapRow
 async_postgres/pg_types/row_mapping.nim	resolveRowColumns
+async_postgres/pg_types/user_types.nim	distinctBaseOnce

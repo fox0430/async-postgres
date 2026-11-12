@@ -1481,9 +1481,9 @@ async_postgres/pg_types.nim	export encoding.writeBindParam
 async_postgres/pg_types.nim	export encoding.writeParamFormat
 async_postgres/pg_types.nim	export encoding.writeParamOid
 async_postgres/pg_types.nim	export encoding.writeParamValue
-async_postgres/pg_types.nim	export ranges
+async_postgres/pg_types.nim	export ranges except formatDateTimeRangeText, formatDateTimeMultirangeText, hasDateTimeBounds
 async_postgres/pg_types.nim	export row_mapping except mapRow, resolveRowColumns, findColumn, fieldContext, isCaseObject
-async_postgres/pg_types.nim	export user_types
+async_postgres/pg_types.nim	export user_types except distinctBaseOnce
 async_postgres/pg_types.nim	get
 async_postgres/pg_types.nim	pgParams
 async_postgres/pg_types/accessors.nim	`$`
@@ -2162,6 +2162,8 @@ async_postgres/pg_types/ranges.nim	toPgTsTzMultirangeParam
 async_postgres/pg_types/ranges.nim	toPgTsTzRangeArrayParam
 async_postgres/pg_types/ranges.nim	toPgTsTzRangeParam
 async_postgres/pg_types/ranges.nim	unboundedRange
+async_postgres/pg_types/row_mapping.nim	getDomain
+async_postgres/pg_types/row_mapping.nim	getDomainOpt
 async_postgres/pg_types/row_mapping.nim	pgColumn
 async_postgres/pg_types/row_mapping.nim	pgSkip
 async_postgres/pg_types/row_mapping.nim	to
@@ -2170,8 +2172,6 @@ async_postgres/pg_types/user_types.nim	encodeCompositeText
 async_postgres/pg_types/user_types.nim	encodeEnumTextArray
 async_postgres/pg_types/user_types.nim	getComposite
 async_postgres/pg_types/user_types.nim	getCompositeOpt
-async_postgres/pg_types/user_types.nim	getDomain
-async_postgres/pg_types/user_types.nim	getDomainOpt
 async_postgres/pg_types/user_types.nim	getEnum
 async_postgres/pg_types/user_types.nim	getEnumArray
 async_postgres/pg_types/user_types.nim	getEnumArrayElemOpt
