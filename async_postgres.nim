@@ -78,7 +78,21 @@
 ## - temp-file cleanup failures
 ##
 ## They are not reported to ``PgTracer`` and cannot be hooked, filtered, or
-## suppressed; a notification hook is future work.
+## suppressed. The plaintext fallback can be detected afterwards with:
+##
+## .. code-block:: nim
+##   hasTls and conn.config.sslMode == sslPrefer and not conn.sslEnabled and
+##     not isUnixSocket(conn.host)
+##
+## Any other plaintext connection is expected, not a fallback. To refuse it,
+## check the ``connect`` result or raise from ``PoolConfig.afterConnect``;
+## ``PgTracer.onConnectEnd`` can only observe it (``data.conn`` when
+## ``data.err`` is nil). All three run after the startup and authentication
+## exchange has crossed the plaintext link: only ``sslmode=require`` or
+## stronger prevents that. The LISTEN pump's in-place reconnect skips the
+## first two, and ``onConnectEnd`` then gets a temporary connection, not the
+## listener: check the listener in ``conn.onReconnect``, which fires once its
+## channels are re-listened.
 ##
 ## Quick Start
 ## ===========
