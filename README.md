@@ -8,20 +8,17 @@ Async PostgreSQL client in Nim.
 - PostgreSQL wire protocol v3
 - Simple Query and Extended Query Protocol
 - Pipeline mode — batch multiple operations in a single network round trip
-- Connection pooling with health checks and maintenance (broken connections discarded on acquire/release), a session reset on each release (`SET`, `SET ROLE`, temporary tables and `LISTEN` do not reach the next borrower), and an `afterConnect` hook to set up each new connection
+- Connection pooling with health checks, a session reset on each release, and an `afterConnect` hook
 - Pool cluster with read replica routing
 - SSL/TLS support (disable, allow, prefer, require, verify-ca, verify-full) with optional client certificate authentication (mTLS)
 - `sslnegotiation` mode (postgres, direct) for Direct SSL connections (PostgreSQL 17+)
 - MD5, SCRAM-SHA-256 and SCRAM-SHA-256-PLUS authentication
-- `credentialsProvider` to fetch the user and password per connection (expiring tokens such as AWS RDS IAM or Microsoft Entra ID, rotated secrets)
 - `channel_binding` policy (disable, prefer, require) to harden SCRAM against downgrade
-- DSN connection string parsing, filled in like libpq from `PG*` environment variables, the connection service file (`pg_service.conf`) and the password file (`.pgpass`)
+- `credentialsProvider` for per-connection credentials (expiring tokens such as AWS RDS IAM, rotated secrets)
+- DSN connection string parsing, filled in like libpq from `PG*` environment variables, `pg_service.conf` and `.pgpass`
 - Unix socket connection
-- Multi-host failover
+- Multi-host failover, with `load_balance_hosts=random` to spread connections across hosts
 - Target session attributes (any, read-write, read-only, primary, standby, prefer-standby)
-- `load_balance_hosts=random` shuffles the configured host list per connection to
-  spread a pool across replicas (reorders the multi-host list only, not multiple
-  addresses behind a single DNS name)
 
 ### Queries & Statements
 - `sql` macro — compile-time `{expr}` placeholder extraction with automatic parameterization
@@ -29,11 +26,11 @@ Async PostgreSQL client in Nim.
 - Prepared statements with server-side statement cache (LRU eviction)
 - Server-side cursors (streaming row chunks)
 - Transactions (`withTransaction`)
-- COPY IN / COPY OUT (buffered and streaming), and typed rows in binary COPY (`conn.copyInRows("users", users)`, streamed with `copyInRowsStream`)
+- COPY IN / COPY OUT (buffered and streaming), including typed rows in binary COPY (`copyInRows`)
 - Large Object API (streaming binary data)
 - LISTEN/NOTIFY with auto-reconnect
 - Advisory locks (session/transaction, exclusive/shared)
-- Logical and physical replication (pgoutput decoder for logical streams; raw WAL streaming, slot-less or slot-based, with optional `TIMELINE` for physical)
+- Logical and physical replication (pgoutput decoder for logical streams)
 
 ### Types
 - Typed parameters (`pgParams` / `toPgParam`) and row accessors (`getStr`, `getInt`, ...)
@@ -53,15 +50,6 @@ Async PostgreSQL client in Nim.
 - Interval type (`PgInterval`)
 - hstore type (`PgHstore` — extension; requires `lookupTypeOids` for binary encoding)
 - XML type (`PgXml`)
-
-Parameter values of types built with the `pgEnum`, `pgDomain` and `pgComposite`
-macros, and `Option`s of them, work with `sql"…{v}…"` and `pgParams(v)`: both
-resolve `toPgParam` at the call site, as a direct `toPgParam(v)` call there
-would, so they find the overloads those macros generate. Only `pgEnum` also
-generates the `seq[T]` and `seq[Option[T]]` forms. Cast the placeholder
-(`$1::mytype`) when the client does not know the type's OID. `queryDirect` /
-`execDirect` take their parameters as separate arguments and cannot encode
-these types.
 
 ### Performance
 - Automatic binary format selection for known-safe types
@@ -119,16 +107,23 @@ waitFor main()
 
 ## Reconnection Policy
 
-- **Connection pool (`PgPool` / `PgPoolCluster`)** — broken connections are detected and discarded automatically. On `acquire`, entries whose state is not `csReady` (or that fail the optional `ping` health check) are retired and replaced. On `release`, connections left in a non-ready or in-transaction state are also closed rather than returned to the idle queue. Configure `healthCheckTimeout` / `pingTimeout` to tune idle-connection probing.
-- **Direct `PgConnection`** — no automatic reconnection for regular queries. Per-query retry would be unsafe for non-idempotent statements and in-flight transactions, so a closed connection must be replaced by calling `connect(...)` again (or by using the pool). Inspect `conn.isConnected()` or `conn.state` to decide whether a handle is still usable.
-- **Configuration faults** — a `PgConfigError` (a cert, key or CA that will not load, `sslcert` without `sslkey`, `sslmode=verify-ca` without `sslrootcert`, …) is deliberately *not* a `PgConnectionError`. `connect(...)` raises it in place of the per-host aggregate, so a reconnect-on-`PgConnectionError` loop never retries a fault no retry can fix. A pool reports it as a `PgPoolError` of kind `pekConfigFault` and stops opening connections, since its config cannot change.
-- **Retry classification** — `retryAdvice(err)` returns `raRetry`, `raStop` or `raUnclear` for any failure; `isTransientError(err)` is the `raRetry` case. `raRetry` does not make replaying safe — a connection lost during `COMMIT` may have committed — and retries need a cap regardless. See [pg_errors](https://fox0430.github.io/async-postgres/async_postgres/pg_errors.html).
-- **Refusals** — a server refusing the config itself (`28P01`, `3D000`, `42501` at startup) is `raStop`. A `28P01` answering a `credentialsProvider`'s password is not: its next call may return a valid token. A pool reports it as `pekRefused` and keeps it in `PgPool.connectRefusal`, but unlike a config fault keeps dialing, so a server-side fix is picked up. See [pg_pool](https://fox0430.github.io/async-postgres/async_postgres/pg_pool.html).
-- **LISTEN/NOTIFY** — this is the one exception. The listen pump reconnects with exponential backoff (up to 10 attempts, 30 s cap) and re-subscribes to all channels. A NOTIFY sent while the connection is down — from the drop until the channels are listened to again — is lost, and nothing else reports it, so register a callback with `onReconnect` to re-read whatever the missed notifications would have announced. The new session is built from the connection's config alone: `SET` / `set_config` changes, temporary tables, prepared statements and session advisory locks do not carry over, and a `SET ROLE` is lost too, so later queries on the connection run with the login role's privileges. Put a setting that must survive in `ConnConfig.extraParams` (e.g. `("search_path", "app")` or `("role", "app_reader")`; unknown DSN keys land there too). If reconnection is ultimately exhausted the pump gives up permanently; a refusal or a config fault ends it at once. The failure surfaces as one of two types, chosen by what the recovery is:
-  - `PgListenError` (a `PgConnectionError`) — the connection itself is gone; recover by re-dialling with `connect(...)`.
-  - `PgListenStoppedError` (a `PgStateError`, deliberately *not* a `PgConnectionError`) — the pump died but the transport is still usable; recover by calling `listen` again. A reconnect-on-`PgConnectionError` loop must not re-dial here, which is why this type sits outside that hierarchy.
+- **Connection pool (`PgPool` / `PgPoolCluster`)** — broken connections are
+  discarded on `acquire` and `release`.
+- **Direct `PgConnection`** — never reconnects on its own: per-query retry is
+  unsafe for non-idempotent statements and open transactions, so call
+  `connect(...)` again or use the pool.
+- **LISTEN/NOTIFY** — the one exception. The listen pump reconnects with
+  backoff and re-subscribes every channel, but a NOTIFY sent while it is down
+  is lost (catch up in `onReconnect`), session state such as `SET ROLE` does
+  not carry over, and it can give up (watch `onListenError`).
+- **Retry classification** — `retryAdvice(err)` returns `raRetry`, `raStop` or
+  `raUnclear` for any failure. A config fault raises `PgConfigError`, not a
+  `PgConnectionError`, so reconnect loops do not retry it; `raRetry` still
+  does not make replaying a `COMMIT` safe.
 
-  Pull-API callers see either type raised from `waitNotification`, so catch both (or `PgError`) rather than `PgListenError` alone. Push-API callers (`onNotify`) should register `onListenError`, which always reports a `PgListenError`; its `transportAlive` field is true for the death the pull API reports as `PgListenStoppedError`.
+See [pg_pool](https://fox0430.github.io/async-postgres/async_postgres/pg_pool.html),
+[pg_errors](https://fox0430.github.io/async-postgres/async_postgres/pg_errors.html)
+and `onReconnect` in the API docs for the details.
 
 ## Async Backend
 
@@ -146,12 +141,11 @@ nim c -d:asyncBackend=chronos your_app.nim
 
 **chronos is recommended.** chronos supports proper future cancellation, which enables reliable timeout handling and clean connection teardown. asyncdispatch lacks real cancellation — timed-out futures continue running in the background, and `cancelAndWait` is a no-op.
 
-SSL backend differs by async backend (`asyncdispatch`: OpenSSL, `chronos`:
-BearSSL via [nim-bearssl](https://github.com/status-im/nim-bearssl)).
-Without `-d:ssl`, `sslmode=prefer`/`allow` on asyncdispatch connect in
-plaintext (with a stderr notice only if a client certificate is configured),
-and settings that need TLS raise `PgConfigError`. Differences to weigh when
-choosing a backend:
+TLS uses OpenSSL on asyncdispatch and BearSSL (via
+[nim-bearssl](https://github.com/status-im/nim-bearssl)) on chronos. Without
+`-d:ssl`, asyncdispatch connects in plaintext under `sslmode=prefer`/`allow`
+and raises `PgConfigError` for settings that need TLS. Differences to weigh
+when choosing a backend:
 
 - chronos negotiates TLS 1.2 only; asyncdispatch also uses 1.3 when offered.
 - chronos fails the handshake on an expired or not-yet-valid server
@@ -160,29 +154,13 @@ choosing a backend:
 - chronos refuses `verify-full` to an IP-literal host.
 - chronos sends SNI only under `verify-full` (`sslsni` has no effect).
 
+Unlike libpq, `sslrootcert` verifies the server only under `verify-ca` /
+`verify-full`: `require` accepts its certificate unverified even with a CA.
+
 The [API docs](https://fox0430.github.io/async-postgres/async_postgres.html#async-backend)
-list every TLS difference and the downgrade notices, which go to stderr only
-(not to `PgTracer`) and cannot be suppressed.
-
-`sslrootcert` reaches the trust store only under `sslmode=verify-ca` /
-`verify-full`. Under `require` (and `allow` / `prefer`) the server certificate
-is accepted without verification even when a CA is configured; libpq instead
-loads the file whenever it exists and verifies against it even under `require`
-(host-name matching still needs `verify-full`). A DSN's `sslrootcert=` is read
-while the DSN is parsed, whatever the mode, so a missing or unreadable file
-fails there as a `PgConfigError` — `ConnConfig.sslRootCert` holds the PEM.
-
-Client certificate authentication (mTLS) is enabled by setting `sslCert` and
-`sslKey` on `ConnConfig` (or `sslcert=` / `sslkey=` in a DSN, which load the
-files from disk). Both must be provided together, and `sslMode` must be
-`sslPrefer` or stronger (otherwise it is rejected at config time). The key
-must be an **unencrypted** PKCS#8, PKCS#1 or SEC1 PEM; no passphrase callback
-is wired up on either backend. When loaded via DSN on POSIX, the `sslkey` file
-must have no group or world permission bits (stricter than libpq's `0o640` for
-root-owned keys); use `chmod 0600`.
-
-Direct SSL negotiation (`sslnegotiation=direct`) requires `sslmode=require` or
-stronger.
+list every TLS difference and the stderr-only downgrade notices, and show how
+to catch the `sslmode=prefer` plaintext fallback with `conn.sslEnabled`.
+`ConnConfig.sslCert` / `sslKey` describe client certificates (mTLS).
 
 ## Examples
 

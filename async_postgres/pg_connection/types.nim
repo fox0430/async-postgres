@@ -197,7 +197,9 @@ type
   LoadBalanceHosts* = enum
     ## Host ordering (libpq ``load_balance_hosts``).
     lbhDisable ## Configured order (default)
-    lbhRandom ## Shuffle host list per connection (replica spread)
+    lbhRandom
+      ## Shuffle the configured host list per connection (not the addresses
+      ## behind one DNS name)
 
   ConnConfig* = object
     ## Connection configuration. Construct via `parseDsn` or set fields directly.
@@ -255,7 +257,8 @@ type
       ## to `sslPrefer` (libpq parity); a raw zero-initialized `ConnConfig` has
       ## `sslDisable`.
     sslNegotiation*: SslNegotiation
-      ## SSL negotiation method (default: `sslnPostgres`). A raw zero-initialized
+      ## SSL negotiation method (default: `sslnPostgres`). `sslnDirect` needs
+      ## `sslMode` of `sslRequire` or stronger. A raw zero-initialized
       ## `ConnConfig` matches because `sslnPostgres` is the enum's zero value,
       ## which is locked in by a `static:` assertion on `SslNegotiation`.
     sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
@@ -268,7 +271,9 @@ type
       ## PEM-encoded client private key for mutual TLS. The key must be
       ## **unencrypted** on both backends (no passphrase callback is wired up).
       ## PKCS#8, PKCS#1 (``RSA PRIVATE KEY``) and SEC1 (``EC PRIVATE KEY``) PEM
-      ## are accepted. Must be paired with ``sslCert``.
+      ## are accepted. Must be paired with ``sslCert``. From a DSN's ``sslkey=``
+      ## on POSIX, the file must have no group or world permission bits,
+      ## stricter than libpq's ``0640`` for root-owned keys.
     sslSni*: bool
       ## Send TLS SNI (default true; suppressed for IP/empty host). chronos
       ## ignores it: it sends SNI only under `sslVerifyFull`, where BearSSL
@@ -2207,11 +2212,12 @@ func pid*(conn: PgConnection): int32 {.inline.} =
   conn.pid
 
 func host*(conn: PgConnection): lent string {.inline.} =
-  ## Host this connection actually reached (a multi-host DSN picks one).
+  ## The ``hostaddr`` this connection dialed, else its ``host``, as configured
+  ## (not the resolved IP; a multi-host DSN picks one entry).
   conn.host
 
 func port*(conn: PgConnection): int {.inline.} =
-  ## Port this connection actually reached.
+  ## Port this connection dialed.
   conn.port
 
 func config*(conn: PgConnection): lent ConnConfig {.inline.} =
