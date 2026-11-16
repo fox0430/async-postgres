@@ -19,7 +19,8 @@
 ## ==========================  ======================================  ====================================
 ## Negotiated TLS              1.2 minimum, 1.3 when offered           Pinned to 1.2
 ## Expired/not-yet-valid cert  Accepted (not verified) under           Handshake fails with
-##                             ``allow``/``prefer``/``require``        ``PgConnectionError``
+##                             ``allow``/``prefer``, and ``require``   ``PgConnectionError``
+##                             without ``sslrootcert``
 ## IP host, ``verify-full``    Verifies IP SANs (``PgSecurityError``   Refused with ``PgSecurityError``
 ##                             if OpenSSL lacks ``SSL_get0_param``     (dNSName SAN only)
 ##                             or ``X509_VERIFY_PARAM_set1_ip_asc``)
@@ -59,12 +60,12 @@
 ## the server certificate is unavailable (``require`` fails the connect on
 ## both).
 ##
-## ``sslrootcert`` reaches the trust store only under ``verify-ca`` /
-## ``verify-full``; under ``require`` (and ``allow`` / ``prefer``) the server
-## certificate is accepted unverified even when a CA is configured (libpq loads
-## the file whenever it exists and verifies against it even under
-## ``require``). A DSN's ``sslrootcert=`` is read while the DSN is parsed,
-## whatever the mode, so a missing or unreadable file is a ``PgConfigError``.
+## ``sslrootcert`` is checked under ``verify-ca`` / ``verify-full``, and under
+## ``require`` when one is set, as in libpq; ``allow`` / ``prefer`` leave it
+## unused. A DSN's ``sslrootcert=`` is read while the DSN is parsed, whatever
+## the mode, so a missing or unreadable file is a ``PgConfigError``.
+## ``parseDsn`` also reads libpq's default ``~/.postgresql/root.crt``,
+## ``postgresql.crt`` and ``postgresql.key`` (see ``parseDsn``).
 ##
 ## Downgrade and fallback notices
 ## ------------------------------
@@ -72,7 +73,8 @@
 ##
 ## - the ``sslmode=prefer`` plaintext fallback after the server refuses SSL
 ## - a client certificate that will not be sent (no TLS support, a Unix-socket
-##   connection, or that plaintext fallback, which then writes two lines)
+##   connection, or that plaintext fallback, which then writes two lines),
+##   unless it is libpq's default ``postgresql.crt``, which libpq drops silently
 ## - ``channel_binding=prefer`` passing over an offered SCRAM-SHA-256-PLUS for
 ##   lack of a server certificate (written once startup completes)
 ## - temp-file cleanup failures
