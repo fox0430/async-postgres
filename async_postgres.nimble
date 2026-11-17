@@ -1,6 +1,6 @@
 # Package
 
-version = "0.4.1"
+version = "0.5.0"
 author = "fox0430"
 description = "Async PostgreSQL client"
 license = "MIT"
