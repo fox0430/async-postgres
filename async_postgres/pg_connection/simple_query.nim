@@ -280,8 +280,9 @@ proc cancelWithin(conn: PgConnection, timeout: Duration) {.async.} =
   config.tracer = nil
   if overTls and config.sslMode in {sslAllow, sslPrefer}:
     # The session got TLS from this server: an 'N' now is no reason to send
-    # the key in the clear.
+    # the key in the clear. Nor does require check a CA the session did not.
     config.sslMode = sslRequire
+    config.sslRootCert = ""
   let side = newPgConnection(conn.host, conn.port, config)
   let abandoned = new(bool)
   try:

@@ -152,13 +152,14 @@ type
     ## SSL mode. Zero value is ``sslDisable`` (raw ``ConnConfig``); ``parseDsn``/
     ## ``initConnConfig`` default to ``sslPrefer`` (libpq parity).
     ## Backend divergence: chronos/BearSSL also rejects expired certificates
-    ## when ``sslAllow``/``sslPrefer``/``sslRequire`` negotiate TLS, and
+    ## when ``sslAllow``/``sslPrefer``, or ``sslRequire`` without
+    ## ``ConnConfig.sslRootCert``, negotiate TLS, and
     ## refuses IP-literal hosts under ``sslVerifyFull``; full list in the
     ## ``async_postgres`` module doc ("Async Backend").
     sslDisable ## Disable SSL
     sslAllow ## Try plaintext; fall back to SSL if refused
     sslPrefer ## Try SSL; fall back to plaintext if refused (libpq default)
-    sslRequire ## Require SSL (no certificate verification)
+    sslRequire ## Require SSL; verify the CA chain only if ``sslRootCert`` is set
     sslVerifyCa ## Require SSL + verify CA chain (no hostname verification)
     sslVerifyFull ## Require SSL + verify CA chain and hostname
 
@@ -251,6 +252,10 @@ type
     hostDefaulted: bool
       ## The single host is ``DefaultHost`` because none was given: the
       ## password file matches it as ``localhost``, as libpq does.
+    defaultSslCert: string
+      ## The PEM ``parseDsn`` took from libpq's default ``postgresql.crt``,
+      ## which libpq sends only over TLS and drops without a word elsewhere.
+      ## Kept whole so an ``sslCert`` set over it counts as explicit.
     database*: string
     sslMode*: SslMode
       ## SSL/TLS negotiation mode. `parseDsn` and `initConnConfig` default this
@@ -261,7 +266,11 @@ type
       ## `sslMode` of `sslRequire` or stronger. A raw zero-initialized
       ## `ConnConfig` matches because `sslnPostgres` is the enum's zero value,
       ## which is locked in by a `static:` assertion on `SslNegotiation`.
-    sslRootCert*: string ## PEM-encoded CA certificate(s) for sslVerifyCa/sslVerifyFull
+    sslRootCert*: string
+      ## PEM-encoded CA certificate(s) the server's certificate must chain to:
+      ## required by ``sslVerifyCa``/``sslVerifyFull``, and under ``sslRequire``
+      ## checked when set, as libpq does (the host name is matched only by
+      ## ``sslVerifyFull``). Unused by ``sslAllow``/``sslPrefer``.
     sslCert*: string
       ## PEM-encoded client certificate (and any intermediates) for mutual TLS.
       ## Must be paired with ``sslKey``; ``sslMode`` must also be ``sslPrefer``
@@ -881,15 +890,21 @@ func dsnName(mode: SslMode): string {.inline.} =
   of sslVerifyCa: "verify-ca"
   of sslVerifyFull: "verify-full"
 
+func explicitClientCert*(config: ConnConfig): bool {.inline.} =
+  ## A client certificate whose silent drop is worth a warning: one not
+  ## taken from libpq's default file. Sibling-only.
+  config.sslCert.len > 0 and config.sslCert != config.defaultSslCert
+
 proc validateClientCertConfig*(config: ConnConfig) =
   ## Reject inconsistent client certificate configurations early (at config
   ## build time, before any connection is opened). Both halves of an mTLS
   ## credential must be present together, and the SSL mode must actually
-  ## negotiate TLS — otherwise the cert/key would be silently ignored.
+  ## negotiate TLS — otherwise the cert/key would be silently ignored. One
+  ## from libpq's default file passes when the sslmode is lowered after
+  ## parsing, as in libpq: unused under disable, sent if allow falls back to TLS.
   if (config.sslCert.len > 0) xor (config.sslKey.len > 0):
     raise newException(PgConfigError, ClientCertPairingErrorMsg)
-  if (config.sslCert.len > 0 or config.sslKey.len > 0) and
-      config.sslMode in {sslDisable, sslAllow}:
+  if config.explicitClientCert and config.sslMode in {sslDisable, sslAllow}:
     raise newException(
       PgConfigError,
       "sslcert/sslkey require sslmode of prefer or stronger (got " &
@@ -920,7 +935,10 @@ proc validateTlsConfig*(
     # Both backends would fall back to a Web PKI store, and verify-ca skips the
     # hostname check, so any publicly issued cert could MITM. Fail closed.
     raise newException(
-      PgConfigError, "sslmode=verify-ca/verify-full requires sslrootcert to be set"
+      PgConfigError,
+      "sslmode=verify-ca/verify-full requires sslrootcert to be set" &
+        " (parseDsn takes libpq's default root.crt only when it reads the" &
+        " environment and the sslmode it parses is require or stronger)",
     )
 
 func hostDefaulted*(config: ConnConfig): bool {.inline.} =
@@ -930,6 +948,16 @@ func hostDefaulted*(config: ConnConfig): bool {.inline.} =
 proc setHostDefaulted*(config: var ConnConfig, value: bool) {.inline.} =
   ## Sibling-only, like ``hostDefaulted``.
   config.hostDefaulted = value
+
+proc setDefaultSslCert*(config: var ConnConfig, pem: string) {.inline.} =
+  ## Sibling-only, like ``hostDefaulted``.
+  config.defaultSslCert = pem
+
+func verifiesServerCert*(config: ConnConfig): bool {.inline.} =
+  ## Whether the server's certificate chain is checked against
+  ## ``sslRootCert``. Sibling-only.
+  config.sslMode in {sslVerifyCa, sslVerifyFull} or
+    (config.sslMode == sslRequire and config.sslRootCert.len > 0)
 
 # HostEntry accessors
 

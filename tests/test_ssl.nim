@@ -3429,7 +3429,9 @@ JeOmWtVZvOCrgXRtH9DmA+/cbA==
 -----END PRIVATE KEY-----
 """
 
-    proc expiredCertError(mode: SslMode): ref PgConnectionError =
+    proc expiredCertError(
+        mode: SslMode, rootCert = expiredCert
+    ): ref PgConnectionError =
       ## `connect`'s error against a server presenting `expiredCert`.
       var err: ref PgConnectionError
 
@@ -3466,7 +3468,7 @@ JeOmWtVZvOCrgXRtH9DmA+/cbA==
           user: "test",
           database: "test",
           sslMode: mode,
-          sslRootCert: expiredCert,
+          sslRootCert: rootCert,
         )
         try:
           let conn = await connect(config)
@@ -3480,13 +3482,15 @@ JeOmWtVZvOCrgXRtH9DmA+/cbA==
       err
 
     test "an expired certificate sslmode asked to verify is a PgSecurityError":
-      let err = expiredCertError(sslVerifyCa)
-      require err != nil
-      check err of PgSecurityError
-      check "TLS handshake failed" in err.msg
+      # require with a CA verifies too, as in libpq.
+      for mode in [sslVerifyCa, sslRequire]:
+        let err = expiredCertError(mode)
+        require err != nil
+        check err of PgSecurityError
+        check "TLS handshake failed" in err.msg
 
     test "BearSSL rejecting a certificate nothing asked to verify is no PgSecurityError":
-      let err = expiredCertError(sslRequire)
+      let err = expiredCertError(sslRequire, rootCert = "")
       require err != nil
       check "TLS handshake failed" in err.msg
       check not (err of PgSecurityError)

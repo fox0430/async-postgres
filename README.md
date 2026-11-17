@@ -149,13 +149,14 @@ when choosing a backend:
 
 - chronos negotiates TLS 1.2 only; asyncdispatch also uses 1.3 when offered.
 - chronos fails the handshake on an expired or not-yet-valid server
-  certificate even under `allow`/`prefer`/`require`, where asyncdispatch does
-  not check it.
+  certificate even under `allow`/`prefer`, and `require` without a CA, where
+  asyncdispatch does not check it.
 - chronos refuses `verify-full` to an IP-literal host.
 - chronos sends SNI only under `verify-full` (`sslsni` has no effect).
 
-Unlike libpq, `sslrootcert` verifies the server only under `verify-ca` /
-`verify-full`: `require` accepts its certificate unverified even with a CA.
+As in libpq, `require` verifies the server against `sslrootcert` when one is
+set, and `parseDsn` fills unset TLS files from `~/.postgresql` (`root.crt`,
+`postgresql.crt`, `postgresql.key`).
 
 The [API docs](https://fox0430.github.io/async-postgres/async_postgres.html#async-backend)
 list every TLS difference and the stderr-only downgrade notices, and show how

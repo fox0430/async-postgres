@@ -372,7 +372,7 @@ suite "parseDsn: what psql's environment asks for that this client does not":
       check paired.sslCert == "cert"
       check paired.sslKey == "key"
 
-  test "sslrootcert=system from a variable or a service file is rejected":
+  test "sslrootcert=system is rejected wherever it is set":
     # libpq would verify-full against the system store; this client has none.
     for mode in ["", " sslmode=disable", " sslmode=verify-full"]:
       check parseError("host=h" & mode, fakeEnv({"PGSSLROOTCERT": "system"})) ==
@@ -383,26 +383,33 @@ suite "parseDsn: what psql's environment asks for that this client does not":
       check parseError("service=a host=h", fakeEnv({"PGSERVICEFILE": file})) ==
         "service file \"" & file &
         "\", line 2: sslrootcert=system is not supported by this client"
+    # The string's too, rather than a file named system.
+    check parseError("host=h sslmode=verify-full sslrootcert=system", DsnEnv()) ==
+      "sslrootcert=system is not supported by this client"
 
-  test "a CA that exists is rejected under require, from the string too":
+  test "a CA under require is read to check the server against, from the string too":
     # libpq verifies against it under require; prefer and allow may fall back
     # to plaintext there anyway, and a missing CA verifies nothing.
     withTempDir:
       let ca = dir / "ca.pem"
       writeFile(ca, "ca")
-      const msg =
-        "sslrootcert with sslmode=require is not supported by this client; use verify-ca"
-      check parseError("host=h sslmode=require", fakeEnv({"PGSSLROOTCERT": ca})) ==
-        "PGSSLROOTCERT: " & msg
-      check parseError("host=h", fakeEnv({"PGSSLMODE": "require", "PGSSLROOTCERT": ca})) ==
-        "PGSSLROOTCERT: " & msg
-      let file = dir / "s.conf"
-      writeFile(file, "[a]\nsslmode=require\nsslrootcert=" & ca & "\n")
-      check parseError("service=a host=h", fakeEnv({"PGSERVICEFILE": file})) ==
-        "service file \"" & file & "\", line 3: " & msg
-      # The string's own CA is refused the same way, with no variable to blame.
-      check parseError("host=h sslmode=require sslrootcert=" & dsnQuote(ca), fakeEnv()) ==
-        msg
+      for env in [
+        fakeEnv({"PGSSLROOTCERT": ca, "PGSSLMODE": "require"}),
+        fakeEnv({"PGSERVICEFILE": dir / "s.conf", "PGSERVICE": "a"}),
+      ]:
+        writeFile(dir / "s.conf", "[a]\nsslmode=require\nsslrootcert=" & ca & "\n")
+        let cfg = parseDsnWith("host=h", env)
+        check cfg.sslRootCert == "ca"
+        check cfg.verifiesServerCert
+      let own =
+        parseDsnWith("host=h sslmode=require sslrootcert=" & dsnQuote(ca), fakeEnv())
+      check own.sslRootCert == "ca"
+      check own.verifiesServerCert
+      let missing = parseDsnWith(
+        "host=h sslmode=require", fakeEnv({"PGSSLROOTCERT": dir / "missing.pem"})
+      )
+      check missing.sslRootCert == ""
+      check not missing.verifiesServerCert
       check parseDsnWith(
         "host=h sslmode=verify-ca sslrootcert=" & dsnQuote(ca), fakeEnv()
       ).sslRootCert == "ca"
@@ -948,3 +955,247 @@ suite "parseDsn: libpq keywords this client lacks, in the string":
   test "a GUC that shares no libpq keyword still goes to the server":
     let cfg = parseDsn("host=h search_path=app", environment = false)
     check cfg.extraParams == @[("search_path", "app")]
+
+proc tlsDir(dir: string): string =
+  ## Where libpq's default TLS files sit under `userDirVar(dir)`.
+  when defined(windows):
+    userDir(dir)
+  else:
+    dir / ".postgresql"
+
+template withTlsHome(body: untyped) =
+  ## A user directory holding `tls`, the default TLS file directory, and an
+  ## `env` that points at it.
+  withTempDir:
+    let tls {.inject.} = tlsDir(dir)
+    createDir(tls)
+    let env {.inject.} = fakeEnv([userDirVar(dir)])
+    body
+
+proc writeKey(path: string, pem = "key") =
+  writeFile(path, pem)
+  setFilePermissions(path, {fpUserRead, fpUserWrite})
+
+proc defaultOrigin(path: string): string =
+  "default file \"" & path & "\": "
+
+suite "parseDsn: libpq's default TLS files":
+  test "root.crt is the CA under require and stronger, unread below":
+    withTlsHome:
+      writeFile(tls / "root.crt", "ca")
+      for mode in ["disable", "allow", "prefer"]:
+        let cfg = parseDsnWith("host=h sslmode=" & mode, env)
+        check cfg.sslRootCert == ""
+        check not cfg.verifiesServerCert
+      for mode in ["require", "verify-ca", "verify-full"]:
+        let cfg = parseDsnWith("host=h sslmode=" & mode, env)
+        check cfg.sslRootCert == "ca"
+        check cfg.verifiesServerCert
+
+  test "a CA set anywhere else wins over root.crt":
+    withTlsHome:
+      writeFile(tls / "root.crt", "default")
+      let other = dir / "other.pem"
+      writeFile(other, "other")
+      check parseDsnWith("host=h sslmode=verify-ca sslrootcert=" & dsnQuote(other), env).sslRootCert ==
+        "other"
+      check parseDsnWith(
+        "host=h sslmode=verify-ca", fakeEnv([userDirVar(dir), ("PGSSLROOTCERT", other)])
+      ).sslRootCert == "other"
+
+  test "without root.crt, verify-full is left to fail at connect and require checks nothing":
+    withTlsHome:
+      check not fileExists(tls / "root.crt")
+      check parseDsnWith("host=h sslmode=verify-full", env).sslRootCert == ""
+      let req = parseDsnWith("host=h sslmode=require", env)
+      check req.sslRootCert == ""
+      check not req.verifiesServerCert
+
+  test "an unusable root.crt names the default file":
+    withTlsHome:
+      createDir(tls / "root.crt")
+      let msg = parseError("host=h sslmode=require", env)
+      check msg.startsWith("default file: ")
+      check msg.count(tls / "root.crt") == 1
+      check parseDsnWith("host=h", env).sslRootCert == "" # prefer: unread
+
+  test "root.crl is rejected whenever a CA is checked":
+    # libpq checks revocation against it with any CA; this client cannot.
+    withTlsHome:
+      writeFile(tls / "root.crl", "crl")
+      check parseDsnWith("host=h sslmode=require", env).sslRootCert == ""
+      check parseDsnWith("host=h sslmode=prefer", env).sslRootCert == ""
+      # With no CA at all, verify-* fails on that at connect, as in libpq.
+      check parseDsnWith("host=h sslmode=verify-full", env).sslRootCert == ""
+      let ca = dir / "ca.pem"
+      writeFile(ca, "ca")
+      let msg =
+        defaultOrigin(tls / "root.crl") & "sslcrl is not supported by this client"
+      check parseError(
+        "host=h sslmode=require", fakeEnv([userDirVar(dir), ("PGSSLROOTCERT", ca)])
+      ) == msg
+      check parseError("host=h sslmode=verify-full sslrootcert=" & dsnQuote(ca), env) ==
+        msg
+      # An empty sslcrl means the default, as in libpq.
+      writeFile(tls / "root.crt", "ca")
+      check parseError("host=h sslmode=verify-ca sslcrl=", env) == msg
+
+  test "postgresql.crt and postgresql.key are the client certificate under prefer and stronger":
+    withTlsHome:
+      writeFile(tls / "postgresql.crt", "cert")
+      writeKey(tls / "postgresql.key")
+      for mode in ["disable", "allow"]:
+        let cfg = parseDsnWith("host=h sslmode=" & mode, env)
+        check cfg.sslCert == ""
+        check cfg.sslKey == ""
+      for mode in ["prefer", "require"]:
+        let cfg = parseDsnWith("host=h sslmode=" & mode, env)
+        check cfg.sslCert == "cert"
+        check cfg.sslKey == "key"
+        check not cfg.explicitClientCert
+        var own = cfg
+        own.sslCert = "own" # set over the default one
+        check own.explicitClientCert
+      check parseDsnWith("host=h sslcertmode=disable", env).sslCert == ""
+
+  test "a certificate set elsewhere takes the default key, and wins over the default one":
+    withTlsHome:
+      writeFile(tls / "postgresql.crt", "default")
+      writeKey(tls / "postgresql.key")
+      let cert = dir / "c.pem"
+      writeFile(cert, "cert")
+      let own = parseDsnWith("host=h sslcert=" & dsnQuote(cert), env)
+      check own.sslCert == "cert"
+      check own.sslKey == "key"
+      check own.explicitClientCert
+      let fromVar =
+        parseDsnWith("host=h", fakeEnv([userDirVar(dir), ("PGSSLCERT", cert)]))
+      check fromVar.sslCert == "cert"
+      check fromVar.sslKey == "key"
+
+  test "a default certificate passes under an sslmode lowered later":
+    # As in libpq, which reads it whenever it starts TLS; one set in code still fails.
+    withTlsHome:
+      writeFile(tls / "postgresql.crt", "cert")
+      writeKey(tls / "postgresql.key")
+      for mode in [sslDisable, sslAllow]:
+        var cfg = parseDsnWith("host=h", env)
+        cfg.sslMode = mode
+        validateClientCertConfig(cfg)
+        cfg.sslCert = "own"
+        expect PgConfigError:
+          validateClientCertConfig(cfg)
+
+  test "a key named elsewhere goes with the default certificate":
+    withTlsHome:
+      writeFile(tls / "postgresql.crt", "cert")
+      writeKey(tls / "postgresql.key")
+      let key = dir / "k.pem"
+      writeKey(key, "own")
+      let cfg = parseDsnWith("host=h", fakeEnv([userDirVar(dir), ("PGSSLKEY", key)]))
+      check cfg.sslCert == "cert"
+      check cfg.sslKey == "own"
+      # One that is not there is an error, never the default key.
+      check parseError(
+        "host=h", fakeEnv([userDirVar(dir), ("PGSSLKEY", dir / "missing.key")])
+      )
+        .startsWith("PGSSLKEY: Cannot read sslkey file")
+
+  test "a file named elsewhere that is not there keeps the default one out":
+    withTlsHome:
+      writeFile(tls / "root.crt", "ca")
+      writeFile(tls / "postgresql.crt", "cert")
+      writeKey(tls / "postgresql.key")
+      let missing = dir / "missing.pem"
+      let noCert =
+        parseDsnWith("host=h", fakeEnv([userDirVar(dir), ("PGSSLCERT", missing)]))
+      check noCert.sslCert == ""
+      check noCert.sslKey == ""
+      let caEnv = fakeEnv([userDirVar(dir), ("PGSSLROOTCERT", missing)])
+      let noCa = parseDsnWith("host=h sslmode=require", caEnv)
+      check noCa.sslRootCert == ""
+      check not noCa.verifiesServerCert
+      check parseError("host=h sslmode=verify-ca", caEnv).startsWith(
+        "PGSSLROOTCERT: Cannot read sslrootcert file"
+      )
+
+  test "a default certificate without its key is a pairing fault naming it":
+    withTlsHome:
+      writeFile(tls / "postgresql.crt", "cert")
+      check parseError("host=h", env) ==
+        defaultOrigin(tls / "postgresql.crt") & ClientCertPairingErrorMsg
+
+  test "a key alone, with no default certificate, is still a pairing fault":
+    withTlsHome:
+      check not fileExists(tls / "postgresql.crt")
+      let key = dir / "k.pem"
+      writeKey(key)
+      check parseError("host=h sslkey=" & dsnQuote(key), env) ==
+        ClientCertPairingErrorMsg
+
+  when defined(posix):
+    test "a loose default key is refused like any other":
+      withTlsHome:
+        writeFile(tls / "postgresql.crt", "cert")
+        writeFile(tls / "postgresql.key", "key")
+        setFilePermissions(
+          tls / "postgresql.key", {fpUserRead, fpUserWrite, fpGroupRead}
+        )
+        check parseError("host=h", env) ==
+          "default file: sslkey file has group or world accessible permissions," &
+          " refusing to use: " & tls / "postgresql.key"
+
+  when defined(posix):
+    test "a default certificate that cannot be stat'ed is none":
+      # A HOME this process cannot search, as /root for another user.
+      if geteuid() == 0:
+        skip() # root searches mode 000
+      else:
+        withTlsHome:
+          writeFile(tls / "postgresql.crt", "cert")
+          setFilePermissions(tls, {})
+          try:
+            check parseDsnWith("host=h sslmode=require", env).sslCert == ""
+          finally:
+            setFilePermissions(tls, {fpUserRead, fpUserWrite, fpUserExec})
+
+  test "none is read when every host is a Unix socket":
+    withTlsHome:
+      writeFile(tls / "root.crt", "ca")
+      writeFile(tls / "root.crl", "crl")
+      writeFile(tls / "postgresql.crt", "cert")
+      let unix = parseDsnWith("host=/run/pg sslmode=require", env)
+      check unix.sslRootCert == ""
+      check unix.sslCert == ""
+      # A TCP host among them is enough, as for libpq's later attempts.
+      check parseError("host=/run/pg,h sslmode=require", env) ==
+        defaultOrigin(tls / "root.crl") & "sslcrl is not supported by this client"
+
+  test "an empty TLS file value means the default file":
+    withTlsHome:
+      writeFile(tls / "root.crt", "ca")
+      writeFile(tls / "postgresql.crt", "cert")
+      writeKey(tls / "postgresql.key")
+      let cfg = parseDsnWith(
+        "host=h sslmode=verify-ca sslrootcert='' sslcert='' sslkey=''", env
+      )
+      check cfg.sslRootCert == "ca"
+      check cfg.sslCert == "cert"
+      check cfg.sslKey == "key"
+      # The string's empty value still keeps the variable out, as in libpq.
+      check parseDsnWith(
+        "host=h sslmode=verify-ca sslrootcert=''",
+        fakeEnv([userDirVar(dir), ("PGSSLROOTCERT", dir / "missing.pem")]),
+      ).sslRootCert == "ca"
+    let bare = parseDsn(
+      "host=h sslmode=verify-ca sslrootcert='' sslcert=''", environment = false
+    )
+    check bare.sslRootCert == ""
+    check bare.sslCert == ""
+
+  test "environment = false reads no default file":
+    withTlsHome:
+      writeFile(tls / "root.crt", "ca")
+      var off = env
+      off.enabled = false
+      check parseDsnWith("host=h sslmode=require", off).sslRootCert == ""

@@ -396,10 +396,9 @@ when hasTls:
         )
 
       let flags =
-        case config.sslMode
-        of sslVerifyFull:
+        if config.sslMode == sslVerifyFull:
           {}
-        of sslVerifyCa:
+        elif config.verifiesServerCert:
           {TLSFlags.NoVerifyServerName}
         else:
           {TLSFlags.NoVerifyHost, TLSFlags.NoVerifyServerName}
@@ -443,11 +442,10 @@ when hasTls:
       # Advertise ALPN on every TLS connection (libpq 17 parity: SSL_set_alpn_protos
       # is called unconditionally); enforcement stays direct-only below.
       try:
-        if config.sslMode in {sslVerifyCa, sslVerifyFull}:
-          # Both backends read sslrootcert only under these two modes (the
-          # asyncdispatch branch below gates `caPath` the same way): a CA
-          # configured with require/allow/prefer stays unread, where libpq
-          # loads the file whenever it exists and verifies against it.
+        if config.verifiesServerCert:
+          # Both backends gate sslrootcert alike (see `caPath` below): a CA
+          # under allow/prefer stays unread, where libpq would verify and, on
+          # failure, reconnect in plaintext.
           var parsed = parseTrustAnchors(config.sslRootCert)
           conn.installTlsStream(
             newTLSClientAsyncStream(
@@ -497,7 +495,7 @@ when hasTls:
       except AsyncStreamError as e:
         # Folded so no backend exception escapes the PgError contract. Only our
         # X.509 engine's rejection is a security refusal, not the server's alerts.
-        if config.sslMode in {sslVerifyCa, sslVerifyFull} and e of TLSStreamProtocolError and
+        if config.verifiesServerCert and e of TLSStreamProtocolError and
             (ref TLSStreamProtocolError)(e).errCode in
             ERR_X509_OK + 1 .. ERR_X509_NOT_TRUSTED:
           raise newException(PgSecurityError, "TLS handshake failed: " & e.msg, e)
@@ -549,11 +547,9 @@ when hasTls:
         p
 
       try:
-        # Mirrors the chronos branch: sslrootcert is read only under these two
-        # modes, so a CA configured with require/allow/prefer stays unread
-        # where libpq would verify against it under require.
+        # Mirrors the chronos branch.
         let caPath =
-          if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+          if config.verifiesServerCert:
             writeTempPem(config.sslRootCert, "pg_ca_")
           else:
             ""
@@ -573,7 +569,7 @@ when hasTls:
             newException(PgConnectionError, "Failed to create SSL context: " & e.msg, e)
         # Enforce TLS 1.2+ (std/net leaves the min at the library default).
         discard enforceTls12Minimum(ctx.context)
-        if config.sslMode in {sslVerifyCa, sslVerifyFull}:
+        if config.verifiesServerCert:
           SSL_CTX_set_verify(ctx.context, SSL_VERIFY_PEER, nil)
 
         # Load CA / cert / key ourselves rather than letting `newContext` do it
@@ -654,9 +650,7 @@ when hasTls:
           enforceVerifyFullIdentity(conn.socket.sslHandle, sslHost)
         # Drive the handshake now so the peer cert is available before SCRAM
         # decides channel binding (asyncnet defers it to the first send/recv).
-        await driveTlsHandshake(
-          conn.socket, config.sslMode in {sslVerifyCa, sslVerifyFull}, direct
-        )
+        await driveTlsHandshake(conn.socket, config.verifiesServerCert, direct)
         if direct:
           assertAlpnPostgres(getSelectedAlpnOpenssl(conn.socket.sslHandle))
         conn.sslEnabled = true
@@ -739,7 +733,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
   validateTlsConfig(config)
   when not hasTls:
     # Only prefer and allow get here: plaintext without an SSLRequest.
-    if config.sslCert.len > 0:
+    if config.explicitClientCert:
       warnStderr "pg_connection: client certificate will NOT be sent: this build has no TLS (compile with -d:ssl)"
     return
   else:
@@ -848,7 +842,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
         raise newException(PgConnectionError, "Server does not support SSL")
       # sslPrefer: a forged 'N' downgrades to plaintext; sslRequire+ prevents it.
       warnStderr "pg_connection: SSL refused by server, falling back to plaintext (sslmode=prefer)"
-      if config.sslCert.len > 0:
+      if config.explicitClientCert:
         # Make the silent mTLS drop observable on the plaintext fallback.
         warnStderr "pg_connection: client certificate will NOT be sent over the plaintext fallback connection"
     of 'E':

@@ -22,11 +22,6 @@ import ../[async_backend, pg_errors]
 from ../pg_types/encoding import hexNibble
 import types, conf_files
 
-const RootCertUnderRequireErrorMsg =
-  "sslrootcert with sslmode=require is not supported by this client; use verify-ca"
-  ## A CA under ``require`` cannot be honored: libpq verifies the server against
-  ## it there, this client would accept any certificate.
-
 proc parseSslMode(s: string): SslMode =
   case s
   of "disable":
@@ -1525,7 +1520,78 @@ proc mergeEnvironment(f: var DsnFields, env: DsnEnv) =
         continue
     f.add(key, val, name)
 
-proc applyFields(f: DsnFields): ConnConfig =
+when hasTls: # the only caller reads them under hasTls
+  proc defaultFileOrigin(path: string): string =
+    "default file \"" & path & "\""
+
+  proc findItem(items: openArray[DsnItem], key: string): Option[DsnItem] =
+    for it in items:
+      if it.key == key:
+        return some(it)
+
+  proc readDefaultTlsFiles(
+      config: var ConnConfig,
+      dir: string,
+      named: openArray[DsnItem],
+      noClientCert: bool,
+      certOrigin: var string,
+  ) =
+    ## libpq's default TLS files under the user's ``dir`` (``initialize_SSL``),
+    ## each read only where the sslmode uses it and no file was named for it:
+    ## libpq takes a named one as is, so one it cannot find means none.
+    ## ``named``: the TLS files a variable or the service file named, read or not.
+    let base =
+      when defined(windows):
+        dir
+      else:
+        confPath(dir, ".postgresql")
+    template read(path, label: string, checkKeyPerms = false): string =
+      try:
+        readPemFileParam(path, label, checkKeyPerms)
+      except PgConfigError as e:
+        raise e.withOrigin("default file") # the message names the path
+
+    if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
+      if config.sslRootCert.len == 0 and named.findItem("sslrootcert").isNone:
+        let path = confPath(base, "root.crt")
+        if confFileStats(path): # libpq: a file it cannot stat is not there
+          config.sslRootCert = read(path, "sslrootcert")
+      if config.sslRootCert.len > 0:
+        # libpq checks revocation against it whatever the CA; this client cannot.
+        # With no CA, verify-* fails on that first, at connect.
+        let path = confPath(base, "root.crl")
+        if confFileStats(path):
+          raise newException(PgConfigError, "sslcrl is not supported by this client")
+            .withOrigin(defaultFileOrigin(path))
+    if config.sslMode in {sslDisable, sslAllow} or noClientCert:
+      return
+    if config.sslCert.len == 0:
+      if named.findItem("sslcert").isSome:
+        return
+      # Any stat failure means none, where libpq fails on all but ENOENT and,
+      # under prefer, retries in plaintext: a HOME this process cannot search
+      # (/root for another user) must not break every DSN.
+      let path = confPath(base, "postgresql.crt")
+      if not confFileStats(path):
+        return
+      config.sslCert = read(path, "sslcert")
+      config.setDefaultSslCert(config.sslCert)
+      certOrigin = defaultFileOrigin(path)
+    # A key goes only with a certificate, as in libpq: a named one waited for it.
+    if config.sslKey.len == 0:
+      let key = named.findItem("sslkey")
+      if key.isSome:
+        try:
+          config.applyParam("sslkey", key.get.val)
+        except PgConfigError as e:
+          raise e.withOrigin(key.get.origin)
+        return
+      let path = confPath(base, "postgresql.key")
+      if not confFileMissing(path):
+        config.sslKey = read(path, "sslkey", checkKeyPerms = true)
+
+proc applyFields(f: DsnFields, defaultsDir = ""): ConnConfig =
+  ## ``defaultsDir``: where libpq's default TLS files live; "" reads none.
   result.keepAlive = true
   result.sslMode = sslPrefer # libpq default; overridden by an explicit sslmode
   result.sslSni = true # libpq default
@@ -1556,6 +1622,15 @@ proc applyFields(f: DsnFields): ConnConfig =
       tcpUserTimeout = some(it)
       continue
     of "sslcert", "sslkey", "sslrootcert":
+      if it.key == "sslrootcert" and it.val == "system":
+        # libpq's system trust store, which there implies verify-full; a
+        # variable's left unread would keep sslmode at prefer.
+        raise newException(
+            PgConfigError, "sslrootcert=system is not supported by this client"
+          )
+          .withOrigin(it.origin)
+      if it.val.len == 0:
+        continue # libpq: the default file
       if it.origin.len > 0:
         tlsFiles.add it
         continue
@@ -1590,7 +1665,7 @@ proc applyFields(f: DsnFields): ConnConfig =
   if noClientCert.isNone:
     for it in ownCertFiles:
       result.applyParam(it.key, it.val)
-  elif ownCertFiles.anyIt(it.key == "sslcert" and it.val.len > 0) and
+  elif ownCertFiles.anyIt(it.key == "sslcert") and
       result.sslMode notin {sslDisable, sslAllow}:
     raise newException(
         PgConfigError,
@@ -1601,31 +1676,20 @@ proc applyFields(f: DsnFields): ConnConfig =
   # break a sslmode=disable DSN, nor a missing CA one that verifies nothing,
   # nor a certificate one with sslcertmode=disable that sends none.
   # Also as libpq: a missing certificate file means none, and the key is read
-  # only along with a certificate, so the key goes last.
+  # only along with a certificate, so the key goes last (or waits for the
+  # default certificate, in readDefaultTlsFiles).
   let sends = result.sslMode notin {sslDisable, sslAllow}
   var certOrigin = "" # of a client cert or key taken from tlsFiles
   for keyPass in [false, true]:
     for it in tlsFiles:
       if (it.key == "sslkey") != keyPass:
         continue
-      if it.key == "sslrootcert" and it.val == "system":
-        # libpq reads this as the system trust store and verify-full; left
-        # unread it would keep sslmode at prefer.
-        raise newException(
-            PgConfigError, "sslrootcert=system is not supported by this client"
-          )
-          .withOrigin(it.origin)
-      if it.key == "sslrootcert" and result.sslMode == sslRequire and
-          confFileStats(it.val):
-        # libpq verifies the server against a CA that is there even under
-        # require; left unread it would accept any certificate.
-        raise newException(PgConfigError, RootCertUnderRequireErrorMsg).withOrigin(
-            it.origin
-          )
       let used =
         case it.key
         of "sslrootcert":
-          result.sslMode in {sslVerifyCa, sslVerifyFull}
+          # Under require libpq verifies with a CA only if it can stat it.
+          result.sslMode in {sslVerifyCa, sslVerifyFull} or
+            (result.sslMode == sslRequire and confFileStats(it.val))
         of "sslcert":
           sends and noClientCert.isNone and not confFileMissing(it.val)
         else:
@@ -1637,11 +1701,6 @@ proc applyFields(f: DsnFields): ConnConfig =
           raise e.withOrigin(it.origin)
         if it.key != "sslrootcert" and certOrigin.len == 0:
           certOrigin = it.origin
-  # A CA the string itself names is read whatever the sslmode, so one met by
-  # require would go unread like a variable's; refuse it the same way.
-  if result.sslMode == sslRequire and result.sslRootCert.len > 0:
-    raise
-      newException(PgConfigError, RootCertUnderRequireErrorMsg).withOrigin(modeOrigin)
   # A spelled-out empty target is a host or address fault, never a port's.
   try:
     checkExplicitHosts(f.hostList, f.addrList, f.hostGiven, f.addrGiven)
@@ -1675,6 +1734,10 @@ proc applyFields(f: DsnFields): ConnConfig =
   result.host = result.hosts[0].displayHost
   result.hostaddr = result.hosts[0].hostaddr
   result.port = result.hosts[0].port
+  when hasTls:
+    # libpq starts no TLS over a Unix socket, so reads none of them there.
+    if defaultsDir.len > 0 and not result.hosts.allIt(isUnixSocket(it.dialAddr)):
+      result.readDefaultTlsFiles(defaultsDir, tlsFiles, noClientCert.isSome, certOrigin)
   # A variable's file goes unread under disable/allow, so an sslmode fault
   # is the string's file meeting that sslmode; a pairing fault is the files'.
   let paired = (result.sslCert.len > 0) == (result.sslKey.len > 0)
@@ -1686,7 +1749,7 @@ proc applyFields(f: DsnFields): ConnConfig =
 proc parseDsnWith(dsn: string, env: DsnEnv): ConnConfig =
   var env = env
   if env.enabled:
-    # Up to three callers below; without HOME each is a user-database lookup.
+    # Several callers below; without HOME each is a user-database lookup.
     let lookup = env.user
     var looked = false
     var info: tuple[name, home: string]
@@ -1703,15 +1766,18 @@ proc parseDsnWith(dsn: string, env: DsnEnv): ConnConfig =
   mergeService(f, env)
   if env.enabled:
     mergeEnvironment(f, env)
-  result = applyFields(f)
+  let userDir =
+    if env.enabled:
+      libpqUserDir(env)
+    else:
+      ""
+  result = applyFields(f, userDir)
   if env.enabled:
     if result.user.len == 0:
       result.user = env.user().name
-    if result.passFile.len == 0:
-      let dir = libpqUserDir(env)
-      if dir.len > 0:
-        result.passFile =
-          confPath(dir, (when defined(windows): "pgpass.conf" else: ".pgpass"))
+    if result.passFile.len == 0 and userDir.len > 0:
+      result.passFile =
+        confPath(userDir, (when defined(windows): "pgpass.conf" else: ".pgpass"))
   rejectRawNul(result)
 
 proc parseDsn*(dsn: string, environment = true): ConnConfig =
@@ -1739,15 +1805,21 @@ proc parseDsn*(dsn: string, environment = true): ConnConfig =
   ##
   ## From a variable or the service file, ``sslcert`` and ``sslkey`` are read
   ## only for an sslmode that sends them (prefer or stronger, and not with
-  ## ``sslcertmode=disable``) and
-  ## ``sslrootcert`` only for verify-ca or verify-full; under require, an
-  ## ``sslrootcert`` file that exists is a ``PgConfigError`` here or in the
-  ## string, since libpq verifies the server against it there and this client
-  ## would accept any certificate. As in libpq, a missing ``sslcert``
-  ## file there means no client certificate, and ``sslkey`` is read only along
-  ## with one (libpq's ``~/.postgresql`` defaults are not read), and
+  ## ``sslcertmode=disable``) and ``sslrootcert`` only for one that checks it:
+  ## verify-ca, verify-full, or require when the file is there (see
+  ## ``ConnConfig.sslRootCert``). As in libpq, a missing ``sslcert`` file there
+  ## means no client certificate, and ``sslkey`` is read only along with one.
+  ## What none of them names comes on the same terms from libpq's default files
+  ## in ``~/.postgresql`` (``%APPDATA%\postgresql`` on Windows): ``root.crt``,
+  ## ``postgresql.crt`` and ``postgresql.key``. A named file that is not there
+  ## is not replaced by the default one, and a named ``sslkey`` goes with the
+  ## default ``postgresql.crt``, both as in libpq. None is read when every host
+  ## is a Unix socket, where libpq starts no TLS. A ``root.crl`` there is a
+  ## ``PgConfigError`` whenever a CA is checked: libpq checks revocation
+  ## against it, which this client cannot. An empty ``sslrootcert``,
+  ## ``sslcert`` or ``sslkey`` means the default file, as in libpq.
   ## ``sslrootcert=system`` (libpq's system trust store, which there implies
-  ## verify-full) is a ``PgConfigError``. ``client_encoding`` is
+  ## verify-full) is a ``PgConfigError`` wherever it is set. ``client_encoding`` is
   ## ignored there and ``PGDATESTYLE`` keeps only its field order (``DMY``,
   ## ...): the session is UTF8 and ISO regardless.
   ##

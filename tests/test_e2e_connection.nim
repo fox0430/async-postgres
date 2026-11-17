@@ -437,6 +437,80 @@ suite "E2E: SSL Verification":
 
     waitFor t()
 
+  test "sslRequire checks the chain against a set sslRootCert":
+    # As libpq does; the host name is not matched (127.0.0.1 here).
+    proc t() {.async.} =
+      var cfg = sslConfig(sslRequire)
+      cfg.sslRootCert = loadCaCert()
+      let conn = await connect(cfg)
+      doAssert conn.sslEnabled == true
+      await conn.close()
+      cfg.sslRootCert = loadWrongCaCert()
+      var raised = false
+      try:
+        let conn = await connect(cfg)
+        await conn.close()
+      except PgSecurityError:
+        raised = true
+      doAssert raised
+
+    waitFor t()
+
+  test "a prefer session's cancel checks no CA the session did not":
+    # cancel goes on under require, where a set sslRootCert would be checked.
+    proc t() {.async.} =
+      var cfg = sslConfig(sslPrefer)
+      cfg.sslRootCert = loadWrongCaCert()
+      let conn = await connect(cfg)
+      doAssert conn.sslEnabled == true
+      let sleeping = conn.simpleQuery("SELECT pg_sleep(30)")
+      await sleepAsync(milliseconds(100))
+      await conn.cancel()
+      var raised = false
+      try:
+        discard await sleeping
+      except PgError as e:
+        raised = true
+        doAssert "57014" in e.msg
+      doAssert raised
+      await conn.close()
+
+    waitFor t()
+
+  test "a DSN takes libpq's default root.crt as its CA":
+    const userDirVar = when defined(windows): "APPDATA" else: "HOME"
+    let home = createTempDir("pg_tls_home_", "")
+    let tls =
+      when defined(windows):
+        home / "postgresql"
+      else:
+        home / ".postgresql"
+    createDir(tls)
+    let saved = getEnv(userDirVar)
+    putEnv(userDirVar, home)
+    let dsn =
+      "host=" & PgHost & " port=" & $PgPort & " user=" & PgUser & " password=" &
+      PgPassword & " dbname=" & PgDatabase
+    proc t(dsn, tls: string) {.async.} =
+      writeFile(tls / "root.crt", loadCaCert())
+      let conn = await connect(dsn & " sslmode=verify-ca")
+      doAssert conn.sslEnabled == true
+      await conn.close()
+      writeFile(tls / "root.crt", loadWrongCaCert())
+      var raised = false
+      try:
+        let conn = await connect(dsn & " sslmode=require")
+        await conn.close()
+      except PgSecurityError:
+        raised = true
+      doAssert raised
+
+    try:
+      waitFor t(dsn, tls)
+    finally:
+      putEnv(userDirVar, saved)
+      removeDir(home)
+
   test "query over sslVerifyCa connection":
     proc t() {.async.} =
       let conn = await connect(

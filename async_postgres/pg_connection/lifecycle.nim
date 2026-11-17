@@ -601,7 +601,7 @@ proc connectToHostImpl(
     # (allowLeg) too. Certificate verification must use the host *name*, never
     # the dialed hostaddr, and must be per-entry: with multi-host failover
     # config.host only reflects the first entry.
-    if isUnix and config.sslCert.len > 0:
+    if isUnix and config.explicitClientCert:
       # Unix sockets skip TLS regardless of sslmode, so a configured client
       # cert is silently dropped — warn like the sslPrefer 'N' fallback path.
       warnStderr "pg_connection: client certificate will NOT be sent over Unix-socket connection (TLS is skipped for AF_UNIX)"
@@ -792,7 +792,8 @@ proc connectToHost*(config: ConnConfig, entry: HostEntry): Future[PgConnection] 
   ## moves on to the host's next address only when a dial fails.
   ##
   ## On Unix sockets TLS is skipped (libpq parity); if ``sslCert`` is set a
-  ## stderr warning is emitted because the client certificate is not sent.
+  ## stderr warning is emitted because the client certificate is not sent,
+  ## unless ``parseDsn`` took it from libpq's default ``postgresql.crt``.
   ## A ``credentialsProvider`` is called without a timeout.
   if config.credentialsProvider == nil:
     return

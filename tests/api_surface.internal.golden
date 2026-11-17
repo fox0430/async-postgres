@@ -289,6 +289,7 @@ async_postgres/pg_connection/types.nim	errorSeverity
 async_postgres/pg_connection/types.nim	evictForInsert
 async_postgres/pg_connection/types.nim	evictForInsert#2
 async_postgres/pg_connection/types.nim	evictStmtCache
+async_postgres/pg_connection/types.nim	explicitClientCert
 async_postgres/pg_connection/types.nim	failNotifyWaiter
 async_postgres/pg_connection/types.nim	failQueuedReplWrites
 async_postgres/pg_connection/types.nim	fatalServerError
@@ -404,6 +405,7 @@ async_postgres/pg_connection/types.nim	sendBufLen
 async_postgres/pg_connection/types.nim	serverCertDer
 async_postgres/pg_connection/types.nim	serverCertMissing
 async_postgres/pg_connection/types.nim	sessionLockDirty
+async_postgres/pg_connection/types.nim	setDefaultSslCert
 async_postgres/pg_connection/types.nim	setHostDefaulted
 async_postgres/pg_connection/types.nim	setListenReconnecting
 async_postgres/pg_connection/types.nim	setReplFlusher
@@ -435,6 +437,7 @@ async_postgres/pg_connection/types.nim	unregisterNotifyWaiter
 async_postgres/pg_connection/types.nim	updateReplMaxReceivedLsn
 async_postgres/pg_connection/types.nim	validateClientCertConfig
 async_postgres/pg_connection/types.nim	validateTlsConfig
+async_postgres/pg_connection/types.nim	verifiesServerCert
 async_postgres/pg_connection/types.nim	waitReplWrite
 async_postgres/pg_connection/types.nim	warnStderr
 async_postgres/pg_connection/types.nim	wireSettled
