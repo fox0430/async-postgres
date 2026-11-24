@@ -372,20 +372,83 @@ suite "parseDsn: what psql's environment asks for that this client does not":
       check paired.sslCert == "cert"
       check paired.sslKey == "key"
 
-  test "sslrootcert=system is rejected wherever it is set":
-    # libpq would verify-full against the system store; this client has none.
-    for mode in ["", " sslmode=disable", " sslmode=verify-full"]:
-      check parseError("host=h" & mode, fakeEnv({"PGSSLROOTCERT": "system"})) ==
-        "PGSSLROOTCERT: sslrootcert=system is not supported by this client"
+  test "sslrootcert=system trusts the system's roots under verify-full, wherever it is set":
+    proc checkSystem(cfg: ConnConfig) =
+      check cfg.sslRootCertSystem
+      check cfg.sslMode == sslVerifyFull
+      check cfg.sslRootCert == ""
+      check cfg.verifiesServerCert
+
+    checkSystem(parseDsnWith("host=h sslrootcert=system", fakeEnv()))
+    checkSystem(parseDsnWith("host=h", fakeEnv({"PGSSLROOTCERT": "system"})))
+    checkSystem(parseDsnWith("postgresql://h/?sslrootcert=system", fakeEnv()))
+    # The string alone, as with environment = false.
+    checkSystem(parseDsnWith("host=h sslrootcert=system", DsnEnv()))
     withTempDir:
       let file = dir / "s.conf"
       writeFile(file, "[a]\nsslrootcert=system\n")
-      check parseError("service=a host=h", fakeEnv({"PGSERVICEFILE": file})) ==
-        "service file \"" & file &
-        "\", line 2: sslrootcert=system is not supported by this client"
-    # The string's too, rather than a file named system.
-    check parseError("host=h sslmode=verify-full sslrootcert=system", DsnEnv()) ==
-      "sslrootcert=system is not supported by this client"
+      checkSystem(parseDsnWith("service=a host=h", fakeEnv({"PGSERVICEFILE": file})))
+    # Lowered after parsing, it fails validation rather than going unchecked.
+    var lowered = parseDsnWith("host=h sslrootcert=system", fakeEnv())
+    lowered.sslMode = sslRequire
+    expect PgConfigError:
+      validateRootCertConfig(lowered)
+
+  test "with sslrootcert=system an sslmode set anywhere stays, and only verify-full is taken":
+    proc weak(mode: string): string =
+      "weak sslmode \"" & mode &
+        "\" may not be used with sslrootcert=system (use \"verify-full\")"
+
+    check parseDsnWith("host=h sslmode=verify-full sslrootcert=system", fakeEnv()).sslMode ==
+      sslVerifyFull
+    for mode in ["disable", "allow", "prefer", "require", "verify-ca"]:
+      check parseError("host=h sslmode=" & mode & " sslrootcert=system", fakeEnv()) ==
+        weak(mode)
+    # Both origins are named, the string's being implicit.
+    check parseError("host=h sslrootcert=system", fakeEnv({"PGSSLMODE": "require"})) ==
+      "PGSSLMODE: " & weak("require")
+    check parseError("host=h sslmode=require", fakeEnv({"PGSSLROOTCERT": "system"})) ==
+      "PGSSLROOTCERT: " & weak("require")
+    check parseError(
+      "host=h", fakeEnv({"PGSSLMODE": "prefer", "PGSSLROOTCERT": "system"})
+    ) == "PGSSLMODE, PGSSLROOTCERT: " & weak("prefer")
+    withTempDir:
+      let file = dir / "s.conf"
+      writeFile(file, "[a]\nsslmode=require\n")
+      check parseError(
+        "service=a host=h sslrootcert=system", fakeEnv({"PGSERVICEFILE": file})
+      ) == "service file \"" & file & "\", line 2: " & weak("require")
+    # The deprecated spellings set it too, as in libpq.
+    check parseError("host=h sslrootcert=system", fakeEnv({"PGREQUIRESSL": "1"})) ==
+      "PGREQUIRESSL: " & weak("require")
+    check parseError("host=h requiressl=1 sslrootcert=system", fakeEnv()) ==
+      weak("require")
+    check parseError("postgresql://h/?ssl=true&sslrootcert=system", fakeEnv()) ==
+      weak("require")
+    # A PGREQUIRESSL not starting with 1 sets nothing.
+    check parseDsnWith("host=h sslrootcert=system", fakeEnv({"PGREQUIRESSL": "0"})).sslMode ==
+      sslVerifyFull
+
+  test "sslrootcert=system is checked for Unix socket hosts too":
+    # As libpq: verify-full there goes on without TLS.
+    when defined(posix):
+      check parseDsnWith("host=/tmp sslrootcert=system", fakeEnv()).sslMode ==
+        sslVerifyFull
+      check parseError("host=/tmp sslmode=prefer sslrootcert=system", fakeEnv())
+        .startsWith("weak sslmode \"prefer\"")
+
+  test "a path spelling of system names a file":
+    withTempDir:
+      writeFile(dir / "system", "ca")
+      let cwd = getCurrentDir()
+      setCurrentDir(dir)
+      try:
+        let cfg =
+          parseDsnWith("host=h sslmode=verify-full sslrootcert=./system", fakeEnv())
+        check cfg.sslRootCert == "ca"
+        check not cfg.sslRootCertSystem
+      finally:
+        setCurrentDir(cwd)
 
   test "a CA under require is read to check the server against, from the string too":
     # libpq verifies against it under require; prefer and allow may fall back
@@ -1039,6 +1102,22 @@ suite "parseDsn: libpq's default TLS files":
       # An empty sslcrl means the default, as in libpq.
       writeFile(tls / "root.crt", "ca")
       check parseError("host=h sslmode=verify-ca sslcrl=", env) == msg
+
+  test "sslrootcert=system reads neither root.crt nor root.crl, but the client certificate":
+    # libpq loads the default verify paths in place of both root files.
+    withTlsHome:
+      writeFile(tls / "root.crt", "ca")
+      writeFile(tls / "root.crl", "crl")
+      writeFile(tls / "postgresql.crt", "cert")
+      writeKey(tls / "postgresql.key")
+      for spelling in [
+        parseDsnWith("host=h sslrootcert=system", env),
+        parseDsnWith("host=h", fakeEnv([userDirVar(dir), ("PGSSLROOTCERT", "system")])),
+      ]:
+        check spelling.sslRootCertSystem
+        check spelling.sslRootCert == ""
+        check spelling.sslCert == "cert"
+        check spelling.sslKey == "key"
 
   test "postgresql.crt and postgresql.key are the client certificate under prefer and stronger":
     withTlsHome:

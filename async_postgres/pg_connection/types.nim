@@ -268,9 +268,15 @@ type
       ## which is locked in by a `static:` assertion on `SslNegotiation`.
     sslRootCert*: string
       ## PEM-encoded CA certificate(s) the server's certificate must chain to:
-      ## required by ``sslVerifyCa``/``sslVerifyFull``, and under ``sslRequire``
+      ## required by ``sslVerifyCa``/``sslVerifyFull`` (unless
+      ## ``sslRootCertSystem`` stands in for it), and under ``sslRequire``
       ## checked when set, as libpq does (the host name is matched only by
       ## ``sslVerifyFull``). Unused by ``sslAllow``/``sslPrefer``.
+    sslRootCertSystem*: bool
+      ## Trust the system's root certificates (libpq's ``sslrootcert=system``).
+      ## Needs ``sslVerifyFull`` and no ``sslRootCert``. Where they are read
+      ## from depends on the backend (``async_postgres`` module doc, "Async
+      ## Backend"); both read them again on each connection.
     sslCert*: string
       ## PEM-encoded client certificate (and any intermediates) for mutual TLS.
       ## Must be paired with ``sslKey``; ``sslMode`` must also be ``sslPrefer``
@@ -911,6 +917,22 @@ proc validateClientCertConfig*(config: ConnConfig) =
         config.sslMode.dsnName & "); they would otherwise be silently unused",
     )
 
+proc validateRootCertConfig*(config: ConnConfig) {.raises: [PgConfigError].} =
+  ## ``sslRootCertSystem`` takes verify-full and no PEM CA, as libpq. Checked
+  ## whatever the host: over a Unix socket verify-full goes on without TLS.
+  if not config.sslRootCertSystem:
+    return
+  if config.sslRootCert.len > 0:
+    raise newException(
+      PgConfigError, "sslrootcert=system cannot be combined with a PEM sslRootCert"
+    )
+  if config.sslMode != sslVerifyFull:
+    raise newException(
+      PgConfigError,
+      "weak sslmode \"" & config.sslMode.dsnName &
+        "\" may not be used with sslrootcert=system (use \"verify-full\")",
+    )
+
 proc validateTlsConfig*(
     config: ConnConfig, overTcp = true
 ) {.raises: [PgConfigError].} =
@@ -931,14 +953,15 @@ proc validateTlsConfig*(
         "require_auth allows only SCRAM-SHA-256-PLUS, which needs TLS" & hint,
       )
   if overTcp and config.sslMode in {sslVerifyCa, sslVerifyFull} and
-      config.sslRootCert.len == 0:
+      config.sslRootCert.len == 0 and not config.sslRootCertSystem:
     # Both backends would fall back to a Web PKI store, and verify-ca skips the
     # hostname check, so any publicly issued cert could MITM. Fail closed.
     raise newException(
       PgConfigError,
       "sslmode=verify-ca/verify-full requires sslrootcert to be set" &
         " (parseDsn takes libpq's default root.crt only when it reads the" &
-        " environment and the sslmode it parses is require or stronger)",
+        " environment and the sslmode it parses is require or stronger;" &
+        " sslrootcert=system trusts the system's roots under verify-full)",
     )
 
 func hostDefaulted*(config: ConnConfig): bool {.inline.} =
@@ -955,7 +978,8 @@ proc setDefaultSslCert*(config: var ConnConfig, pem: string) {.inline.} =
 
 func verifiesServerCert*(config: ConnConfig): bool {.inline.} =
   ## Whether the server's certificate chain is checked against
-  ## ``sslRootCert``. Sibling-only.
+  ## ``sslRootCert`` or, with ``sslRootCertSystem`` (always verify-full),
+  ## the system's roots. Sibling-only.
   config.sslMode in {sslVerifyCa, sslVerifyFull} or
     (config.sslMode == sslRequire and config.sslRootCert.len > 0)
 

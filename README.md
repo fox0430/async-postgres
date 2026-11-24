@@ -156,7 +156,10 @@ when choosing a backend:
 
 As in libpq, `require` verifies the server against `sslrootcert` when one is
 set, and `parseDsn` fills unset TLS files from `~/.postgresql` (`root.crt`,
-`postgresql.crt`, `postgresql.key`).
+`postgresql.crt`, `postgresql.key`). `sslrootcert=system` verifies the server
+under `verify-full` against the system's root certificates: OpenSSL's default
+paths on asyncdispatch, and `SSL_CERT_FILE`, `SSL_CERT_DIR` or the OS bundle
+on chronos.
 
 The [API docs](https://fox0430.github.io/async-postgres/async_postgres.html#async-backend)
 list every TLS difference and the stderr-only downgrade notices, and show how

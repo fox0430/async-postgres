@@ -624,6 +624,7 @@ async_postgres/pg_connection/types.nim	ConnConfig.sslKey
 async_postgres/pg_connection/types.nim	ConnConfig.sslMode
 async_postgres/pg_connection/types.nim	ConnConfig.sslNegotiation
 async_postgres/pg_connection/types.nim	ConnConfig.sslRootCert
+async_postgres/pg_connection/types.nim	ConnConfig.sslRootCertSystem
 async_postgres/pg_connection/types.nim	ConnConfig.sslSni
 async_postgres/pg_connection/types.nim	ConnConfig.targetSessionAttrs
 async_postgres/pg_connection/types.nim	ConnConfig.tcpUserTimeout

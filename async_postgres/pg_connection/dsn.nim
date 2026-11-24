@@ -1196,6 +1196,7 @@ proc initConnConfig*(
     sslNegotiation = sslnPostgres,
     passFile = "",
     tcpUserTimeout = 0,
+    sslRootCertSystem = false,
 ): ConnConfig =
   ## Create a connection configuration with sensible defaults.
   ## For DSN-based configuration, use `parseDsn` instead. Unlike `parseDsn`,
@@ -1206,7 +1207,9 @@ proc initConnConfig*(
   ## ``ZeroDuration`` (no timeout). When ``hosts`` is non-empty, scalar
   ## ``host``/``hostaddr``/``port`` are overwritten from ``hosts[0]`` (same as
   ## DSN parsers). An empty ``host`` with no ``hostaddr`` is rejected, like an
-  ## explicitly empty ``host`` in a DSN.
+  ## explicitly empty ``host`` in a DSN. ``sslRootCertSystem`` needs
+  ## ``sslMode = sslVerifyFull`` passed too: the default ``sslPrefer`` is not
+  ## raised as ``parseDsn`` raises an unset sslmode.
   result = ConnConfig(
     host: host,
     port: port,
@@ -1217,6 +1220,7 @@ proc initConnConfig*(
     sslMode: sslMode,
     sslNegotiation: sslNegotiation,
     sslRootCert: sslRootCert,
+    sslRootCertSystem: sslRootCertSystem,
     sslCert: sslCert,
     sslKey: sslKey,
     sslSni: sslSni,
@@ -1239,6 +1243,7 @@ proc initConnConfig*(
   )
   validateConnConfig(result)
   validateClientCertConfig(result)
+  validateRootCertConfig(result)
 
 type
   DsnEnv = object ## What ``parseDsn`` reads besides the string. Tests swap it out.
@@ -1551,7 +1556,9 @@ when hasTls: # the only caller reads them under hasTls
       except PgConfigError as e:
         raise e.withOrigin("default file") # the message names the path
 
-    if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull}:
+    # libpq reads neither root file for sslrootcert=system.
+    if config.sslMode in {sslRequire, sslVerifyCa, sslVerifyFull} and
+        not config.sslRootCertSystem:
       if config.sslRootCert.len == 0 and named.findItem("sslrootcert").isNone:
         let path = confPath(base, "root.crt")
         if confFileStats(path): # libpq: a file it cannot stat is not there
@@ -1598,7 +1605,9 @@ proc applyFields(f: DsnFields, defaultsDir = ""): ConnConfig =
   var tlsFiles: seq[DsnItem] # from the environment or a service file
   var ownCertFiles: seq[DsnItem] # the string's sslcert/sslkey, once sslcertmode is known
   var noClientCert = none(string) # where an sslcertmode=disable came from
+  var modeGiven = false
   var modeOrigin = ""
+  var systemOrigin = "" # of sslrootcert=system
   var tcpUserTimeout = none(DsnItem)
   var fallbackAppName = ""
   for it in f.items:
@@ -1606,6 +1615,7 @@ proc applyFields(f: DsnFields, defaultsDir = ""): ConnConfig =
     of "service":
       continue
     of "sslmode":
+      modeGiven = true
       modeOrigin = it.origin
     of "passfile":
       result.passFile = it.val
@@ -1623,12 +1633,10 @@ proc applyFields(f: DsnFields, defaultsDir = ""): ConnConfig =
       continue
     of "sslcert", "sslkey", "sslrootcert":
       if it.key == "sslrootcert" and it.val == "system":
-        # libpq's system trust store, which there implies verify-full; a
-        # variable's left unread would keep sslmode at prefer.
-        raise newException(
-            PgConfigError, "sslrootcert=system is not supported by this client"
-          )
-          .withOrigin(it.origin)
+        # libpq's system trust store, never a file wherever it comes from.
+        result.sslRootCertSystem = true
+        systemOrigin = it.origin
+        continue
       if it.val.len == 0:
         continue # libpq: the default file
       if it.origin.len > 0:
@@ -1659,6 +1667,15 @@ proc applyFields(f: DsnFields, defaultsDir = ""): ConnConfig =
       result.applyParam(it.key, it.val)
     except PgConfigError as e:
       raise e.withOrigin(it.origin)
+  if result.sslRootCertSystem:
+    # As libpq: verify-full unless an sslmode is set anywhere, raised before
+    # anything below reads the sslmode.
+    if not modeGiven:
+      result.sslMode = sslVerifyFull
+    try:
+      validateRootCertConfig(result)
+    except PgConfigError as e:
+      raise e.withOrigin(joinOrigins([modeOrigin, systemOrigin]))
   # The string's client certificate waits for sslcertmode. With disable,
   # libpq reads neither file (a key goes only with a certificate); one that
   # sslmode would send is refused rather than quietly left out.
@@ -1818,8 +1835,11 @@ proc parseDsn*(dsn: string, environment = true): ConnConfig =
   ## ``PgConfigError`` whenever a CA is checked: libpq checks revocation
   ## against it, which this client cannot. An empty ``sslrootcert``,
   ## ``sslcert`` or ``sslkey`` means the default file, as in libpq.
-  ## ``sslrootcert=system`` (libpq's system trust store, which there implies
-  ## verify-full) is a ``PgConfigError`` wherever it is set. ``client_encoding`` is
+  ## ``sslrootcert=system``, wherever it is set, trusts the system's root
+  ## certificates (``ConnConfig.sslRootCertSystem``) and reads neither
+  ## ``root.crt`` nor ``root.crl``; as in libpq, it makes the sslmode
+  ## verify-full unless one is set anywhere, and any other sslmode is a
+  ## ``PgConfigError``. ``./system`` names a file. ``client_encoding`` is
   ## ignored there and ``PGDATESTYLE`` keeps only its field order (``DMY``,
   ## ...): the session is UTF8 and ISO regardless.
   ##
