@@ -23,6 +23,7 @@ async_postgres/pg_bearssl.nim	X509CertCaptureContext.certDer
 async_postgres/pg_bearssl.nim	X509CertCaptureContext.depth
 async_postgres/pg_bearssl.nim	X509CertCaptureContext.inner
 async_postgres/pg_bearssl.nim	X509CertCaptureContext.vtable
+async_postgres/pg_bearssl.nim	certPemDecodes
 async_postgres/pg_bearssl.nim	installX509Capture
 async_postgres/pg_bearssl.nim	loadCertificate
 async_postgres/pg_bearssl.nim	loadPrivateKey
@@ -436,6 +437,7 @@ async_postgres/pg_connection/types.nim	txAbortFields
 async_postgres/pg_connection/types.nim	unregisterNotifyWaiter
 async_postgres/pg_connection/types.nim	updateReplMaxReceivedLsn
 async_postgres/pg_connection/types.nim	validateClientCertConfig
+async_postgres/pg_connection/types.nim	validateRootCertConfig
 async_postgres/pg_connection/types.nim	validateTlsConfig
 async_postgres/pg_connection/types.nim	verifiesServerCert
 async_postgres/pg_connection/types.nim	waitReplWrite

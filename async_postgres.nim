@@ -34,6 +34,12 @@
 ##                             (``openssl x509 -trustout``): aux       (``PgConfigError`` if no other CA is
 ##                             trust settings honoured                 left); export CAs as plain
 ##                                                                     ``CERTIFICATE``
+## ``sslrootcert=system``      OpenSSL's default paths, as libpq:      ``SSL_CERT_FILE``, else the hashed
+##                             ``SSL_CERT_FILE`` and ``SSL_CERT_DIR``  names in ``SSL_CERT_DIR``, else the
+##                             or the build's ``OPENSSLDIR``; with     first bundle ``std/ssl_certs`` finds
+##                             no root there the handshake fails       (Windows: ``cacert.pem`` beside the
+##                             (``PgSecurityError``)                   program or on ``PATH``); none is a
+##                                                                     ``PgConfigError``
 ## Root CA without CA:TRUE     Accepted as a CA with                   Refused as a CA with
 ##                             ``keyUsage`` keyCertSign; a bare        ``PgSecurityError``
 ##                             root and ``CA:FALSE`` are refused
@@ -54,7 +60,8 @@
 ## certificate in ``sslrootcert``, both backends verify it — BearSSL matches
 ## the DN and public key, whatever the CA flag says.
 ##
-## Both backends trust only the pinned ``sslrootcert`` (no system store),
+## Both backends trust only the pinned ``sslrootcert``, or the system's roots
+## with ``sslrootcert=system`` (never the Windows or macOS certificate store),
 ## enforce ALPN for ``sslnegotiation=direct`` only, and drop from
 ## SCRAM-SHA-256-PLUS to SCRAM-SHA-256 under ``channel_binding=prefer`` when
 ## the server certificate is unavailable (``require`` fails the connect on
@@ -66,6 +73,9 @@
 ## the mode, so a missing or unreadable file is a ``PgConfigError``.
 ## ``parseDsn`` also reads libpq's default ``~/.postgresql/root.crt``,
 ## ``postgresql.crt`` and ``postgresql.key`` (see ``parseDsn``).
+## ``sslrootcert=system`` (``ConnConfig.sslRootCertSystem``) takes
+## ``verify-full`` only, which ``parseDsn`` sets when no sslmode is given, as
+## libpq does; both backends read the system's roots on each connection.
 ##
 ## Downgrade and fallback notices
 ## ------------------------------

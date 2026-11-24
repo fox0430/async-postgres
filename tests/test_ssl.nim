@@ -27,6 +27,7 @@ when hasAsyncDispatch and not defined(ssl):
   .}
 
 when hasChronos:
+  import std/tempfiles
   import ../async_postgres/pg_bearssl {.all.}
   import chronos/streams/tlsstream
   import bearssl/abi/bearssl_ssl as bssl
@@ -3560,3 +3561,256 @@ JeOmWtVZvOCrgXRtH9DmA+/cbA==
       )
       check sslEnabled
       check certDerLen > 0
+
+suite "sslrootcert=system config validation":
+  test "initConnConfig takes it only with verify-full and no PEM CA":
+    let cfg = initConnConfig(sslMode = sslVerifyFull, sslRootCertSystem = true)
+    check cfg.sslRootCertSystem
+    check cfg.verifiesServerCert
+    validateTlsConfig(cfg) # stands in for sslrootcert
+    var msg = ""
+    try:
+      discard initConnConfig(sslRootCertSystem = true)
+    except PgConfigError as e:
+      msg = e.msg
+    # The default prefer is not raised, unlike parseDsn's unset sslmode.
+    check msg ==
+      "weak sslmode \"prefer\" may not be used with sslrootcert=system (use \"verify-full\")"
+    expect PgConfigError:
+      discard initConnConfig(
+        sslMode = sslVerifyFull, sslRootCertSystem = true, sslRootCert = testCaCert()
+      )
+
+  test "a hand-built config with a weak sslmode fails before I/O":
+    for direct in [false, true]:
+      let (err, sslRequestSeen) = connectBeforeSsl(
+        ConnConfig(
+          host: "localhost",
+          hostaddr: "127.0.0.1",
+          user: "test",
+          database: "test",
+          sslMode: sslRequire,
+          sslRootCertSystem: true,
+        ),
+        direct,
+      )
+      require err != nil
+      check err of PgConfigError
+      check "sslrootcert=system" in err.msg
+      check not sslRequestSeen
+
+const certDir = currentSourcePath().parentDir / "certs"
+
+template withCertEnv(file, dir: string, body: untyped) =
+  ## `body` with only the given SSL_CERT_FILE / SSL_CERT_DIR ("" unsets).
+  let saved = [
+    (existsEnv("SSL_CERT_FILE"), getEnv("SSL_CERT_FILE")),
+    (existsEnv("SSL_CERT_DIR"), getEnv("SSL_CERT_DIR")),
+  ]
+  for (name, val) in [("SSL_CERT_FILE", file), ("SSL_CERT_DIR", dir)]:
+    if val.len > 0:
+      putEnv(name, val)
+    else:
+      delEnv(name)
+  try:
+    body
+  finally:
+    for i, name in ["SSL_CERT_FILE", "SSL_CERT_DIR"]:
+      if saved[i][0]:
+        putEnv(name, saved[i][1])
+      else:
+        delEnv(name)
+
+when hasChronos:
+  proc serveTlsStartup(
+      ms: MockServer, key: TLSPrivateKey, cert: TLSCertificate
+  ) {.async.} =
+    ## Answer one SSLRequest, then a StartupMessage over TLS with ReadyForQuery.
+    let st = await ms.accept()
+    let reader = newAsyncStreamReader(st)
+    let writer = newAsyncStreamWriter(st)
+    var tls: TLSAsyncStream
+    try:
+      discard await readN(st, 8)
+      await sendBytes(st, @[byte('S')])
+      tls = newTLSServerAsyncStream(
+        reader, writer, key, cert, minVersion = TLSVersion.TLS12
+      )
+      await tls.handshake()
+      var lenBuf = newSeq[byte](4)
+      await tls.reader.readExactly(addr lenBuf[0], 4)
+      discard await tls.reader.read(decodeInt32(lenBuf, 0) - 4)
+      var resp: seq[byte]
+      resp.add(buildBackendMsg('R', @[0'u8, 0, 0, 0]))
+      resp.add(buildBackendMsg('Z', @[byte('I')]))
+      await tls.writer.write(resp)
+      discard await tls.reader.read() # Terminate, then EOF
+    except CatchableError:
+      discard
+    if tls != nil:
+      await tls.reader.closeWait()
+      await tls.writer.closeWait()
+    await reader.closeWait()
+    await writer.closeWait()
+    await closeClient(st)
+
+elif hasAsyncDispatch:
+  proc serveTlsStartup(ms: MockServer) {.async.} =
+    ## As the chronos one, with OpenSSL.
+    let st = await ms.accept()
+    try:
+      discard await readN(st, 8)
+      await sendBytes(st, @[byte('S')])
+      let ctx = newContext(
+        verifyMode = CVerifyNone,
+        certFile = certDir / "server.crt",
+        keyFile = certDir / "server.key",
+      )
+      wrapConnectedSocket(ctx, st, handshakeAsServer)
+      let lenBuf = await readN(st, 4)
+      discard await readN(st, decodeInt32(lenBuf, 0) - 4)
+      var resp: seq[byte]
+      resp.add(buildBackendMsg('R', @[0'u8, 0, 0, 0]))
+      resp.add(buildBackendMsg('Z', @[byte('I')]))
+      await sendBytes(st, resp)
+      discard await st.recv(5) # Terminate
+    except CatchableError:
+      discard
+    finally:
+      st.close()
+
+proc connectSystemRoots(): tuple[err: ref CatchableError, sslEnabled: bool] =
+  ## verify-full with sslrootcert=system to a server whose certificate
+  ## `ca.crt` signed for localhost.
+  doAssert ensureTestCerts(),
+    "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
+  var res: tuple[err: ref CatchableError, sslEnabled: bool]
+
+  proc body(ms: MockServer, serverFut: Future[void]) {.async.} =
+    let config = ConnConfig(
+      host: "localhost",
+      hostaddr: "127.0.0.1",
+      port: ms.port,
+      user: "test",
+      database: "test",
+      sslMode: sslVerifyFull,
+      sslRootCertSystem: true,
+      connectTimeout: seconds(5),
+    )
+    try:
+      let conn = await connect(config)
+      res.sslEnabled = conn.sslEnabled
+      await conn.close()
+    except CatchableError as e:
+      res.err = e
+    finally:
+      await serverFut.wait(seconds(5))
+      await closeServer(ms)
+
+  when hasChronos:
+    proc testBody(key: TLSPrivateKey, cert: TLSCertificate) {.async.} =
+      let ms = startMockServer()
+      await body(ms, serveTlsStartup(ms, key, cert))
+
+    # Made outside the async frames, which must not own them.
+    waitFor testBody(
+      loadPrivateKey(readFile(certDir / "server.key")),
+      loadCertificate(readFile(certDir / "server.crt")),
+    )
+  else:
+    proc testBody() {.async.} =
+      let ms = startMockServer()
+      await body(ms, serveTlsStartup(ms))
+
+    waitFor testBody()
+  res
+
+suite "sslrootcert=system handshake":
+  test "SSL_CERT_FILE's roots verify the server":
+    withCertEnv(certDir / "ca.crt", ""):
+      let (err, sslEnabled) = connectSystemRoots()
+      if err != nil:
+        checkpoint err.msg
+      check err == nil
+      check sslEnabled
+
+  test "a server certificate no system root signed is a PgSecurityError":
+    withCertEnv(certDir / "wrong_ca.crt", ""):
+      let (err, _) = connectSystemRoots()
+      require err != nil
+      check err of PgSecurityError
+
+  when hasChronos:
+    test "SSL_CERT_DIR's hashed names verify the server":
+      let dir = createTempDir("pg_cert_dir_", "")
+      try:
+        copyFile(certDir / "ca.crt", dir / "0123abcd.0")
+        withCertEnv("", dir):
+          let (err, sslEnabled) = connectSystemRoots()
+          check err == nil
+          check sslEnabled
+      finally:
+        removeDir(dir)
+
+    test "an unreadable SSL_CERT_FILE is a PgConfigError naming it":
+      let missing = certDir / "missing.crt"
+      withCertEnv(missing, ""):
+        let (err, _) = connectSystemRoots()
+        require err != nil
+        check err of PgConfigError
+        check ("SSL_CERT_FILE \"" & missing & "\"") in err.msg
+
+when hasChronos:
+  suite "systemRootPem (chronos)":
+    test "SSL_CERT_FILE alone is read, named in the source":
+      let file = certDir / "ca.crt"
+      withCertEnv(file, certDir):
+        let roots = systemRootPem()
+        check roots.pem == readFile(file)
+        check roots.source == "SSL_CERT_FILE \"" & file & "\""
+
+    test "SSL_CERT_DIR reads only OpenSSL's hashed names, in every directory":
+      let a = createTempDir("pg_cert_dir_", "")
+      let b = createTempDir("pg_cert_dir_", "")
+      try:
+        writeFile(a / "0123abcd.0", "a0")
+        writeFile(a / "0123abcd.1", "a1")
+        writeFile(a / "0123abcd.r0", "crl")
+        writeFile(a / "0123ABCD.0", "upper")
+        writeFile(a / "bundle.pem", "bundle")
+        writeFile(b / "ffffffff.0", "b0")
+        let dirs = a & PathSep & b
+        withCertEnv("", dirs):
+          let roots = systemRootPem()
+          check roots.pem == "a0\na1\nb0\n"
+          check roots.source == "SSL_CERT_DIR \"" & dirs & "\""
+        withCertEnv("", a / "missing"):
+          var msg = ""
+          try:
+            discard systemRootPem()
+          except PgConfigError as e:
+            msg = e.msg
+          check msg == "no certificates found in SSL_CERT_DIR \"" & a / "missing" & "\""
+      finally:
+        removeDir(a)
+        removeDir(b)
+
+    test "a hashed file with broken PEM is left out, the rest still trusted":
+      let dir = createTempDir("pg_cert_dir_", "")
+      try:
+        let ca = readFile(certDir / "ca.crt")
+        writeFile(dir / "00000000.0", ca[0 ..< ca.len div 2]) # cut off mid-body
+        writeFile(dir / "11111111.0", ca)
+        withCertEnv("", dir):
+          let roots = systemRootPem()
+          check roots.pem == ca & "\n"
+          check parseTrustAnchors(roots.pem, roots.source).backing.len > 0
+      finally:
+        removeDir(dir)
+
+    when defined(linux) or defined(macosx):
+      test "without either variable the OS bundle is found and parses":
+        withCertEnv("", ""):
+          let roots = systemRootPem()
+          check roots.pem.len > 0
+          check parseTrustAnchors(roots.pem, roots.source).backing.len > 0

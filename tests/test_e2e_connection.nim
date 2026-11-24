@@ -437,6 +437,30 @@ suite "E2E: SSL Verification":
 
     waitFor t()
 
+  test "sslrootcert=system verifies the server against SSL_CERT_FILE":
+    discard loadCaCert() # generates the certificates if missing
+    let had = existsEnv("SSL_CERT_FILE")
+    let saved = getEnv("SSL_CERT_FILE")
+    putEnv("SSL_CERT_FILE", currentSourcePath().parentDir / "certs" / "ca.crt")
+    defer:
+      if had:
+        putEnv("SSL_CERT_FILE", saved)
+      else:
+        delEnv("SSL_CERT_FILE")
+    proc t() {.async.} =
+      let cfg = parseDsn(
+        "host=localhost port=" & $PgPort & " user=" & dsnQuote(PgUser) & " password=" &
+          dsnQuote(PgPassword) & " dbname=" & dsnQuote(PgDatabase) &
+          " sslrootcert=system",
+        environment = false,
+      )
+      doAssert cfg.sslMode == sslVerifyFull
+      let conn = await connect(cfg)
+      doAssert conn.sslEnabled
+      await conn.close()
+
+    waitFor t()
+
   test "sslRequire checks the chain against a set sslRootCert":
     # As libpq does; the host name is not matched (127.0.0.1 here).
     proc t() {.async.} =

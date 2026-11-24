@@ -9,10 +9,19 @@ import std/unittest
 import ../async_postgres/async_backend
 
 when hasChronos:
-  import std/strutils
+  import std/[os, strutils]
   import ../async_postgres/pg_bearssl
   import ../async_postgres/pg_errors
   import chronos/streams/tlsstream
+  import cert_fixtures
+
+  proc caPem(): string =
+    doAssert ensureTestCerts(),
+      "test certificates missing; install openssl and run `bash tests/gen_certs.sh`"
+    readFile(currentSourcePath().parentDir / "certs" / "ca.crt")
+
+  proc certBlock(body: string): string =
+    "-----BEGIN CERTIFICATE-----\n" & body & "\n-----END CERTIFICATE-----\n"
 
   suite "pg_bearssl: PEM loaders reject garbage":
     test "loadCertificate rejects non-PEM text":
@@ -62,6 +71,52 @@ when hasChronos:
       except PgConfigError as e:
         msg = e.msg
       check "TRUSTED CERTIFICATE" in msg
+
+  suite "pg_bearssl: PEM bodies are canonical base64":
+    test "URL-safe, misplaced padding and partial quartets are malformed":
+      for body in ["AB-_", "AA=A", "A===", "AAAA====", "AAA", "AAAAA=", "=AAA"]:
+        var msg = ""
+        try:
+          discard loadCertificate(certBlock(body))
+        except TLSStreamProtocolError as e:
+          msg = e.msg
+        check msg == "Invalid PEM encoding in CERTIFICATE block"
+        expect PgConfigError:
+          discard parseTrustAnchors(certBlock(body))
+
+    test "whitespace inside a body line is skipped":
+      # BearSSL's decoder, used before, skipped it too.
+      let lines = caPem().splitLines
+      var spaced: seq[string]
+      for i, line in lines:
+        spaced.add(
+          if i == 1:
+            line[0 ..< 4] & " \t" & line[4 .. ^1]
+          else:
+            line
+        )
+      check parseTrustAnchors(spaced.join("\n")).backing.len ==
+        parseTrustAnchors(caPem()).backing.len
+
+  suite "pg_bearssl: trust anchor errors name the source":
+    test "a source replaces the generic wording":
+      const source = "SSL_CERT_FILE \"/x.pem\""
+      var msg = ""
+      try:
+        discard parseTrustAnchors("", source)
+      except PgConfigError as e:
+        msg = e.msg
+      check msg == "No valid CA certificates found in " & source
+      try:
+        discard parseTrustAnchors(certBlock("AA=A"), source)
+      except PgConfigError as e:
+        msg = e.msg
+      check msg == "Invalid PEM encoding in CERTIFICATE block in " & source
+      try:
+        discard parseTrustAnchors(certBlock("AA=A"))
+      except PgConfigError as e:
+        msg = e.msg
+      check msg == "Invalid PEM encoding in CERTIFICATE block of CA data"
 else:
   suite "pg_bearssl: asyncdispatch stub":
     test "module compiles to an empty stub without chronos":

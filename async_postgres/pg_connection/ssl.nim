@@ -62,6 +62,7 @@ when hasChronos:
     {.error: "the chronos backend requires chronos >= 4.4.0".}
   from bearssl/x509 import ERR_X509_OK, ERR_X509_NOT_TRUSTED
   import ../pg_bearssl
+  import std/[algorithm, os, ssl_certs]
 elif hasAsyncDispatch:
   when defined(ssl):
     import std/[asyncnet, dynlib, openssl, tempfiles, os]
@@ -125,6 +126,8 @@ when hasAsyncDispatch and defined(ssl):
     .}
     SslCtxSetDefaultPasswdCbFn =
       proc(ctx: SslCtx, cb: pem_password_cb) {.cdecl, gcsafe, raises: [].}
+    SslCtxSetDefaultVerifyPathsFn =
+      proc(ctx: SslCtx): cint {.cdecl, gcsafe, raises: [].}
     SslGetPeerCertificateFn = proc(ssl: SslPtr): PX509 {.cdecl, gcsafe, raises: [].}
     X509FreeFn = proc(cert: PX509) {.cdecl, gcsafe, raises: [].}
 
@@ -160,6 +163,9 @@ when hasAsyncDispatch and defined(ssl):
       cast[SslCtxSetAlpnProtosFn](resolveSym(sslDynlib, "SSL_CTX_set_alpn_protos"))
     sslCtxSetDefaultPasswdCb = cast[SslCtxSetDefaultPasswdCbFn](resolveSym(
       sslDynlib, "SSL_CTX_set_default_passwd_cb"
+    ))
+    sslCtxSetDefaultVerifyPaths = cast[SslCtxSetDefaultVerifyPathsFn](resolveSym(
+      sslDynlib, "SSL_CTX_set_default_verify_paths"
     ))
     # std/openssl intentionally omits these declarations on Windows. Resolve
     # them ourselves so Windows keeps SCRAM-SHA-256-PLUS channel binding.
@@ -365,6 +371,82 @@ when hasTls:
           selected.escape("", "") & "' (expected '" & PgAlpnProtocol & "')",
       )
 
+when hasChronos:
+  proc isHashedCertName(name: string): bool =
+    ## OpenSSL's name for a certificate in a hashed directory (8 hex digits,
+    ## '.', a number), so no CRL (``.rN``) or bundle beside them is read.
+    if name.len < 10 or name[8] != '.':
+      return false
+    for i in 0 ..< 8:
+      if name[i] notin {'0' .. '9', 'a' .. 'f'}:
+        return false
+    for i in 9 ..< name.len:
+      if name[i] notin Digits:
+        return false
+    true
+
+  proc readHashedDir(dir: string, pem: var string) {.raises: [OSError].} =
+    var paths: seq[string]
+    for kind, path in walkDir(dir):
+      if kind in {pcFile, pcLinkToFile} and isHashedCertName(path.extractFilename):
+        paths.add path
+    paths.sort()
+    for path in paths:
+      var text: string
+      try:
+        text = readFile(path)
+      except IOError:
+        continue # a dangling link: OpenSSL finds nothing there either
+      # OpenSSL reads a hashed file only to look up its own subject, so a
+      # broken one must not reject the rest.
+      if certPemDecodes(text):
+        pem.add text
+        pem.add '\n'
+
+  proc systemRootPem(): tuple[pem, source: string] {.raises: [PgConfigError].} =
+    ## The roots ``sslrootcert=system`` trusts, read on each connection:
+    ## ``SSL_CERT_FILE``, else the hashed names in each ``SSL_CERT_DIR``
+    ## directory, else the first file or directory ``std/ssl_certs`` finds.
+    try:
+      let file = getEnv("SSL_CERT_FILE")
+      if file.len > 0:
+        result.source = "SSL_CERT_FILE \"" & file & "\""
+        try:
+          result.pem = readFile(file)
+        except IOError as e:
+          raise newException(
+            PgConfigError, "could not read " & result.source & ": " & e.msg
+          )
+        return
+      let dirs = getEnv("SSL_CERT_DIR")
+      if dirs.len > 0:
+        result.source = "SSL_CERT_DIR \"" & dirs & "\""
+        for dir in dirs.split(PathSep):
+          if dir.len > 0:
+            readHashedDir(dir, result.pem)
+        if result.pem.len == 0:
+          raise newException(PgConfigError, "no certificates found in " & result.source)
+        return
+      for path in scanSSLCertificates():
+        result.source = "\"" & path & "\""
+        if dirExists(path):
+          readHashedDir(path, result.pem)
+        else:
+          try:
+            result.pem = readFile(path)
+          except IOError as e:
+            raise newException(
+              PgConfigError, "could not read " & result.source & ": " & e.msg
+            )
+        break
+    except OSError as e:
+      raise
+        newException(PgConfigError, "could not read system root certificates: " & e.msg)
+    if result.pem.len == 0:
+      raise newException(
+        PgConfigError, "no system root certificates found; set SSL_CERT_FILE"
+      )
+
 proc sniName*(sslHost: string, sslSni: bool): string =
   ## SNI value. Empty = no SNI (IP literal or no host).
   if not sslSni:
@@ -446,7 +528,12 @@ when hasTls:
           # Both backends gate sslrootcert alike (see `caPath` below): a CA
           # under allow/prefer stays unread, where libpq would verify and, on
           # failure, reconnect in plaintext.
-          var parsed = parseTrustAnchors(config.sslRootCert)
+          var parsed =
+            if config.sslRootCertSystem:
+              let roots = systemRootPem()
+              parseTrustAnchors(roots.pem, roots.source)
+            else:
+              parseTrustAnchors(config.sslRootCert)
           conn.installTlsStream(
             newTLSClientAsyncStream(
               conn.baseReader,
@@ -549,7 +636,7 @@ when hasTls:
       try:
         # Mirrors the chronos branch.
         let caPath =
-          if config.verifiesServerCert:
+          if config.verifiesServerCert and not config.sslRootCertSystem:
             writeTempPem(config.sslRootCert, "pg_ca_")
           else:
             ""
@@ -562,7 +649,7 @@ when hasTls:
           # SSL_CTX_load_verify_locations *appends* sslrootcert instead of
           # replacing that store — any Web-PKI-issued cert would then pass
           # verify-ca/verify-full. Peer verification is enabled manually below
-          # so only the pinned CA is trusted.
+          # so only the pinned CA (or, for system, the default paths) is trusted.
           ctx = newContext(verifyMode = CVerifyNone)
         except CatchableError as e:
           raise
@@ -578,7 +665,18 @@ when hasTls:
         # returning the SslContext, so no handle to `destroyContext`). Doing it
         # here keeps `ctx` non-nil so the outer `finally` cleans up.
         try:
-          if caPath.len > 0:
+          if config.sslRootCertSystem:
+            # libpq's call for system. A store with no roots still returns 1
+            # and fails the handshake's verification instead.
+            if sslCtxSetDefaultVerifyPaths == nil:
+              raise newException(
+                IOError, "libssl does not export SSL_CTX_set_default_verify_paths"
+              )
+            if sslCtxSetDefaultVerifyPaths(ctx.context) != 1:
+              raise newException(
+                IOError, formatSslError("could not load system root certificate paths")
+              )
+          elif caPath.len > 0:
             if SSL_CTX_load_verify_locations(ctx.context, caPath.cstring, nil) != 1:
               raise newException(IOError, "Failed to load CA certificate: " & caPath)
           if certPath.len > 0:
@@ -729,6 +827,7 @@ proc negotiateSSL*(conn: PgConnection, config: ConnConfig, sslHost: string) {.as
     raise
       newException(PgConfigError, "negotiateSSL requires sslmode other than disable")
   validateClientCertConfig(config)
+  validateRootCertConfig(config)
   validateDirectSslCompatible(config)
   validateTlsConfig(config)
   when not hasTls:

@@ -179,8 +179,8 @@ when hasChronos:
     malformed: bool ## Unterminated, mismatched END, or a header inside the body
 
   proc pemBlocks(pem: string): seq[PemBlock] =
-    ## Split `pem` into undecoded blocks. Unlike `pemDecode`, tolerates text
-    ## around blocks and RFC 1421 headers, as OpenSSL does.
+    ## Split `pem` into undecoded blocks. Unlike BearSSL's PEM decoder,
+    ## tolerates text around blocks and RFC 1421 headers, as OpenSSL does.
     var open, inHeader = false
     var cur: PemBlock
     for rawLine in pem.splitLines:
@@ -224,15 +224,35 @@ when hasChronos:
     else:
       label.escape("", "")
 
+  proc canonicalBase64(body: string, text: var string): bool =
+    ## Whether ``body`` is whole base64 quartets with padding only at the end,
+    ## as BearSSL's PEM decoder requires (std/base64 takes URL-safe or
+    ## truncated text); ``text`` gets it without the whitespace BearSSL skips.
+    text = newStringOfCap(body.len)
+    var pad = 0
+    for c in body:
+      case c
+      of 'A' .. 'Z', 'a' .. 'z', '0' .. '9', '+', '/':
+        if pad > 0:
+          return false
+        text.add c
+      of '=':
+        inc pad
+        text.add c
+      of '\0' .. ' ':
+        discard
+      else:
+        return false
+    pad <= 2 and text.len mod 4 == 0
+
   proc decode(b: PemBlock): seq[byte] {.raises: [TLSStreamProtocolError].} =
     ## DER of an unencrypted block; raises when it is malformed.
-    # BearSSL's decoder, unlike std/base64, rejects URL-safe or truncated text.
-    if not (b.malformed or b.encrypted):
+    # Not BearSSL's PEM decoder: a system bundle takes it 10ms, blocking the loop.
+    var text: string
+    if not (b.malformed or b.encrypted) and canonicalBase64(b.body, text):
       try:
-        let items = pemDecode("-----BEGIN X-----\n" & b.body & "\n-----END X-----\n")
-        if items.len == 1:
-          return items[0].data
-      except TLSStreamProtocolError:
+        return toBytes(base64.decode(text))
+      except ValueError:
         discard
     raise newException(
       TLSStreamProtocolError,
@@ -263,6 +283,16 @@ when hasChronos:
       let data = decode(b)
       if data.len > 0:
         yield (if isTrusted: firstDerElement(data) else: data)
+
+  proc certPemDecodes*(pem: string): bool =
+    ## Whether `parseTrustAnchors` decodes every certificate block of `pem`
+    ## without raising.
+    try:
+      for _ in certificateDers(pemBlocks(pem), trusted = false):
+        discard
+      true
+    except TLSStreamProtocolError:
+      false
 
   proc loadCertificate*(
       pem: string
@@ -459,9 +489,10 @@ when hasChronos:
       raise newException(TLSStreamProtocolError, unreadable)
     raise newException(TLSStreamProtocolError, "Could not find private key")
 
-  proc parseTrustAnchors*(pemData: string): TrustAnchorResult =
+  proc parseTrustAnchors*(pemData: string, source = ""): TrustAnchorResult =
     ## Parse PEM-encoded CA certificates into a TrustAnchorStore.
     ## Returns both the store and the backing memory that anchor pointers reference.
+    ## ``source`` names where ``pemData`` was read from, for errors.
     ##
     ## IMPORTANT: X509TrustAnchor contains raw `ptr byte` fields (dn.data,
     ## pkey.key.rsa.n/e, pkey.key.ec.q). TrustAnchorStore.new() only shallow-copies
@@ -536,12 +567,17 @@ when hasChronos:
         anchors.add(anchor)
     except TLSStreamProtocolError as e:
       # Same config fault as the anchorless case below.
-      raise newException(PgConfigError, e.msg & " of CA data")
+      raise newException(
+        PgConfigError, e.msg & (if source.len > 0: " in " & source
+        else: " of CA data")
+      )
 
     if anchors.len == 0:
       # A config fault a reconnect loop can only spin on (see `pg_errors`).
       # TRUSTED CERTIFICATE is skipped: ignoring its trust settings widens trust.
-      var msg = "No valid CA certificates found in PEM data"
+      var msg =
+        "No valid CA certificates found in " &
+        (if source.len > 0: source else: "PEM data")
       for b in blocks:
         if b.label == TrustedCertLabel:
           msg.add(

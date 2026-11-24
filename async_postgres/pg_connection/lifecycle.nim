@@ -393,6 +393,7 @@ proc hostConfig(config: ConnConfig, entry: HostEntry, validated = false): ConnCo
   if not validated:
     validateConnConfig(result)
     validateClientCertConfig(result)
+    validateRootCertConfig(result)
     # The sslAllow plaintext leg skips `negotiateSSL`: a direct/weak-sslmode
     # conflict has to fail here, before any dial.
     validateDirectSslCompatible(result)
@@ -1096,6 +1097,7 @@ proc connect*(config: ConnConfig): Future[PgConnection] =
     # hostaddr / cert config (``initConnConfig`` alone is not enough).
     validateConnConfig(config)
     validateClientCertConfig(config)
+    validateRootCertConfig(config)
     # sslrootcert is left to each host's attempt: a Unix socket needs none.
     validateSecurityConfig(config, overTcp = false)
     # Compute the ordered host list once so the trace and the actual connection
