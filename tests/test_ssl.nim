@@ -3798,7 +3798,7 @@ when hasChronos:
         writeFile(a / "0123abcd.0", "a0")
         writeFile(a / "0123abcd.1", "a1")
         writeFile(a / "0123abcd.r0", "crl")
-        writeFile(a / "0123ABCD.0", "upper")
+        writeFile(a / "89ABCDEF.0", "upper")
         writeFile(a / "bundle.pem", "bundle")
         writeFile(b / "ffffffff.0", "b0")
         let dirs = a & PathSep & b
