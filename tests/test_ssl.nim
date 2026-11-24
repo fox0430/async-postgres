@@ -3734,20 +3734,33 @@ proc connectSystemRoots(): tuple[err: ref CatchableError, sslEnabled: bool] =
     waitFor testBody()
   res
 
+proc canVerifySystemRoots(): bool =
+  ## Apple's system libssl lacks `SSL_set1_host`, so verify-full fails closed.
+  when hasChronos:
+    true
+  else:
+    sslSet1Host != nil and sslCtxSetDefaultVerifyPaths != nil
+
 suite "sslrootcert=system handshake":
   test "SSL_CERT_FILE's roots verify the server":
-    withCertEnv(certDir / "ca.crt", ""):
-      let (err, sslEnabled) = connectSystemRoots()
-      if err != nil:
-        checkpoint err.msg
-      check err == nil
-      check sslEnabled
+    if not canVerifySystemRoots():
+      skip()
+    else:
+      withCertEnv(certDir / "ca.crt", ""):
+        let (err, sslEnabled) = connectSystemRoots()
+        if err != nil:
+          checkpoint err.msg
+        check err == nil
+        check sslEnabled
 
   test "a server certificate no system root signed is a PgSecurityError":
-    withCertEnv(certDir / "wrong_ca.crt", ""):
-      let (err, _) = connectSystemRoots()
-      require err != nil
-      check err of PgSecurityError
+    if not canVerifySystemRoots():
+      skip()
+    else:
+      withCertEnv(certDir / "wrong_ca.crt", ""):
+        let (err, _) = connectSystemRoots()
+        require err != nil
+        check err of PgSecurityError
 
   when hasChronos:
     test "SSL_CERT_DIR's hashed names verify the server":
