@@ -3601,25 +3601,34 @@ suite "sslrootcert=system config validation":
 
 const certDir = currentSourcePath().parentDir / "certs"
 
+when defined(windows):
+  proc msvcrtPutenv(
+    entry: cstring
+  ): cint {.cdecl, dynlib: "msvcrt.dll", importc: "_putenv".}
+
+proc setCertEnv(name, val: string) =
+  ## Sets `name`, or unsets it for "".
+  if val.len > 0:
+    putEnv(name, val)
+  else:
+    delEnv(name)
+  when defined(windows):
+    # Nim's OpenSSL DLLs read msvcrt's copy of the environment, which a UCRT
+    # executable's putEnv does not reach.
+    doAssert msvcrtPutenv(cstring(name & "=" & val)) == 0
+
 template withCertEnv(file, dir: string, body: untyped) =
   ## `body` with only the given SSL_CERT_FILE / SSL_CERT_DIR ("" unsets).
   let saved = [
-    (existsEnv("SSL_CERT_FILE"), getEnv("SSL_CERT_FILE")),
-    (existsEnv("SSL_CERT_DIR"), getEnv("SSL_CERT_DIR")),
+    ("SSL_CERT_FILE", getEnv("SSL_CERT_FILE")), ("SSL_CERT_DIR", getEnv("SSL_CERT_DIR"))
   ]
-  for (name, val) in [("SSL_CERT_FILE", file), ("SSL_CERT_DIR", dir)]:
-    if val.len > 0:
-      putEnv(name, val)
-    else:
-      delEnv(name)
+  setCertEnv("SSL_CERT_FILE", file)
+  setCertEnv("SSL_CERT_DIR", dir)
   try:
     body
   finally:
-    for i, name in ["SSL_CERT_FILE", "SSL_CERT_DIR"]:
-      if saved[i][0]:
-        putEnv(name, saved[i][1])
-      else:
-        delEnv(name)
+    for (name, val) in saved:
+      setCertEnv(name, val)
 
 when hasChronos:
   proc serveTlsStartup(
