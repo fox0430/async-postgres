@@ -565,6 +565,7 @@ async_postgres/pg_types/decoding.nim	decodePointBinary
 async_postgres/pg_types/decoding.nim	ensureNoTrailing
 async_postgres/pg_types/decoding.nim	export array
 async_postgres/pg_types/decoding.nim	export pg_bytes
+async_postgres/pg_types/decoding.nim	parseTextArrayDelim
 async_postgres/pg_types/decoding.nim	rejectMultiDim
 async_postgres/pg_types/encoding.nim	addBind
 async_postgres/pg_types/encoding.nim	addParse
