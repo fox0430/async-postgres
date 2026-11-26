@@ -351,7 +351,7 @@ proc rejectMultiDim*(
     raise newException(
       PgTypeError,
       "Multi-dimensional array (ndim=" & $decoded.dims.len &
-        ") cannot be read as seq; use the PgArray[T] accessor instead",
+        ") cannot be read as seq; use PgArray[T] instead",
     )
 
 proc decodeBinaryComposite*(
@@ -1270,45 +1270,86 @@ proc parsePointsText*(s: string): seq[PgPoint] {.raises: [PgError].} =
 
 # Array text format parser
 
-proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
+proc parseTextArrayDelim*(
+    s: string, delim: char
+): seq[Option[string]] {.raises: [PgError].} =
   ## Parse PostgreSQL 1-D text-format array literal: {elem1,elem2,...}
   ## Returns elements as ``Option[string]`` (none for NULL).
+  ## ``delim`` is the element type's array delimiter (``;`` for ``box``).
+  ## A ``[l:u]=`` prefix, which the server prints when the lower bound is not
+  ## 1, is checked against the element count and dropped, as the binary 1-D
+  ## accessors drop the header's bound.
   ## Raises ``PgTypeError`` for multi-dimensional literals; callers that need
   ## multi-dim support should decode via the ``PgArray[T]`` accessors.
   ## Every error carries ``len=`` and ``pos=``, the latter a 0-based byte offset
   ## into ``s`` (so it matches what the caller sees) pointing at the byte that
   ## failed — for an unterminated quoted element, at its opening quote. An empty
-  ## literal has no byte to point at and reports ``pos=0``.
-  if s.len < 2 or s[0] != '{' or s[^1] != '}':
+  ## literal has no byte to point at and reports ``pos=0``; bounds that do not
+  ## match the element count report the prefix's ``[`` at ``pos=0``.
+  doAssert delim notin {'"', '\\', '{', '}'},
+    "array delimiter cannot be a structural byte"
+  template fail(what: string, pos: int) =
+    raise newException(PgTypeError, what & " (len=" & $s.len & ", pos=" & $pos & ")")
+
+  const multiDimMsg =
+    "Multi-dimensional array text literal cannot be read as seq; " &
+    "use PgArray[T] instead"
+  # Offset of the opening brace; non-zero only after a bounds prefix.
+  var b = 0
+  # int64: the span of two int32 bounds overflows a 32-bit int.
+  var declared = -1'i64
+  if s.len > 0 and s[0] == '[':
+    let close = s.find(']', 1)
+    if close < 0:
+      fail("array: unterminated bounds", 0)
+    let colon = s.find(':', 1)
+    if colon < 0 or colon > close:
+      fail("array: malformed bounds", close)
+    var lower, upper: int32
+    try:
+      lower = pgParseInt32(s[1 ..< colon])
+    except PgTypeError:
+      fail("array: malformed bounds", 1)
+    try:
+      upper = pgParseInt32(s[colon + 1 ..< close])
+    except PgTypeError:
+      fail("array: malformed bounds", colon + 1)
+    if upper < lower:
+      fail("array: upper bound below lower", colon + 1)
+    b = close + 1
+    if b < s.len and s[b] == '[':
+      fail(multiDimMsg, b)
+    if b >= s.len:
+      fail("array: bounds without '='", close)
+    if s[b] != '=':
+      fail("array: bounds without '='", b)
+    b += 1
+    declared = int64(upper) - int64(lower) + 1
+  if s.len - b < 2 or s[b] != '{' or s[^1] != '}':
     # Point at the brace that is wrong; a literal too short to have one reports
-    # offset 0, so every error from here carries both ``len=`` and ``pos=``.
+    # its start, so every error from here carries both ``len=`` and ``pos=``.
     let bracePos =
-      if s.len >= 2 and s[0] == '{':
+      if s.len - b >= 2 and s[b] == '{':
         s.len - 1
+      elif b > 0 and b >= s.len:
+        b - 1 # nothing after a bounds prefix's '='
       else:
-        0
-    raise newException(
-      PgTypeError, "Invalid array literal (len=" & $s.len & ", pos=" & $bracePos & ")"
-    )
-  let inner = s[1 ..^ 2]
-  if inner.len == 0:
-    return @[]
+        b
+    fail("Invalid array literal", bracePos)
+  let inner = s[b + 1 ..^ 2]
+  # Offset in ``s`` of ``inner[0]``.
+  let o = b + 1
   var i = 0
   while i < inner.len:
     # A '{' at an element-start position marks a nested subarray. Silently
-    # splitting on ',' would yield garbage fragments (e.g. "{{a,b},{c,d}}"
-    # → ["{a","b}","{c","d}"]), so raise here to mirror the binary path's
-    # rejectMultiDim contract.
+    # splitting on the delimiter would yield garbage fragments (e.g.
+    # "{{a,b},{c,d}}" → ["{a","b}","{c","d}"]), so raise here to mirror the
+    # binary path's rejectMultiDim contract.
     if inner[i] == '{':
-      raise newException(
-        PgTypeError,
-        "Multi-dimensional array text literal cannot be read as seq; " &
-          "use the PgArray[T] accessor instead (len=" & $s.len & ", pos=" & $(i + 1) &
-          ")",
-      )
+      fail(multiDimMsg, i + o)
     if inner[i] == '"':
       # Quoted element
-      let quotePos = i + 1 # 0-based offset of the opening quote in ``s``
+      let quotePos = i + o # offset of the opening quote in ``s``
       i += 1
       var elem = ""
       while i < inner.len:
@@ -1321,44 +1362,38 @@ proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
           elem.add(inner[i])
         i += 1
       if i >= inner.len:
-        raise newException(
-          PgTypeError,
-          "array: unterminated quoted element (len=" & $s.len & ", pos=" & $quotePos &
-            ")",
-        )
+        fail("array: unterminated quoted element", quotePos)
       i += 1 # skip closing quote
-      # A quoted element must be followed by ',' or the end of the array;
-      # anything else (e.g. `{"ab"cd}`) would otherwise split silently.
-      if i < inner.len and inner[i] != ',':
-        raise newException(
-          PgTypeError,
-          "array: unexpected byte after quoted element (len=" & $s.len & ", pos=" &
-            $(i + 1) & ")",
-        )
+      # A quoted element must be followed by the delimiter or the end of the
+      # array; anything else (e.g. `{"ab"cd}`) would otherwise split silently.
+      if i < inner.len and inner[i] != delim:
+        fail("array: unexpected byte after quoted element", i + o)
       result.add(some(elem))
     else:
       # Unquoted element
       var elem = ""
-      while i < inner.len and inner[i] != ',':
+      while i < inner.len and inner[i] != delim:
         # Server-side output quotes elements containing these structural
         # bytes, so an unquoted occurrence is malformed input.
         if inner[i] in {'"', '\\', '{', '}'}:
-          raise newException(
-            PgTypeError,
-            "array: unexpected byte in unquoted element (len=" & $s.len & ", pos=" &
-              $(i + 1) & ")",
-          )
+          fail("array: unexpected byte in unquoted element", i + o)
         elem.add(inner[i])
         i += 1
       if elem == "NULL":
         result.add(none(string))
       else:
         result.add(some(elem))
-    if i < inner.len and inner[i] == ',':
+    if i < inner.len and inner[i] == delim:
       i += 1
       if i == inner.len:
-        # ``i`` was just advanced past the comma, so it is the comma's own
-        # 0-based offset in ``s``.
-        raise newException(
-          PgTypeError, "array: trailing comma (len=" & $s.len & ", pos=" & $i & ")"
+        fail(
+          if delim == ',': "array: trailing comma" else: "array: trailing delimiter",
+          i + o - 1,
         )
+  if declared >= 0 and int64(result.len) != declared:
+    fail("array: bounds do not match the element count", 0)
+
+proc parseTextArray*(s: string): seq[Option[string]] {.raises: [PgError].} =
+  ## ``parseTextArrayDelim`` with the ``,`` delimiter that every built-in type
+  ## but ``box`` uses.
+  parseTextArrayDelim(s, ',')

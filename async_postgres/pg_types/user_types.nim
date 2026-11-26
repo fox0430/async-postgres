@@ -862,42 +862,8 @@ proc parseCompositeArrayBounds(
   if i >= s.len or s[i] != '{':
     raise newException(PgTypeError, "array field: expected '{'")
 
-proc parseCompositeDelimSeqText(
-    s: string, start: int, delim: char
-): seq[Option[string]] =
-  ## 1-D literal of an element type whose delimiter is not ','.
-  var i = start
-  var dims: seq[int32]
-  var leafDepth = -1
-  parseCompositeArrayLevel(s, i, dims, result, 0, delim, leafDepth)
-  if i != s.len:
-    raise newException(PgTypeError, "array field: trailing bytes")
-  if dims.len > 1:
-    raise newException(
-      PgTypeError, "array field: a seq field reads one dimension; use PgArray[T]"
-    )
-
 proc parseCompositeSeqText[E](s: string, _: seq[E]): seq[E] =
-  ## A seq has no lower bound, so a `[l:u]=` prefix is checked and dropped,
-  ## as the binary read drops the header's bound.
-  let delim = compositeArrayDelim[E]()
-  var i = 0
-  var lowerBounds, prefixDims: seq[int32]
-  parseCompositeArrayBounds(s, i, lowerBounds, prefixDims)
-  if prefixDims.len > 1:
-    raise newException(
-      PgTypeError, "array field: a seq field reads one dimension; use PgArray[T]"
-    )
-  let parts =
-    if delim == ',':
-      if i == 0:
-        parseTextArray(s)
-      else:
-        parseTextArray(s[i .. ^1])
-    else:
-      parseCompositeDelimSeqText(s, i, delim)
-  if prefixDims.len == 1 and parts.len != int(prefixDims[0]):
-    raise newException(PgTypeError, "array field: bounds do not match dimensions")
+  let parts = parseTextArrayDelim(s, compositeArrayDelim[E]())
   when E is Option:
     type Inner = typeof(default(E).get)
     result = newSeq[Option[Inner]](parts.len)
