@@ -269,7 +269,8 @@ proc rangeElemNeedsQuoting(s: string): bool =
       return true
   false
 
-proc quoteRangeElem(s: string): string =
+proc quoteRangeElem*(s: string): string =
+  ## Sibling-only: ``user_types`` quotes a composite's range bounds with it.
   if not rangeElemNeedsQuoting(s):
     return s
   result = "\""
@@ -313,9 +314,14 @@ proc parseRangeElem(
         i += 1
         elem.add(s[i])
       elif s[i] == '"':
-        i += 1
-        closed = true
-        break
+        # range_out doubles a quote inside a quoted bound.
+        if i + 1 < s.len and s[i + 1] == '"':
+          i += 1
+          elem.add('"')
+        else:
+          i += 1
+          closed = true
+          break
       else:
         elem.add(s[i])
       i += 1

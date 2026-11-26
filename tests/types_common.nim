@@ -1,6 +1,6 @@
 ## Shared fixtures for the ``test_types_*`` unit tests.
 
-import std/[options, times]
+import std/[json, options, times]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types
@@ -105,9 +105,36 @@ type
   NameFieldRecord* = object
     name*: string
 
+  FieldUserId* = distinct int32
+
+  ArrayFieldsRecord* = object
+    name*: string
+    tags*: seq[string]
+    nums*: seq[Option[int32]]
+    grid*: PgArray[int32]
+    payload*: seq[byte]
+
+  ScalarFieldsRecord* = object
+    id*: PgUuid
+    mood*: Mood
+    uid*: FieldUserId
+    span*: PgRange[int32]
+    spans*: PgMultirange[int32]
+    doc*: JsonNode
+
+  DateArrayRecord* = object
+    at*: seq[DateTime]
+
+  NestedRecord* = object
+    inner*: PointRecord
+
 pgComposite(PointRecord)
 pgComposite(PersonRecord, 50000'i32)
 pgComposite(NullableRecord)
 pgComposite(WideIntRecord)
 pgComposite(TimestampRecord)
 pgComposite(NameFieldRecord)
+pgComposite(ArrayFieldsRecord)
+pgComposite(ScalarFieldsRecord)
+pgComposite(DateArrayRecord)
+pgComposite(NestedRecord)

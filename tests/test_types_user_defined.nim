@@ -1,4 +1,4 @@
-import std/[unittest, options, strutils, times]
+import std/[json, unittest, options, strutils, times]
 
 import ../async_postgres/pg_protocol
 import ../async_postgres/pg_types {.all.}
@@ -29,6 +29,12 @@ type
   PriceCents = distinct Cents
   Slots = distinct PgMultirange[int32]
 
+type BinaryScalarRecord = object
+  id: PgUuid
+  mood: Mood
+  uid: FieldUserId
+  doc: JsonNode
+
 proc `==`(a, b: UsPostalCode): bool {.borrow.}
 proc `==`(a, b: SmallCount): bool {.borrow.}
 proc `==`(a, b: PositiveInt): bool {.borrow.}
@@ -56,6 +62,94 @@ pgDomain(IsActive, bool)
 pgDomain(RatioF32, float32)
 pgDomain(EventAt, DateTime)
 pgDomain(ZipPlus4, UsPostalCode, 90002)
+
+type
+  EmailDomain = distinct string
+  EmailRecord = object
+    email: EmailDomain
+
+  JsonNullRecord = object
+    doc: JsonNode
+
+proc `$`(v: EmailDomain): string =
+  "email:" & string(v)
+
+pgComposite(EmailRecord)
+pgComposite(JsonNullRecord)
+
+type
+  OwnDollarPoint = object
+    x, y: float64
+
+  OwnDollarRecord = object
+    p: OwnDollarPoint
+
+  TimeFieldRecord = object
+    at: Time
+
+  TupleFieldRecord = object
+    pair: tuple[a, b: int]
+
+  UnnamedTupleRecord = object
+    pair: (int32, int32)
+
+  BoxArrayRecord = object
+    boxes: seq[PgBox]
+    grid: PgArray[PgBox]
+
+  FixedArrayRecord = object
+    pair: array[2, int32]
+    tags: array[2, Option[string]]
+
+  ByteArrayRecord = object
+    key: array[3, byte]
+
+proc `$`(p: OwnDollarPoint): string =
+  "(" & $p.x & "," & $p.y & ")"
+
+pgComposite(OwnDollarRecord)
+pgComposite(TimeFieldRecord)
+pgComposite(TupleFieldRecord)
+pgComposite(UnnamedTupleRecord)
+pgComposite(BoxArrayRecord)
+pgComposite(FixedArrayRecord)
+pgComposite(ByteArrayRecord)
+
+type
+  HexPos = distinct uint64 # Like `Lsn`: its base has no PostgreSQL type.
+  HexPosRecord = object
+    pos: HexPos
+
+  TemplateDollarPoint = object
+    x: int
+
+  TemplateDollarRecord = object
+    p: TemplateDollarPoint
+
+  DomainRangeRecord = object
+    span: PgRange[PositiveInt]
+    spans: PgMultirange[PositiveInt]
+
+  ByteArraySeqRecord = object
+    keys: seq[array[2, byte]]
+
+proc `$`(v: HexPos): string =
+  toHex(uint64(v) shr 32).strip(trailing = false, chars = {'0'}) & "/" &
+    toHex(uint64(v) and 0xFFFF_FFFF'u64).strip(trailing = false, chars = {'0'})
+
+template `$`(p: TemplateDollarPoint): string =
+  $p.x
+
+pgComposite(HexPosRecord)
+pgComposite(TemplateDollarRecord)
+pgComposite(DomainRangeRecord)
+pgComposite(ByteArraySeqRecord)
+
+type SetRecord = object
+  nums: set[int16]
+  moods: set[Mood]
+
+pgComposite(SetRecord)
 
 suite "User-defined enum":
   test "pgEnum generates toPgParam with OID 0":
@@ -853,14 +947,679 @@ suite "User-defined composite":
       mkRow(@[some(encodeBinaryComposite(domainOid))], @[mkField(50000'i32, 1'i16)])
     check msgOf(getComposite[PersonRecord](domainOidRow, 0)) ==
       "Column 0: Composite binary field OID 50001 incompatible with Nim int32" &
-      " (a user-defined type, such as a domain, which a binary composite" &
-      " names by its own OID; use resultFormat = rfText)"
+      " (a user-defined type: domain, enum, composite, range or extension; read" &
+      " a domain into a `distinct` of its base type, an enum into a pgEnum" &
+      " type, or use resultFormat = rfText)"
 
   test "NULL composite cells stay single-prefixed":
     let row = mkRow(@[none(seq[byte])], @[mkField(0'i32, 0'i16)])
     check msgOf(getComposite[PointRecord](row, 0)) == "Column 0 is NULL"
     let bin = mkRow(@[none(seq[byte])], @[mkField(0'i32, 1'i16)])
     check msgOf(getComposite[PointRecord](bin, 0)) == "Column 0 is NULL"
+
+suite "Composite field types":
+  template msgOf(body: untyped): string =
+    block:
+      var msg = ""
+      try:
+        discard body
+      except PgTypeError as e:
+        msg = e.msg
+      msg
+
+  proc tsVectorLexeme(lexeme: string, position: int16): seq[byte] =
+    ## Binary tsvector with one lexeme at one position.
+    result.add(@(toBE32(1'i32)))
+    result.add(toBytes(lexeme))
+    result.add(0'u8)
+    result.add(@(toBE16(1'i16)))
+    result.add(@(toBE16(position)))
+
+  proc tsQueryOperand(lexeme: string): seq[byte] =
+    ## Binary tsquery with a single operand.
+    result.add(@(toBE32(1'i32)))
+    result.add(1'u8) # operand token
+    result.add(0'u8) # weight
+    result.add(0'u8) # no prefix
+    result.add(toBytes(lexeme))
+    result.add(0'u8)
+
+  proc jstZone(): Timezone =
+    const west = -9 * 3600
+    proc fromTime(time: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(isDst: false, utcOffset: west, time: time)
+
+    proc fromAdj(adjTime: Time): ZonedTime {.nimcall, gcsafe, raises: [].} =
+      ZonedTime(
+        isDst: false, utcOffset: west, time: adjTime + initDuration(seconds = west)
+      )
+
+    newTimezone("JST+09", fromTime, fromAdj)
+
+  proc sampleArrays(): ArrayFieldsRecord =
+    ArrayFieldsRecord(
+      name: "n",
+      tags: @["a", "b,c"],
+      nums: @[some(1'i32), none(int32)],
+      grid: pgArray([2'i32, 2'i32], [1'i32, 2, 3, 4]),
+      payload: @[byte 1, 0xFF],
+    )
+
+  test "array fields write PostgreSQL literals, not Nim reprs":
+    let encoded = toString(toPgParam(sampleArrays()).value.get)
+    check encoded ==
+      """(n,"{""a"",""b,c""}","{""1"",NULL}","[1:2][1:2]={{""1"",""2""},{""3"",""4""}}","\\x01ff")"""
+
+  test "array fields round-trip through text format":
+    let orig = sampleArrays()
+    let p = toPgParam(orig)
+    let row: Row = @[p.value]
+    let back = getComposite[ArrayFieldsRecord](row, 0)
+    check back.name == orig.name
+    check back.tags == orig.tags
+    check back.nums == orig.nums
+    check back.grid.dims == orig.grid.dims
+    check back.grid.lowerBounds == orig.grid.lowerBounds
+    check back.grid.elements == orig.grid.elements
+    check back.payload == orig.payload
+
+  test "array fields round-trip through binary format":
+    let orig = sampleArrays()
+    let fields = @[
+      (oid: OidText, data: some(toBytes("n"))),
+      (oid: OidTextArray, data: some(toPgParam(orig.tags).value.get)),
+      (oid: OidInt4Array, data: some(toPgParam(orig.nums).value.get)),
+      (oid: OidInt4Array, data: some(toPgParam(orig.grid).value.get)),
+      (oid: OidBytea, data: some(orig.payload)),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let back = getComposite[ArrayFieldsRecord](row, 0)
+    check back.tags == orig.tags
+    check back.nums == orig.nums
+    check back.grid.dims == orig.grid.dims
+    check back.grid.lowerBounds == orig.grid.lowerBounds
+    check back.grid.elements == orig.grid.elements
+    check back.payload == orig.payload
+
+  test "Nim array fields write and read PostgreSQL arrays":
+    let orig = FixedArrayRecord(pair: [1'i32, 2], tags: [some("a"), none(string)])
+    let p = toPgParam(orig)
+    check toString(p.value.get) == "(\"{\"\"1\"\",\"\"2\"\"}\",\"{\"\"a\"\",NULL}\")"
+    let back = getComposite[FixedArrayRecord](@[p.value], 0)
+    check back.pair == orig.pair
+    check back.tags == orig.tags
+
+    let fields = @[
+      (oid: OidInt4Array, data: some(toPgParam(@[3'i32, 4]).value.get)),
+      (oid: OidTextArray, data: some(toPgParam(@[some("b"), none(string)]).value.get)),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let bin = getComposite[FixedArrayRecord](row, 0)
+    check bin.pair == [3'i32, 4]
+    check bin.tags == [some("b"), none(string)]
+
+  test "Nim array fields reject a different element count":
+    let text: Row = @[some(toBytes("(\"{1,2,3}\",\"{a,b}\")"))]
+    check "3 elements for a Nim array of 2" in
+      msgOf(getComposite[FixedArrayRecord](text, 0))
+    let fields = @[
+      (oid: OidInt4Array, data: some(toPgParam(@[3'i32]).value.get)),
+      (oid: OidTextArray, data: some(toPgParam(@["b", "c"]).value.get)),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check "1 elements for a Nim array of 2" in
+      msgOf(getComposite[FixedArrayRecord](row, 0))
+
+  test "Nim byte array fields are bytea":
+    let orig = ByteArrayRecord(key: [1'u8, 2, 255])
+    let p = toPgParam(orig)
+    check toString(p.value.get) == "(\"\\\\x0102ff\")"
+    check getComposite[ByteArrayRecord](@[p.value], 0).key == orig.key
+    let fields = @[(oid: OidBytea, data: some(@[1'u8, 2, 255]))]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check getComposite[ByteArrayRecord](row, 0).key == orig.key
+    let short = @[(oid: OidBytea, data: some(@[1'u8, 2]))]
+    let shortRow =
+      mkRow(@[some(encodeBinaryComposite(short))], @[mkField(50000'i32, 1'i16)])
+    check "2 elements for a Nim array of 3" in
+      msgOf(getComposite[ByteArrayRecord](shortRow, 0))
+
+  test "range fields over a domain are written by the base type":
+    let orig = DomainRangeRecord(
+      span: rangeOf(PositiveInt(1), PositiveInt(5)),
+      spans: PgMultirange[PositiveInt](@[rangeOf(PositiveInt(1), PositiveInt(3))]),
+    )
+    let p = toPgParam(orig)
+    check toString(p.value.get) == "(\"[1,5)\",\"{[1,3)}\")"
+    let back = getComposite[DomainRangeRecord](@[p.value], 0)
+    check int32(back.span.lower.value) == 1
+    check int32(back.span.upper.value) == 5
+    check back.spans.len == 1
+
+  test "a seq of byte arrays is a bytea array":
+    let orig = ByteArraySeqRecord(keys: @[[1'u8, 2], [255'u8, 0]])
+    let p = toPgParam(orig)
+    check compositeFieldText(orig.keys) == "{\"\\\\x0102\",\"\\\\xff00\"}"
+    check getComposite[ByteArraySeqRecord](@[p.value], 0).keys == orig.keys
+    let fields = @[
+      (
+        oid: OidByteaArray,
+        data: some(encodeBinaryArray(OidBytea, @[@[1'u8, 2], @[255'u8, 0]])),
+      )
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check getComposite[ByteArraySeqRecord](row, 0).keys == orig.keys
+
+  test "seq and Nim array fields drop a text lower bound":
+    check compositeFieldFromText[seq[int32]]("[0:1]={1,2}") == @[1'i32, 2]
+    check compositeFieldFromText[array[2, int32]]("[0:1]={1,2}") == [1'i32, 2]
+    check compositeFieldFromText[seq[Option[int32]]]("[-1:0]={NULL,2}") ==
+      @[none(int32), some(2'i32)]
+    check compositeFieldFromText[seq[PgBox]]("[0:0]={(1,1),(0,0)}").len == 1
+    check "bounds do not match" in
+      msgOf(compositeFieldFromText[seq[int32]]("[0:2]={1,2}"))
+    check "reads one dimension" in
+      msgOf(compositeFieldFromText[seq[int32]]("[1:1][1:2]={{1,2}}"))
+    check "bounds without '='" in msgOf(
+      compositeFieldFromText[seq[int32]]("[0:1]{1,2}")
+    )
+
+  test "PgArray keeps non-default lower bounds in text form":
+    let orig = ArrayFieldsRecord(
+      name: "n",
+      tags: @[],
+      nums: @[],
+      grid: PgArray[int32](
+        dims: @[2'i32, 2'i32],
+        lowerBounds: @[3'i32, 7'i32],
+        elements: @[some(1'i32), some(2'i32), some(3'i32), some(4'i32)],
+      ),
+      payload: @[],
+    )
+    let encoded = toString(toPgParam(orig).value.get)
+    check "[3:4][7:8]=" in encoded
+    let row: Row = @[some(toBytes(encoded))]
+    let back = getComposite[ArrayFieldsRecord](row, 0)
+    check back.grid.dims == @[2'i32, 2'i32]
+    check back.grid.lowerBounds == @[3'i32, 7'i32]
+    check back.grid.elements == @[some(1'i32), some(2'i32), some(3'i32), some(4'i32)]
+
+  test "PgArray keeps NULL elements in text and binary formats":
+    let orig = ArrayFieldsRecord(
+      name: "n",
+      tags: @[],
+      nums: @[],
+      grid: PgArray[int32](
+        dims: @[2'i32], lowerBounds: @[1'i32], elements: @[some(1'i32), none(int32)]
+      ),
+      payload: @[],
+    )
+    let encoded = toString(toPgParam(orig).value.get)
+    check "NULL" in encoded
+    let textRow: Row = @[some(toBytes(encoded))]
+    check getComposite[ArrayFieldsRecord](textRow, 0).grid.elements == orig.grid.elements
+    let binary = toPgParam(orig.grid).value.get
+    let fields = @[
+      (oid: OidText, data: some(toBytes("n"))),
+      (oid: OidTextArray, data: some(toPgParam(newSeq[string]()).value.get)),
+      (oid: OidInt4Array, data: some(toPgParam(newSeq[Option[int32]]()).value.get)),
+      (oid: OidInt4Array, data: some(binary)),
+      (oid: OidBytea, data: some(newSeq[byte]())),
+    ]
+    let binRow =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check getComposite[ArrayFieldsRecord](binRow, 0).grid.elements == orig.grid.elements
+
+  test "DateTime array elements are written as UTC instants":
+    let orig = DateArrayRecord(at: @[dateTime(2024, mMar, 15, 10, 30, 0, 0, jstZone())])
+    let encoded = toString(toPgParam(orig).value.get)
+    check "2024-03-15 01:30:00.000000Z" in encoded
+    let row: Row = @[some(toBytes(encoded))]
+    let back = getComposite[DateArrayRecord](row, 0)
+    check back.at[0] == dateTime(2024, mMar, 15, 1, 30, 0, 0, utc())
+
+  test "scalar user-defined fields round-trip through text format":
+    let orig = ScalarFieldsRecord(
+      id: PgUuid("123e4567-e89b-12d3-a456-426614174000"),
+      mood: happy,
+      uid: FieldUserId(7),
+      span: rangeOf(1'i32, 5'i32),
+      spans: toMultirange(rangeOf(1'i32, 5'i32)),
+      doc: %*{"a": 1},
+    )
+    let p = toPgParam(orig)
+    let row: Row = @[p.value]
+    let back = getComposite[ScalarFieldsRecord](row, 0)
+    check string(back.id) == string(orig.id)
+    check back.mood == orig.mood
+    check int32(back.uid) == int32(orig.uid)
+    check $back.span == $orig.span
+    check $back.spans == $orig.spans
+    check back.doc == orig.doc
+
+  test "enum, uuid, domain and json round-trip through binary format":
+    let orig = BinaryScalarRecord(
+      id: PgUuid("123e4567-e89b-12d3-a456-426614174000"),
+      mood: sad,
+      uid: FieldUserId(9),
+      doc: %*{"a": 2},
+    )
+    let fields = @[
+      (oid: OidUuid, data: some(toPgBinaryParam(orig.id).value.get)),
+      (oid: 90001'i32, data: some(toBytes("sad"))),
+      (oid: 90002'i32, data: some(@(toBE32(9)))),
+      (oid: OidJsonb, data: some(toPgBinaryParam(orig.doc).value.get)),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let back = getComposite[BinaryScalarRecord](row, 0)
+    check string(back.id) == string(orig.id)
+    check back.mood == orig.mood
+    check int32(back.uid) == int32(orig.uid)
+    check back.doc == orig.doc
+
+  test "enum and domain fields accept OIDs past 2^31":
+    # OIDs are unsigned; 3000000000 arrives as a negative int32.
+    let high = cast[int32](3_000_000_000'u32)
+    let fields = @[
+      (
+        oid: OidUuid,
+        data: some(
+          toPgBinaryParam(PgUuid("123e4567-e89b-12d3-a456-426614174000")).value.get
+        ),
+      ),
+      (oid: high, data: some(toBytes("sad"))),
+      (oid: high + 1, data: some(@(toBE32(9)))),
+      (oid: OidJsonb, data: some(toPgBinaryParam(%*{"a": 2}).value.get)),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let back = getComposite[BinaryScalarRecord](row, 0)
+    check back.mood == sad
+    check int32(back.uid) == 9
+
+  test "binary range fields ask for text format":
+    type RangeRecord = object
+      span: PgRange[int32]
+
+    let fields =
+      @[(oid: OidInt4Range, data: some(toPgParam(rangeOf(1'i32, 5'i32)).value.get))]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let msg = msgOf(getComposite[RangeRecord](row, 0))
+    check "PgRange" in msg
+    check "rfText" in msg
+
+  test "binary money fields ask for text format":
+    type MoneyRecord = object
+      amount: PgMoney
+
+    let fields = @[(oid: OidMoney, data: some(@(toBE64(12345))))]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check "fractional digits" in msgOf(getComposite[MoneyRecord](row, 0))
+
+  test "nested composites are rejected with a field-type error":
+    let nested = NestedRecord(inner: PointRecord(x: 1.0, y: 2.0))
+    check "unsupported field type" in msgOf(toPgParam(nested))
+
+  test "object fields with a `$` of their own are written through it":
+    check toString(
+      toPgParam(OwnDollarRecord(p: OwnDollarPoint(x: 1.5, y: 2.0))).value.get
+    ) == "(\"(1.5,2.0)\")"
+    let t = dateTime(2024, mMar, 15, 10, 30, 0, 0, utc()).toTime
+    check $t in toString(toPgParam(TimeFieldRecord(at: t)).value.get)
+
+  test "tuple fields are rejected instead of writing a Nim repr":
+    check "unsupported field type" in
+      msgOf(toPgParam(TupleFieldRecord(pair: (a: 1, b: 2))))
+    check "unsupported field type" in
+      msgOf(toPgParam(UnnamedTupleRecord(pair: (1'i32, 2'i32))))
+
+  test "array-of-array fields do not compile":
+    # pgComposite itself cannot run in `compiles`; check the field codecs.
+    let buf: seq[byte] = @[]
+    check compiles(compositeFieldText(@[1'i32]))
+    check compiles(compositeFieldText(@[toBytes("a")]))
+    check not compiles(compositeFieldText(@[@[1'i32]]))
+    check not compiles(compositeFieldText(@[PgArray[int32]()]))
+    check compiles(compositeFieldFromText[seq[int32]]("{}"))
+    check not compiles(compositeFieldFromText[seq[seq[int32]]]("{}"))
+    check not compiles(compositeFieldFromText[seq[Option[seq[int32]]]]("{}"))
+    check compiles(compositeFieldFromBinary[seq[int32]](buf, 0, 0, 0'i32, false))
+    check not compiles(
+      compositeFieldFromBinary[seq[seq[int32]]](buf, 0, 0, 0'i32, false)
+    )
+    check not compiles(compositeFieldText(@[[1'i32, 2]]))
+    check not compiles(compositeFieldFromText[PgArray[seq[int32]]]("{}"))
+
+  test "set fields are 1-D arrays":
+    check compositeFieldText({3'i16, 1}) == "{\"1\",\"3\"}"
+    check compositeFieldText(set[int16]({})) == "{}"
+    check compositeFieldFromText[set[int16]]("{3,1,3}") == {1'i16, 3}
+    let orig = SetRecord(nums: {1'i16, 2}, moods: {happy, sad})
+    let p = toPgParam(orig)
+    let back = getComposite[SetRecord](@[p.value], 0)
+    check back.nums == orig.nums
+    check back.moods == orig.moods
+    let fields = @[
+      (oid: OidInt2Array, data: some(encodeBinaryArray(OidInt2, @[@(toBE16(2'i16))]))),
+      (oid: 90020'i32, data: some(encodeBinaryArray(90021'i32, @[toBytes("sad")]))),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let bin = getComposite[SetRecord](row, 0)
+    check bin.nums == {2'i16}
+    check bin.moods == {sad}
+    check not compiles(compositeFieldText(@[{1'i16}]))
+
+  test "a byte-array element checks the element OID before any element":
+    type KeyRecord = object
+      keys: seq[Option[array[2, byte]]]
+
+    let fields = @[
+      (
+        oid: OidInt4Array,
+        data: some(
+          encodeBinaryArray(OidInt4, @[2'i32], @[none(seq[byte]), none(seq[byte])])
+        ),
+      )
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check "array element OID 23" in msgOf(getComposite[KeyRecord](row, 0))
+
+  test "nested Option fields do not compile":
+    let buf: seq[byte] = @[]
+    check compiles(compositeFieldText([1'i32, 2]))
+    check compiles(compositeFieldText(@[some(1'i32)]))
+    check not compiles(compositeFieldText(some(1'i32)))
+    check not compiles(compositeFieldText(PgArray[Option[int32]]()))
+    check not compiles(compositeFieldFromText[PgArray[Option[int32]]]("{}"))
+    check not compiles(compositeFieldFromBinary[Option[int32]](buf, 0, 0, 0'i32, false))
+
+  test "box array fields use the ';' delimiter":
+    let b1 = PgBox(high: PgPoint(x: 2, y: 2), low: PgPoint(x: 1, y: 1))
+    let b2 = PgBox(high: PgPoint(x: 4, y: 4), low: PgPoint(x: 3, y: 3))
+    let orig = BoxArrayRecord(
+      boxes: @[b1, b2],
+      grid: PgArray[PgBox](
+        dims: @[1'i32, 2'i32],
+        lowerBounds: @[0'i32, 1'i32],
+        elements: @[some(b1), some(b2)],
+      ),
+    )
+    let encoded = toString(toPgParam(orig).value.get)
+    check ";" in encoded
+    let back = getComposite[BoxArrayRecord](@[some(toBytes(encoded))], 0)
+    check back.boxes == orig.boxes
+    check back.grid == orig.grid
+    # The server's form: box elements are unquoted and hold commas.
+    let row: Row = @[
+      some(
+        toBytes(
+          "(\"{(2,2),(1,1);(4,4),(3,3)}\",\"[0:0][1:2]={{(2,2),(1,1);(4,4),(3,3)}}\")"
+        )
+      )
+    ]
+    let server = getComposite[BoxArrayRecord](row, 0)
+    check server.boxes == orig.boxes
+    check server.grid == orig.grid
+
+  test "a domain array field reads elements named by the base type's OID":
+    type EventArrayRecord = object
+      ats: seq[EventAt]
+
+    let dt = dateTime(2024, mMar, 15, 10, 30, 0, 0, utc())
+    let elem = toPgBinaryTimestampTzParam(dt).value.get
+    let arr = encodeBinaryArray(OidTimestampTz, [1'i32], [some(elem)])
+    let fields = @[(oid: OidTimestampTzArray, data: some(arr))]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let back = getComposite[EventArrayRecord](row, 0)
+    check back.ats.len == 1
+    check DateTime(back.ats[0]) == dt
+
+  test "PgArray text bounds must match the dimensions":
+    type GridRecord = object
+      grid: PgArray[int32]
+
+    let row: Row = @[some(toBytes("(\"[1:3]={1,2}\")"))]
+    check "bounds do not match dimensions" in msgOf(getComposite[GridRecord](row, 0))
+
+  test "distinct string array elements round-trip through binary format":
+    type DistinctArrayRecord = object
+      ids: seq[PgUuid]
+      docs: seq[PgXml]
+      macs: seq[PgMacAddr]
+      mac8s: seq[PgMacAddr8]
+      grid: PgArray[PgUuid]
+
+    let ids = @[PgUuid("123e4567-e89b-12d3-a456-426614174000")]
+    let docs = @[PgXml("<a>x</a>")]
+    let macs = @[PgMacAddr("08:00:2b:01:02:03")]
+    let mac8s = @[PgMacAddr8("08:00:2b:01:02:03:04:05")]
+    let orig = DistinctArrayRecord(
+      ids: ids,
+      docs: docs,
+      macs: macs,
+      mac8s: mac8s,
+      grid: PgArray[PgUuid](
+        dims: @[1'i32], lowerBounds: @[1'i32], elements: @[some(ids[0])]
+      ),
+    )
+    let fields = @[
+      (oid: OidUuidArray, data: some(toPgParam(ids).value.get)),
+      (oid: OidXmlArray, data: some(toPgParam(docs).value.get)),
+      (oid: OidMacAddrArray, data: some(toPgParam(macs).value.get)),
+      (oid: OidMacAddr8Array, data: some(toPgParam(mac8s).value.get)),
+      (oid: OidUuidArray, data: some(toPgParam(ids).value.get)),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let back = getComposite[DistinctArrayRecord](row, 0)
+    check back.ids == orig.ids
+    check back.docs == orig.docs
+    check back.macs == orig.macs
+    check back.mac8s == orig.mac8s
+    check back.grid == orig.grid
+
+  test "tsvector and tsquery fields round-trip through binary format":
+    type TsFieldsRecord = object
+      vec: PgTsVector
+      qry: PgTsQuery
+      emptyVec: PgTsVector
+
+    let orig = TsFieldsRecord(
+      vec: PgTsVector("'foo':1"), qry: PgTsQuery("'bar'"), emptyVec: PgTsVector("")
+    )
+    let fields = @[
+      (oid: OidTsVector, data: some(tsVectorLexeme("foo", 1))),
+      (oid: OidTsQuery, data: some(tsQueryOperand("bar"))),
+      (oid: OidTsVector, data: some(@(toBE32(0'i32)))),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let back = getComposite[TsFieldsRecord](row, 0)
+    check back.vec == orig.vec
+    check back.qry == orig.qry
+    check back.emptyVec == orig.emptyVec
+
+  test "tsvector and tsquery array fields round-trip through binary format":
+    type TsArrayRecord = object
+      vecs: seq[PgTsVector]
+      qrys: seq[PgTsQuery]
+
+    let fields = @[
+      (
+        oid: OidTsVectorArray,
+        data: some(encodeBinaryArray(OidTsVector, @[tsVectorLexeme("foo", 1)])),
+      ),
+      (
+        oid: OidTsQueryArray,
+        data: some(encodeBinaryArray(OidTsQuery, @[tsQueryOperand("bar")])),
+      ),
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let back = getComposite[TsArrayRecord](row, 0)
+    check back.vecs == @[PgTsVector("'foo':1")]
+    check back.qrys == @[PgTsQuery("'bar'")]
+
+  test "a tsvector array field rejects a dynamic element OID up front":
+    type TsVecRecord = object
+      vecs: seq[PgTsVector]
+
+    let fields = @[
+      (
+        oid: 90003'i32,
+        data: some(encodeBinaryArray(90004'i32, @[tsVectorLexeme("foo", 1)])),
+      )
+    ]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check msgOf(getComposite[TsVecRecord](row, 0)) ==
+      "Column 0: Composite binary array element OID 90004 incompatible with Nim" &
+      " PgTsVector (a user-defined type: domain, enum, composite, range or" &
+      " extension; read a domain into a `distinct` of its base type, an enum" &
+      " into a pgEnum type, or use resultFormat = rfText)"
+
+  test "a domain with a custom `$` is encoded by its base type":
+    let encoded = toString(toPgParam(EmailRecord(email: EmailDomain("a@b"))).value.get)
+    check encoded == "(a@b)"
+
+  test "a distinct over a type with no PostgreSQL counterpart uses its `$`":
+    let p = toPgParam(HexPosRecord(pos: HexPos(0x1_0000_00FF'u64)))
+    check toString(p.value.get) == "(1/FF)"
+
+  test "a template `$` of the field type's own is no repr":
+    let p = toPgParam(TemplateDollarRecord(p: TemplateDollarPoint(x: 7)))
+    check toString(p.value.get) == "(7)"
+
+  test "binary array fields reject a non-array attribute OID":
+    type IntSeqRecord = object
+      xs: seq[int32]
+      grid: PgArray[int32]
+
+    let payload = encodeBinaryArray(OidInt4, @[@(toBE32(1'i32))])
+    for (xsOid, gridOid) in [(OidBytea, OidInt4Array), (OidInt4Array, OidText)]:
+      let fields =
+        @[(oid: xsOid, data: some(payload)), (oid: gridOid, data: some(payload))]
+      let row =
+        mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+      let msg = msgOf(getComposite[IntSeqRecord](row, 0))
+      check "Composite binary field OID" in msg
+      check "rfText" notin msg
+    # A domain over an array names the attribute by a dynamic OID.
+    let domainFields =
+      @[(oid: 90010'i32, data: some(payload)), (oid: 0'i32, data: some(payload))]
+    let domainRow =
+      mkRow(@[some(encodeBinaryComposite(domainFields))], @[mkField(50000'i32, 1'i16)])
+    check getComposite[IntSeqRecord](domainRow, 0).xs == @[1'i32]
+
+  test "a binary field with no reader does not suggest text format":
+    type TimeRecord = object
+      t: Time
+
+    let fields = @[(oid: OidTimestampTz, data: some(@(toBE64(0'i64))))]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    let msg = msgOf(getComposite[TimeRecord](row, 0))
+    check "cast the attribute in SQL" in msg
+    check "rfText" notin msg
+
+  test "a built-in OID mismatch does not suggest text format":
+    type TsVecRecord = object
+      vecs: seq[PgTsVector]
+
+    let fields =
+      @[(oid: 90003'i32, data: some(encodeBinaryArray(OidInt4, @[@(toBE32(1'i32))])))]
+    let row =
+      mkRow(@[some(encodeBinaryComposite(fields))], @[mkField(50000'i32, 1'i16)])
+    check msgOf(getComposite[TsVecRecord](row, 0)) ==
+      "Column 0: Composite binary array element OID 23 incompatible with Nim PgTsVector"
+
+  test "a nil JsonNode field raises instead of crashing":
+    check "nil JsonNode" in msgOf(toPgParam(JsonNullRecord(doc: nil)))
+    check "newJNull()" in msgOf(toPgParam(JsonNullRecord(doc: nil)))
+
+  test "a domain over json/jsonb is read in binary format":
+    type
+      DomJson = distinct JsonNode
+      DomJsonRecord = object
+        doc: DomJson
+
+    let jsonb = toPgBinaryParam(%*{"a": 1}).value.get
+    let jsonbRow = mkRow(
+      @[some(encodeBinaryComposite(@[(oid: 90010'i32, data: some(jsonb))]))],
+      @[mkField(50000'i32, 1'i16)],
+    )
+    check JsonNode(getComposite[DomJsonRecord](jsonbRow, 0).doc) == %*{"a": 1}
+
+    let jsonText = toBytes("""{"b": 2}""")
+    let jsonRow = mkRow(
+      @[some(encodeBinaryComposite(@[(oid: 90011'i32, data: some(jsonText))]))],
+      @[mkField(50000'i32, 1'i16)],
+    )
+    check JsonNode(getComposite[DomJsonRecord](jsonRow, 0).doc) == %*{"b": 2}
+
+  test "scalars at different depths are rejected":
+    check "irregular dimensions" in
+      msgOf(compositeFieldFromText[PgArray[int32]]("{{{1}},{2}}"))
+    check "irregular dimensions" in
+      msgOf(compositeFieldFromText[PgArray[int32]]("{{1},{{2}}}"))
+    check "irregular dimensions" in
+      msgOf(compositeFieldFromText[PgArray[int32]]("{{1,2},{{3},{4}}}"))
+
+  test "a mixed scalar/subarray literal is rejected":
+    type GridRecord = object
+      grid: PgArray[int32]
+
+    let row: Row = @[some(toBytes("(\"{1,{2}}\")"))]
+    check "irregular dimensions" in msgOf(getComposite[GridRecord](row, 0))
+
+  test "binary money and range array elements ask for text format":
+    type
+      MoneyArrayRecord = object
+        v: seq[PgMoney]
+
+      RangeArrayRecord = object
+        v: seq[PgRange[int32]]
+
+    let moneyRow = mkRow(
+      @[
+        some(
+          encodeBinaryComposite(
+            @[(oid: OidMoneyArray, data: some(encodeBinaryArrayEmpty(OidMoney)))]
+          )
+        )
+      ],
+      @[mkField(50000'i32, 1'i16)],
+    )
+    let moneyMsg = msgOf(getComposite[MoneyArrayRecord](moneyRow, 0))
+    check "binary money array elements" in moneyMsg
+    check "rfText" in moneyMsg
+
+    let rangeRow = mkRow(
+      @[
+        some(
+          encodeBinaryComposite(
+            @[
+              (oid: OidInt4RangeArray, data: some(encodeBinaryArrayEmpty(OidInt4Range)))
+            ]
+          )
+        )
+      ],
+      @[mkField(50000'i32, 1'i16)],
+    )
+    let rangeMsg = msgOf(getComposite[RangeArrayRecord](rangeRow, 0))
+    check "PgRange" in rangeMsg
+    check "rfText" in rangeMsg
 
 suite "User-defined domain":
   test "pgDomain rejects a type its overload would recurse on":

@@ -83,14 +83,15 @@ export decoding.parseTextArray
 # `row_mapping.nim` build on.
 export accessors except
   nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid,
-  wireOidIsDynamic, colTypeOid
+  wireOidIsDynamic, colTypeOid, parseRegisteredScalar, decodeRegisteredScalar
 
 # `ranges` — range/multirange construction and typed parameters; the raw
 # binary decoders were privatised in the module itself. The DateTime range
-# text writers are sibling-only, for `user_types`' composite fields, as is
-# `hasDateTimeBounds`, shared with `row_mapping`.
+# text writers and `quoteRangeElem` are sibling-only, for `user_types`'
+# composite fields, as is `hasDateTimeBounds`, shared with `row_mapping`.
 export ranges except
-  formatDateTimeRangeText, formatDateTimeMultirangeText, hasDateTimeBounds
+  formatDateTimeRangeText, formatDateTimeMultirangeText, hasDateTimeBounds,
+  quoteRangeElem
 
 # `row_mapping` — `to(row, T)` and its field pragmas. `mapRow` and
 # `resolveRowColumns` (the column cache behind `to(QueryResult, seq[T])`) are

@@ -1444,7 +1444,7 @@ async_postgres/pg_sql.nim	queryValueOrDefault#5
 async_postgres/pg_sql.nim	queryValueOrDefault#6
 async_postgres/pg_sql.nim	sql
 async_postgres/pg_sql.nim	sqlParams
-async_postgres/pg_types.nim	export accessors except nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid, wireOidIsDynamic, colTypeOid
+async_postgres/pg_types.nim	export accessors except nameAccessor, optAccessor, cellInfo, checkScalarColOid, checkArrayElemOid, wireOidIsDynamic, colTypeOid, parseRegisteredScalar, decodeRegisteredScalar
 async_postgres/pg_types.nim	export array
 async_postgres/pg_types.nim	export core except PgIntParse, pipOk, pipInvalid, pipOverflow, checkPgTimeFields, checkPgTimeTzOffset, isPgHexText, isPgIntText, isPgUIntText, pgParseBiggestInt, pgParseBiggestIntView, pgParseFloat, pgParseFloat32, pgParseHexInt, pgParseHexUInt32, pgParseInt, pgParseInt16, pgParseInt32, pgParseIntView, pgParseUIntField, parsePgBoolText, pgTypeErrorOnValueError, withColumnContext
 async_postgres/pg_types.nim	export decoding.fromPgText
@@ -1482,7 +1482,7 @@ async_postgres/pg_types.nim	export encoding.writeBindParam
 async_postgres/pg_types.nim	export encoding.writeParamFormat
 async_postgres/pg_types.nim	export encoding.writeParamOid
 async_postgres/pg_types.nim	export encoding.writeParamValue
-async_postgres/pg_types.nim	export ranges except formatDateTimeRangeText, formatDateTimeMultirangeText, hasDateTimeBounds
+async_postgres/pg_types.nim	export ranges except formatDateTimeRangeText, formatDateTimeMultirangeText, hasDateTimeBounds, quoteRangeElem
 async_postgres/pg_types.nim	export row_mapping except mapRow, resolveRowColumns, findColumn, fieldContext, isCaseObject
 async_postgres/pg_types.nim	export user_types except distinctBaseOnce
 async_postgres/pg_types.nim	get
