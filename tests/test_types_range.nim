@@ -148,6 +148,23 @@ suite "Range text parsing":
     )
     check r.isEmpty == true
 
+  test "a doubled quote inside a quoted bound is one quote":
+    # range_out's form; a backslash escape still works.
+    let r = parseRangeText[string](
+      "[\"\",\"z\"\"z,\\\"\")",
+      proc(s: string): string =
+        s,
+    )
+    check r.lower.value == ""
+    check r.upper.value == "z\"z,\""
+    # PostgreSQL 18's output for the bounds "" and `z"z,\`.
+    let server = parseRangeText[string](
+      "[\"\",\"z\"\"z,\\\\\")",
+      proc(s: string): string =
+        s,
+    )
+    check server.upper.value == "z\"z,\\"
+
   test "parse [1,10)":
     let r = parseRangeText[int32](
       "[1,10)",

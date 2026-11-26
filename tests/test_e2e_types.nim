@@ -12,7 +12,137 @@ import e2e_common
 type TstzRecord = object
   at: DateTime
 
+type
+  E2eMood = enum
+    emHappy = "happy"
+    emSad = "sad"
+
+  E2eUserId = distinct int32
+  E2eAt = distinct DateTime
+
+  E2eFieldsRecord = object
+    name: string
+    uid: E2eUserId
+    mood: E2eMood
+    tags: seq[string]
+    nums: seq[Option[int32]]
+    grid: PgArray[int32]
+    payload: seq[byte]
+    at: seq[DateTime]
+    boxes: seq[PgBox]
+    stamps: seq[E2eAt]
+
+  E2eTimeRecord = object
+    t: Time
+
+  E2eBoundsRecord = object
+    xs: seq[int32]
+    pair: array[2, int32]
+    key: array[3, byte]
+
+pgEnum(E2eMood)
 pgComposite(TstzRecord)
+pgComposite(E2eFieldsRecord)
+pgComposite(E2eTimeRecord)
+
+suite "E2E: composite field types":
+  test "arrays, enum and domain fields round-trip in text and binary":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      try:
+        discard
+          await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_fields_rec CASCADE")
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_time_rec CASCADE")
+        discard await conn.simpleQuery("DROP DOMAIN IF EXISTS test_e2e_uid")
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_fields_mood")
+        discard await conn.simpleQuery(
+          "CREATE TYPE test_e2e_fields_mood AS ENUM ('happy','sad')"
+        )
+        discard await conn.simpleQuery("CREATE DOMAIN test_e2e_uid AS int4")
+        discard
+          await conn.simpleQuery("CREATE TYPE test_e2e_time_rec AS (t timestamptz)")
+        discard await conn.simpleQuery(
+          "CREATE TYPE test_e2e_fields_rec AS (name text, uid test_e2e_uid," &
+            " mood test_e2e_fields_mood, tags text[], nums int4[], grid int4[]," &
+            " payload bytea, at timestamptz[], boxes box[], stamps timestamptz[])"
+        )
+        let orig = E2eFieldsRecord(
+          name: "n",
+          uid: E2eUserId(7),
+          mood: emHappy,
+          tags: @["a", "b,c"],
+          nums: @[some(1'i32), none(int32)],
+          grid: PgArray[int32](
+            dims: @[2'i32, 2'i32],
+            lowerBounds: @[3'i32, 7'i32],
+            elements: @[some(1'i32), some(2'i32), some(3'i32), some(4'i32)],
+          ),
+          payload: @[byte 0, 1, 0xFF],
+          at: @[dateTime(2024, mMar, 15, 10, 30, 0, 0, utc())],
+          boxes: @[
+            PgBox(high: PgPoint(x: 2, y: 2), low: PgPoint(x: 1, y: 1)),
+            PgBox(high: PgPoint(x: 4, y: 4), low: PgPoint(x: 3, y: 3)),
+          ],
+          stamps: @[E2eAt(dateTime(2024, mMar, 15, 10, 30, 0, 0, utc()))],
+        )
+        for fmt in [rfText, rfBinary]:
+          let row = (
+            await conn.query(
+              "SELECT $1::test_e2e_fields_rec", @[toPgParam(orig)], resultFormat = fmt
+            )
+          ).rows[0]
+          let back = getComposite[E2eFieldsRecord](row, 0)
+          doAssert back.name == orig.name, $fmt
+          doAssert int32(back.uid) == int32(orig.uid), $fmt
+          doAssert back.mood == orig.mood, $fmt
+          doAssert back.tags == orig.tags, $fmt
+          doAssert back.nums == orig.nums, $fmt
+          doAssert back.grid.dims == orig.grid.dims, $fmt
+          doAssert back.grid.lowerBounds == orig.grid.lowerBounds, $fmt
+          doAssert back.grid.elements == orig.grid.elements, $fmt
+          doAssert back.payload == orig.payload, $fmt
+          doAssert back.at == orig.at, $fmt
+          doAssert back.boxes == orig.boxes, $fmt
+          doAssert back.stamps.len == 1, $fmt
+          doAssert DateTime(back.stamps[0]) == DateTime(orig.stamps[0]), $fmt
+        let t = dateTime(2024, mMar, 15, 10, 30, 0, 0, utc()).toTime
+        let same = (
+          await conn.query(
+            "SELECT ($1::test_e2e_time_rec).t = $2::timestamptz",
+            @[toPgParam(E2eTimeRecord(t: t)), toPgParam("2024-03-15T10:30:00Z")],
+          )
+        ).rows[0]
+        doAssert same.getBool(0)
+      finally:
+        discard
+          await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_fields_rec CASCADE")
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_time_rec CASCADE")
+        discard await conn.simpleQuery("DROP DOMAIN IF EXISTS test_e2e_uid")
+        discard await conn.simpleQuery("DROP TYPE IF EXISTS test_e2e_fields_mood")
+        await conn.close()
+
+    waitFor t()
+
+  test "seq and Nim array fields read arrays with a lower bound other than 1":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      try:
+        for fmt in [rfText, rfBinary]:
+          let row = (
+            await conn.query(
+              "SELECT ROW('[0:1]={1,2}'::int4[], '[-1:0]={3,4}'::int4[]," &
+                " '\\x0102ff'::bytea)",
+              resultFormat = fmt,
+            )
+          ).rows[0]
+          let back = getComposite[E2eBoundsRecord](row, 0)
+          doAssert back.xs == @[1'i32, 2], $fmt
+          doAssert back.pair == [3'i32, 4], $fmt
+          doAssert back.key == [1'u8, 2, 255], $fmt
+      finally:
+        await conn.close()
+
+    waitFor t()
 
 suite "E2E: Type Roundtrip":
   test "integer types roundtrip":

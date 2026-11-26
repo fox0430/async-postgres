@@ -150,13 +150,14 @@ proc colTypeOid*(row: Row, col: int): int32 {.inline.} =
   else:
     0'i32
 
-const FirstNormalObjectId = 16384'i32
+const FirstNormalObjectId = 16384'u32
   ## Built-in OIDs are below this bound (``access/transam.h``); dynamic types
   ## are at or above it.
 
 func wireOidIsDynamic*(actual: int32): bool {.inline.} =
   ## Whether ``actual`` is catalog-assigned (dynamic), regardless of layout.
-  actual >= FirstNormalObjectId
+  ## OIDs are unsigned; past 2^31 they arrive as negative int32.
+  cast[uint32](actual) >= FirstNormalObjectId
 
 func wireOidAcceptable(actual: int32, expected: openArray[int32]): bool =
   ## Whether a binary payload declared as ``actual`` may be decoded as
@@ -2358,3 +2359,14 @@ proc get*(
 ): seq[PgMoney] =
   ## Generic money array accessor by column name under known conventions.
   row.getMoneyArray(row.columnIndex(name), conv)
+
+# Scalar codec reuse for `pgComposite` fields. Sibling-only: callers keep using
+# the typed row accessors.
+
+proc parseRegisteredScalar*[T](_: typedesc[T], s: string): T =
+  ## Text form of a type registered in the array element registry.
+  parsePgArrayElement(T, s)
+
+proc decodeRegisteredScalar*[T](_: typedesc[T], buf: openArray[byte]): T =
+  ## Binary form of a type registered in the array element registry.
+  decodePgArrayElement(T, buf)
