@@ -1449,30 +1449,8 @@ proc parsePgArrayElement(_: typedesc[PgCircle], s: string): PgCircle =
 
 proc boxTextElements(s: string): seq[Option[string]] =
   ## Elements of a text ``box[]`` literal: ``box`` is the one built-in type
-  ## whose array delimiter is ``;``, so `parseTextArray` cannot split it.
-  if s.len < 2 or s[0] != '{' or s[^1] != '}':
-    # Same rule as `parseTextArray`: point at the brace that is wrong, or at 0
-    # when the literal is too short to have one.
-    let bracePos =
-      if s.len >= 2 and s[0] == '{':
-        s.len - 1
-      else:
-        0
-    raise newException(
-      PgTypeError,
-      "Invalid box array literal (len=" & $s.len & ", pos=" & $bracePos & ")",
-    )
-  let inner = s[1 ..^ 2]
-  if inner.len == 0:
-    return
-  for p in inner.split(';'):
-    let v = p.strip()
-    result.add(
-      if v == "NULL":
-        none(string)
-      else:
-        some(v)
-    )
+  ## whose array delimiter is ``;``.
+  parseTextArrayDelim(s, ';')
 
 # Named helpers where typedesc dispatch can't distinguish: DateTime is shared
 # by timestamp/timestamptz/date; JsonNode needs runtime elemOid.

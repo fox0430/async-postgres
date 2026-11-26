@@ -1123,7 +1123,7 @@ suite "Composite field types":
     check compositeFieldFromText[seq[PgBox]]("[0:0]={(1,1),(0,0)}").len == 1
     check "bounds do not match" in
       msgOf(compositeFieldFromText[seq[int32]]("[0:2]={1,2}"))
-    check "reads one dimension" in
+    check "Multi-dimensional" in
       msgOf(compositeFieldFromText[seq[int32]]("[1:1][1:2]={{1,2}}"))
     check "bounds without '='" in msgOf(
       compositeFieldFromText[seq[int32]]("[0:1]{1,2}")

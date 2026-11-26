@@ -299,11 +299,61 @@ suite "parseTextArray":
     check msgOf("{a\"b,c}") ==
       "array: unexpected byte in unquoted element (len=7, pos=2)"
     check msgOf("{a,b,}") == "array: trailing comma (len=6, pos=4)"
+    # Offsets stay relative to the whole literal after a bounds prefix.
+    check msgOf("[0:1]={a\"b,c}") ==
+      "array: unexpected byte in unquoted element (len=13, pos=8)"
+    check msgOf("[0:1]=(a,b)") == "Invalid array literal (len=11, pos=6)"
+    check msgOf("") == "Invalid array literal (len=0, pos=0)"
+    check msgOf("[0:1]=") == "Invalid array literal (len=6, pos=5)"
+    check msgOf("[0:1]") == "array: bounds without '=' (len=5, pos=4)"
+    check msgOf("[0:1]x{a,b}") == "array: bounds without '=' (len=11, pos=5)"
+    check msgOf("[-2147483648:2147483647]={a}") ==
+      "array: bounds do not match the element count (len=28, pos=0)"
+    check msgOf("[x:1]={a,b}") == "array: malformed bounds (len=11, pos=1)"
+    check msgOf("[0:x]={a}") == "array: malformed bounds (len=9, pos=3)"
+    check msgOf("[01]={a,b}") == "array: malformed bounds (len=10, pos=3)"
+    check msgOf("[2:1]={}") == "array: upper bound below lower (len=8, pos=3)"
+    check msgOf("[0:5]={a,b}") ==
+      "array: bounds do not match the element count (len=11, pos=0)"
+
+  test "a bounds prefix is checked and dropped":
+    check parseTextArray("[0:2]={a,b,c}") == @[some("a"), some("b"), some("c")]
+    check parseTextArray("[-1:0]={NULL,\"x\"}") == @[none(string), some("x")]
+    check parseTextArray("[1:1]={a}") == @[some("a")]
+    for bad in [
+      "[0:2]={a,b}", "[0:1]{a,b}", "[0:1={a,b}", "[01]={a,b}", "[a:b]={a,b}",
+      "[2:1]={}", "[0:0][1:2]={{a,b}}", "[0:1]=",
+    ]:
+      expect PgTypeError:
+        discard parseTextArray(bad)
+
+  test "another delimiter splits on it alone":
+    check parseTextArrayDelim("{(1,1),(0,0);NULL}", ';') ==
+      @[some("(1,1),(0,0)"), none(string)]
+    check parseTextArrayDelim("[0:0]={(1,1),(0,0)}", ';') == @[some("(1,1),(0,0)")]
+    expect PgTypeError:
+      discard parseTextArrayDelim("{a;}", ';')
+
+  test "parseTextArray stays a single proc value":
+    let f = parseTextArray
+    check f("{a}") == @[some("a")]
+
+  test "a structural delimiter is rejected":
+    for d in ['"', '\\', '{', '}']:
+      expect AssertionDefect:
+        discard parseTextArrayDelim("{a}", d)
 
 suite "Array row accessors":
   test "getIntArray":
     let row: Row = @[some(toBytes("{1,2,3}"))]
     check row.getIntArray(0) == @[1'i32, 2, 3]
+
+  test "getIntArray drops a text lower bound":
+    let row: Row = @[some(toBytes("[0:2]={1,2,3}"))]
+    check row.getIntArray(0) == @[1'i32, 2, 3]
+    check row.getIntArrayElemOpt(0) == @[some(1'i32), some(2'i32), some(3'i32)]
+    let box: Row = @[some(toBytes("[0:0]={(2,2),(1,1)}"))]
+    check box.getBoxArray(0).len == 1
 
   test "getIntArray empty":
     let row: Row = @[some(toBytes("{}"))]
@@ -2280,10 +2330,10 @@ suite "array element errors carry the column number":
   test "box literal error carries len and pos":
     let noBraces: Row = @[some(toBytes("(1,2),(3,4)"))]
     check msgOf(noBraces.getBoxArray(0)) ==
-      "Column 0: Invalid box array literal (len=11, pos=0)"
+      "Column 0: Invalid array literal (len=11, pos=0)"
     let openBrace: Row = @[some(toBytes("{(1,2),(3,4)"))]
     check msgOf(openBrace.getBoxArray(0)) ==
-      "Column 0: Invalid box array literal (len=12, pos=11)"
+      "Column 0: Invalid array literal (len=12, pos=11)"
 
   test "a NULL column stays single-prefixed on every array path":
     # A NULL cell is a column-level failure the getters already report as

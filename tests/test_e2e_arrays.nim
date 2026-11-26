@@ -1712,6 +1712,22 @@ suite "E2E: Geometric array types":
 
     waitFor t()
 
+  test "1-D getters drop a lower bound other than 1 in either format":
+    proc t() {.async.} =
+      let conn = await connect(plainConfig())
+      const q =
+        "SELECT '[0:2]={1,2,3}'::int4[], '[-1:0]={NULL,b}'::text[], " &
+        "'[5:5]={(1,1),(0,0)}'::box[]"
+      for fmt in [rfText, rfBinary]:
+        let res = await conn.query(q, resultFormat = fmt)
+        let row = res.rows[0]
+        doAssert row.getIntArray(0) == @[1'i32, 2, 3]
+        doAssert row.getStrArrayElemOpt(1) == @[none(string), some("b")]
+        doAssert row.getBoxArray(2).len == 1
+      await conn.close()
+
+    waitFor t()
+
 suite "E2E: Other array types":
   test "xml array roundtrip":
     proc t() {.async.} =
